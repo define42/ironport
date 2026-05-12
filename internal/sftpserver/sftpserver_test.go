@@ -2519,7 +2519,12 @@ type stubListener struct {
 }
 
 func (l *stubListener) Accept() (net.Conn, error) { return l.conn, nil }
-func (l *stubListener) Close() error              { return nil }
+func (l *stubListener) Close() error {
+	if l.conn != nil {
+		return l.conn.Close()
+	}
+	return nil
+}
 func (l *stubListener) Addr() net.Addr            { return &net.TCPAddr{} }
 
 type stubConn struct {
@@ -2555,7 +2560,7 @@ func TestFTPServer_CmdStorSanitizesCopyErrors(t *testing.T) {
 	fs.cmdStor("upload.txt", false)
 
 	got := control.String()
-	if !strings.Contains(got, "426 request failed\r\n") {
+	if !strings.Contains(got, "426 "+ftpErrMsg(copyErr)+"\r\n") {
 		t.Fatalf("cmdStor reply = %q; want sanitized FTP error reply", got)
 	}
 	if strings.Contains(got, "/srv/secret.txt") {
