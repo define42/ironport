@@ -284,13 +284,13 @@ func parseFTPPASVResponse(msg string) (string, int, error) {
 		return "", 0, errors.New("invalid passive mode tuple")
 	}
 
-	values := make([]int, 0, 6)
-	for _, part := range parts {
+	values := make([]int, len(parts))
+	for i, part := range parts {
 		value, err := strconv.Atoi(strings.TrimSpace(part))
 		if err != nil {
 			return "", 0, err
 		}
-		values = append(values, value)
+		values[i] = value
 	}
 
 	host := net.IPv4(byte(values[0]), byte(values[1]), byte(values[2]), byte(values[3])).String()

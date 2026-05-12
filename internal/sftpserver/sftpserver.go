@@ -275,7 +275,7 @@ func (s *Server) listenFTPData(host string) (net.Listener, error) {
 	if lastErr == nil {
 		lastErr = errors.New("no FTP passive ports configured")
 	}
-	return nil, fmt.Errorf("no free FTP passive port in range %q: %w", portRange, lastErr)
+	return nil, fmt.Errorf("all FTP passive ports in range %q are unavailable: %w", portRange, lastErr)
 }
 
 // ListenAndServe starts the SFTP server and, when FTPAddr is non-empty, the FTP
