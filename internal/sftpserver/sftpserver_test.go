@@ -406,6 +406,94 @@ func TestNewServer(t *testing.T) {
 	}
 }
 
+func TestParseFTPPassivePortRange(t *testing.T) {
+	tests := []struct {
+		name      string
+		portRange string
+		wantStart int
+		wantEnd   int
+		wantErr   bool
+	}{
+		{name: "empty", portRange: "", wantStart: 0, wantEnd: 0},
+		{name: "single port", portRange: "5000", wantStart: 5000, wantEnd: 5000},
+		{name: "range", portRange: "5000-5010", wantStart: 5000, wantEnd: 5010},
+		{name: "range with spaces", portRange: " 5000 - 5010 ", wantStart: 5000, wantEnd: 5010},
+		{name: "invalid text", portRange: "abc", wantErr: true},
+		{name: "invalid range", portRange: "5000-", wantErr: true},
+		{name: "start greater than end", portRange: "5010-5000", wantErr: true},
+		{name: "out of range", portRange: "70000", wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotStart, gotEnd, err := parseFTPPassivePortRange(tc.portRange)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("parseFTPPassivePortRange(%q) error = nil; want non-nil", tc.portRange)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseFTPPassivePortRange(%q): %v", tc.portRange, err)
+			}
+			if gotStart != tc.wantStart || gotEnd != tc.wantEnd {
+				t.Fatalf("parseFTPPassivePortRange(%q) = (%d, %d); want (%d, %d)", tc.portRange, gotStart, gotEnd, tc.wantStart, tc.wantEnd)
+			}
+		})
+	}
+}
+
+func TestServerListenFTPData(t *testing.T) {
+	t.Run("os assigned port", func(t *testing.T) {
+		srv := &Server{}
+		ln, err := srv.listenFTPData("127.0.0.1")
+		if err != nil {
+			t.Fatalf("listenFTPData: %v", err)
+		}
+		t.Cleanup(func() { _ = ln.Close() })
+
+		port := ln.Addr().(*net.TCPAddr).Port
+		if port == 0 {
+			t.Fatal("listenFTPData returned port 0; want assigned port")
+		}
+	})
+
+	t.Run("configured single port", func(t *testing.T) {
+		probe, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("net.Listen: %v", err)
+		}
+		port := probe.Addr().(*net.TCPAddr).Port
+		_ = probe.Close()
+
+		srv := &Server{FTPPassivePortRange: strconv.Itoa(port)}
+		ln, err := srv.listenFTPData("127.0.0.1")
+		if err != nil {
+			t.Fatalf("listenFTPData: %v", err)
+		}
+		t.Cleanup(func() { _ = ln.Close() })
+
+		gotPort := ln.Addr().(*net.TCPAddr).Port
+		if gotPort != port {
+			t.Fatalf("listenFTPData port = %d; want %d", gotPort, port)
+		}
+	})
+
+	t.Run("configured port unavailable", func(t *testing.T) {
+		busyLn, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("net.Listen: %v", err)
+		}
+		t.Cleanup(func() { _ = busyLn.Close() })
+
+		port := busyLn.Addr().(*net.TCPAddr).Port
+		srv := &Server{FTPPassivePortRange: strconv.Itoa(port)}
+		if _, err := srv.listenFTPData("127.0.0.1"); err == nil {
+			t.Fatal("listenFTPData error = nil; want non-nil when configured port is already in use")
+		}
+	})
+}
+
 func TestFTPServer_UploadDownloadList(t *testing.T) {
 	root := t.TempDir()
 	users := map[string]UserInfo{
