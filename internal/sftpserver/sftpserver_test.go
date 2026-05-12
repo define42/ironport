@@ -2539,21 +2539,25 @@ func TestFTPServer_CmdStorSanitizesCopyErrors(t *testing.T) {
 	root := t.TempDir()
 	copyErr := errors.New("copy failed while reading /srv/secret.txt")
 	var control bytes.Buffer
+	controlConn := &stubConn{}
+	dataConn := &stubConn{readErr: copyErr}
 
 	fs := &ftpSession{
 		server: &Server{
 			CompletedUploads: make(chan CompletedUpload, 1),
 		},
-		conn:   &stubConn{},
+		conn:   controlConn,
 		w:      bufio.NewWriter(&control),
 		user:   UserInfo{Root: root, CanWrite: true},
-		dataLn: &stubListener{conn: &stubConn{readErr: copyErr}},
+		dataLn: &stubListener{conn: dataConn},
 	}
 
 	fs.cmdStor("upload.txt", false)
 
 	if got := control.String(); got != "150 opening data connection\r\n426 request failed\r\n" {
 		t.Fatalf("cmdStor reply = %q; want sanitized FTP error reply", got)
+	} else if strings.Contains(got, "/srv/secret.txt") {
+		t.Fatalf("cmdStor reply leaked internal path: %q", got)
 	}
 }
 
