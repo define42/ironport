@@ -57,6 +57,23 @@ type UserInfo struct {
 	CanWrite       bool            // allow write/upload/delete/rename operations
 }
 
+// CompletedUpload describes a file upload that has finished successfully.
+// It is the payload delivered on Server.CompletedUploads.
+type CompletedUpload struct {
+	// Username is the authenticated SFTP user that performed the upload.
+	Username string
+	// FullFilePath is the absolute path of the uploaded file on the server's
+	// local filesystem (i.e. resolved through the user's jail root).
+	FullFilePath string
+	// FilePath is the file path as seen by the SFTP client, relative to the
+	// user's jail root (e.g. "/incoming/foo.txt").
+	FilePath string
+	// ClientIP is the remote IP address of the SFTP client that performed
+	// the upload, without the port.  It is empty if the address could not
+	// be parsed.
+	ClientIP string
+}
+
 // Server is a self-contained SFTP server.
 type Server struct {
 	// Addr is the TCP address to listen on, e.g. ":2022".
@@ -69,11 +86,12 @@ type Server struct {
 	ln net.Listener
 	// Signer is the host key used for the SSH handshake.
 	Signer ssh.Signer
-	// CompletedUploads receives the SFTP path of each file whose write has
-	// finished successfully (i.e. the client closed the file without error).
-	// The channel is buffered; sends are non-blocking so a slow consumer
-	// never stalls an upload.  Callers should drain the channel continuously.
-	CompletedUploads chan string
+	// CompletedUploads receives a CompletedUpload describing each file whose
+	// write has finished successfully (i.e. the client closed the file
+	// without error).  The channel is buffered; sends are non-blocking so a
+	// slow consumer never stalls an upload.  Callers should drain the
+	// channel continuously.
+	CompletedUploads chan CompletedUpload
 	// TempExtensions is an optional list of file extensions (each beginning
 	// with a leading dot, e.g. ".tmp", ".writing") that mark files as still
 	// being written and therefore not yet "complete".
@@ -171,7 +189,7 @@ func NewServer(addr string, users map[string]UserInfo, signer ssh.Signer) *Serve
 		Addr:             addr,
 		Users:            users,
 		Signer:           signer,
-		CompletedUploads: make(chan string, 64),
+		CompletedUploads: make(chan CompletedUpload, 64),
 	}
 }
 
@@ -366,7 +384,7 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 	return cfg
 }
 
-func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- string, tempExts []string) {
+func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload, tempExts []string) {
 	defer nc.Close()
 
 	// Enforce a deadline for the SSH handshake to prevent malicious clients
@@ -387,6 +405,7 @@ func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- string, tempE
 	user := sshConn.Permissions.Extensions["user"]
 	canRead := sshConn.Permissions.Extensions["canRead"] == "true"
 	canWrite := sshConn.Permissions.Extensions["canWrite"] == "true"
+	clientIP := remoteIP(sshConn.RemoteAddr())
 	log.Printf("login user=%s root=%s from=%s", user, jailRoot, sshConn.RemoteAddr())
 
 	// Discard global requests
@@ -404,11 +423,25 @@ func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- string, tempE
 			continue
 		}
 
-		go handleSession(ch, inReqs, jailRoot, canRead, canWrite, uploads, tempExts)
+		go handleSession(ch, inReqs, jailRoot, user, clientIP, canRead, canWrite, uploads, tempExts)
 	}
 }
 
-func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot string, canRead, canWrite bool, uploads chan<- string, tempExts []string) {
+// remoteIP extracts the IP portion of a net.Addr.  If the address contains a
+// host:port pair (as is the case for TCP) only the host is returned; otherwise
+// the full string form of the address is returned.  Returns "" for a nil addr.
+func remoteIP(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	s := addr.String()
+	if host, _, err := net.SplitHostPort(s); err == nil {
+		return host
+	}
+	return s
+}
+
+func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string) {
 	defer ch.Close()
 
 	for req := range inReqs {
@@ -429,7 +462,7 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot string, 
 			}
 			_ = req.Reply(true, nil)
 
-			handlers := jailedHandlers(jailRoot, canRead, canWrite, uploads, tempExts)
+			handlers := jailedHandlers(jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts)
 
 			server := sftp.NewRequestServer(ch, handlers)
 			if err := server.Serve(); err != nil && !errors.Is(err, io.EOF) {
@@ -446,9 +479,11 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot string, 
 
 type jail struct {
 	root     string
+	username string
+	clientIP string
 	canRead  bool
 	canWrite bool
-	uploads  chan<- string
+	uploads  chan<- CompletedUpload
 	// tempExts is the list of "still being written" extensions (lower-case,
 	// dot-prefixed).  Uploads ending in one of these extensions are not
 	// announced on uploads; renaming such a file to a name without any of
@@ -531,9 +566,12 @@ func (j jail) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 // renames the file to its final name (see jail.Filecmd "Rename").
 type writeLogger struct {
 	*os.File
-	filepath string
-	uploads  chan<- string
-	tempExts []string
+	filepath     string
+	fullFilepath string
+	username     string
+	clientIP     string
+	uploads      chan<- CompletedUpload
+	tempExts     []string
 }
 
 func (w *writeLogger) Close() error {
@@ -548,8 +586,14 @@ func (w *writeLogger) Close() error {
 		}
 		// Announce the completed upload on the queue; non-blocking so a slow
 		// consumer never stalls the upload handler.
+		evt := CompletedUpload{
+			Username:     w.username,
+			FullFilePath: w.fullFilepath,
+			FilePath:     w.filepath,
+			ClientIP:     w.clientIP,
+		}
 		select {
-		case w.uploads <- w.filepath:
+		case w.uploads <- evt:
 		default:
 			log.Printf("upload complete: CompletedUploads queue full, notification for %q dropped", w.filepath)
 		}
@@ -572,7 +616,15 @@ func (j jail) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &writeLogger{File: f, filepath: r.Filepath, uploads: j.uploads, tempExts: j.tempExts}, nil
+	return &writeLogger{
+		File:         f,
+		filepath:     r.Filepath,
+		fullFilepath: p,
+		username:     j.username,
+		clientIP:     j.clientIP,
+		uploads:      j.uploads,
+		tempExts:     j.tempExts,
+	}, nil
 }
 
 // Filecmd implements sftp.FileCmder.
@@ -607,8 +659,14 @@ func (j jail) Filecmd(r *sftp.Request) error {
 		// completes and announce the new SFTP path on uploads.
 		if hasTempExt(r.Filepath, j.tempExts) && !hasTempExt(r.Target, j.tempExts) {
 			log.Printf("upload complete via rename: %q -> %q", r.Filepath, r.Target)
+			evt := CompletedUpload{
+				Username:     j.username,
+				FullFilePath: newP,
+				FilePath:     r.Target,
+				ClientIP:     j.clientIP,
+			}
 			select {
-			case j.uploads <- r.Target:
+			case j.uploads <- evt:
 			default:
 				log.Printf("upload complete: CompletedUploads queue full, notification for %q dropped", r.Target)
 			}
@@ -680,8 +738,16 @@ func (j jail) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	}
 }
 
-func jailedHandlers(root string, canRead, canWrite bool, uploads chan<- string, tempExts []string) sftp.Handlers {
-	j := jail{root: filepath.Clean(root), canRead: canRead, canWrite: canWrite, uploads: uploads, tempExts: tempExts}
+func jailedHandlers(root, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string) sftp.Handlers {
+	j := jail{
+		root:     filepath.Clean(root),
+		username: username,
+		clientIP: clientIP,
+		canRead:  canRead,
+		canWrite: canWrite,
+		uploads:  uploads,
+		tempExts: tempExts,
+	}
 	return sftp.Handlers{
 		FileGet:  j,
 		FilePut:  j,
