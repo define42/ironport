@@ -32,7 +32,7 @@ func main() {
 		signer = mustHostKey()
 	}
 
-	srv := sftpserver.NewServer(":2022", ":2121", users, signer)
+	srv := sftpserver.NewServer(":2022", ":2121", "5000-5010", users, signer)
 	// Files written with one of these extensions are considered "still being
 	// written" and won't be announced on CompletedUploads until the client
 	// renames them to a final (non-temp) name.

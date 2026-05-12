@@ -12,7 +12,7 @@
 //
 // Typical usage:
 //
-//	srv := sftpserver.NewServer(":2022", ":2121", users, signer)
+//	srv := sftpserver.NewServer(":2022", ":2121", "5000-5010", users, signer)
 //	log.Fatal(srv.ListenAndServe())
 package sftpserver
 
@@ -86,6 +86,10 @@ type Server struct {
 	// FTPAddr is the TCP address to listen on for FTP, e.g. ":2121".
 	// Set it to "" to disable FTP.
 	FTPAddr string
+	// FTPPassivePortRange optionally constrains FTP passive-mode data listeners
+	// to a single port or inclusive range such as "5000-5010". Leave it empty
+	// to let the OS choose any available port.
+	FTPPassivePortRange string
 	// Users maps usernames to their credentials and jail roots.
 	Users map[string]UserInfo
 	// mu protects Users and listeners for concurrent reads and writes.
@@ -202,16 +206,73 @@ func (s *Server) RemoveUserKey(username string, key ssh.PublicKey) {
 	s.Users[username] = u
 }
 
-// NewServer creates a new Server with the given SFTP address, FTP address, user
-// map, and host key. Pass ftpAddr as "" to disable FTP.
-func NewServer(addr, ftpAddr string, users map[string]UserInfo, signer ssh.Signer) *Server {
+// NewServer creates a new Server with the given SFTP address, FTP address,
+// optional FTP passive data port range, user map, and host key. Pass ftpAddr as
+// "" to disable FTP. Leave ftpPassivePortRange empty to use OS-assigned passive
+// data ports.
+func NewServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserInfo, signer ssh.Signer) *Server {
 	return &Server{
-		Addr:             addr,
-		FTPAddr:          ftpAddr,
-		Users:            users,
-		Signer:           signer,
-		CompletedUploads: make(chan CompletedUpload, 64),
+		Addr:                addr,
+		FTPAddr:             ftpAddr,
+		FTPPassivePortRange: ftpPassivePortRange,
+		Users:               users,
+		Signer:              signer,
+		CompletedUploads:    make(chan CompletedUpload, 64),
 	}
+}
+
+func parseFTPPassivePortRange(portRange string) (start, end int, err error) {
+	portRange = strings.TrimSpace(portRange)
+	if portRange == "" {
+		return 0, 0, nil
+	}
+
+	if !strings.Contains(portRange, "-") {
+		port, err := strconv.Atoi(portRange)
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid FTP passive port %q", portRange)
+		}
+		if port < 1 || port > 65535 {
+			return 0, 0, fmt.Errorf("FTP passive port %q out of range", portRange)
+		}
+		return port, port, nil
+	}
+
+	startText, endText, _ := strings.Cut(portRange, "-")
+	start, err = strconv.Atoi(strings.TrimSpace(startText))
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid FTP passive port range %q", portRange)
+	}
+	end, err = strconv.Atoi(strings.TrimSpace(endText))
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid FTP passive port range %q", portRange)
+	}
+	if start < 1 || start > 65535 || end < 1 || end > 65535 || start > end {
+		return 0, 0, fmt.Errorf("FTP passive port range %q out of range", portRange)
+	}
+	return start, end, nil
+}
+
+func (s *Server) listenFTPData(host string) (net.Listener, error) {
+	portRange := strings.TrimSpace(s.FTPPassivePortRange)
+	if portRange == "" {
+		return net.Listen("tcp", net.JoinHostPort(host, "0"))
+	}
+
+	start, end, err := parseFTPPassivePortRange(portRange)
+	if err != nil {
+		return nil, err
+	}
+
+	var lastErr error
+	for port := start; port <= end; port++ {
+		ln, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+		if err == nil {
+			return ln, nil
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("all FTP passive ports in range %q are unavailable: %w", portRange, lastErr)
 }
 
 // ListenAndServe starts the SFTP server and, when FTPAddr is non-empty, the FTP
@@ -1280,7 +1341,7 @@ func (f *ftpSession) enterPassive(epsv bool) {
 		return
 	}
 
-	ln, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
+	ln, err := f.server.listenFTPData(host)
 	if err != nil {
 		_ = f.reply(425, err.Error())
 		return
