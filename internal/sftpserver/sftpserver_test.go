@@ -129,7 +129,7 @@ func startTestServer(t *testing.T, users map[string]UserInfo) (srv *Server, addr
 			if err != nil {
 				return // listener closed
 			}
-			go handleConn(nc, cfg, srv.CompletedUploads, srv.tempExtensions(), srv.idleTimeout())
+			go handleConn(nc, cfg, srv.CompletedUploads, srv.tempExtensions(), srv.idleTimeout(), srv.allowChown())
 		}
 	}()
 
@@ -856,7 +856,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleConn(nc, cfg, srv.CompletedUploads, srv.tempExtensions(), srv.idleTimeout())
+			go handleConn(nc, cfg, srv.CompletedUploads, srv.tempExtensions(), srv.idleTimeout(), srv.allowChown())
 		}
 	}()
 	t.Cleanup(func() { ln.Close() })
@@ -1633,7 +1633,8 @@ func TestSFTPServer_Chown(t *testing.T) {
 	users := map[string]UserInfo{
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
-	_, addr, stop := startTestServer(t, users)
+	srv, addr, stop := startTestServer(t, users)
+	srv.AllowChown = true
 	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
@@ -1674,7 +1675,8 @@ func TestSFTPServer_Chgrp(t *testing.T) {
 	users := map[string]UserInfo{
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
-	_, addr, stop := startTestServer(t, users)
+	srv, addr, stop := startTestServer(t, users)
+	srv.AllowChown = true
 	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
@@ -2000,7 +2002,7 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleConn(nc, cfg, srv.CompletedUploads, srv.tempExtensions(), srv.idleTimeout())
+			go handleConn(nc, cfg, srv.CompletedUploads, srv.tempExtensions(), srv.idleTimeout(), srv.allowChown())
 		}
 	}()
 
@@ -2583,4 +2585,87 @@ t.Errorf("nextAcceptBackoff(900ms) = %v; want 1s", got)
 if got := nextAcceptBackoff(time.Second); got != time.Second {
 t.Errorf("nextAcceptBackoff(1s) = %v; want 1s", got)
 }
+}
+
+// TestSFTPServer_Chown_DefaultDenied verifies that a chown request is
+// rejected with a permission error when Server.AllowChown is left at its
+// default (false). This is the opt-in flag that hardens deployments where
+// the server runs with enough privilege (e.g. as root) to actually change
+// ownership: clients must not be able to chown jailed files unless the
+// operator has explicitly enabled it.
+func TestSFTPServer_Chown_DefaultDenied(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+	if srv.AllowChown {
+		t.Fatalf("AllowChown should default to false")
+	}
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	f, err := client.Create("/chown_denied.txt")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := f.Write([]byte("x")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	f.Close()
+
+	info, err := os.Stat(filepath.Join(root, "chown_denied.txt"))
+	if err != nil {
+		t.Fatalf("os.Stat: %v", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("cannot read uid/gid on this platform")
+	}
+	// Chown to the current uid/gid: this would succeed on disk (same owner),
+	// so the only thing that can fail this call is the server's AllowChown
+	// gate. If the gate is wired up correctly we get a permission error
+	// regardless of the underlying filesystem semantics.
+	err = client.Chown("/chown_denied.txt", int(stat.Uid), int(stat.Gid))
+	if err == nil {
+		t.Fatalf("Chown succeeded with AllowChown=false; want permission denied")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "permission") {
+		t.Errorf("Chown error = %v; want a permission denied error", err)
+	}
+}
+
+// TestSFTPServer_SymlinkRejected verifies that clients cannot create symlinks
+// inside their jail. Allowing symlinks would let a client plant a link
+// pointing outside the jail root that a subsequent request could follow,
+// bypassing the path-containment checks in jail.resolve.
+func TestSFTPServer_SymlinkRejected(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	// Create a target file so the symlink would otherwise be valid.
+	f, err := client.Create("/target.txt")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	f.Close()
+
+	err = client.Symlink("/target.txt", "/link.txt")
+	if err == nil {
+		t.Fatalf("Symlink unexpectedly succeeded; want permission denied")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "permission") {
+		t.Errorf("Symlink error = %v; want a permission denied error", err)
+	}
+	// Confirm no link was created on disk.
+	if _, err := os.Lstat(filepath.Join(root, "link.txt")); !os.IsNotExist(err) {
+		t.Errorf("link.txt exists on disk after rejected Symlink: err=%v", err)
+	}
 }

@@ -14,6 +14,7 @@ A production-ready, embeddable SFTP server library for Go with a security-first 
 - **Handshake timeout** — connections that do not complete the SSH handshake within 30 seconds are dropped
 - **Idle-session timeout** — configurable via `Server.IdleTimeout` (default 15 minutes); inactive authenticated SFTP sessions are reaped
 - **Empty-password protection** — users whose stored `Password` is empty cannot authenticate via password, and empty supplied passwords are always rejected
+- **Chown opt-in** — `Setstat`/`Fsetstat` requests that try to change file ownership (uid/gid) are rejected with a permission error unless `Server.AllowChown` is explicitly set to `true`. Symlink creation by clients is always refused so a planted link cannot be followed to escape the jail.
 
 ## Quick start
 
