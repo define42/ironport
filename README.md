@@ -26,7 +26,7 @@ import (
     "crypto/rsa"
     "log"
 
-    "github.com/define42/sftpserver/internal/sftpserver"
+    "github.com/define42/sftpserver"
     "golang.org/x/crypto/ssh"
 )
 
@@ -121,7 +121,7 @@ signer, err := sftpserver.NewSignerFromFile("/etc/ssh/sftp_host_key")
 ## Running the example binary
 
 ```sh
-go run . -host-key /path/to/host_key
+go run ./cmd/sftpserver -host-key /path/to/host_key
 ```
 
 If `-host-key` is omitted a fresh RSA-3072 key is generated on every start (not suitable for production, as clients will see a different host key each time).
