@@ -2514,6 +2514,60 @@ t.Errorf("ftpErrMsg(%v) = %q; want %q", tc.err, got, tc.want)
 }
 }
 
+type stubListener struct {
+	conn net.Conn
+}
+
+func (l *stubListener) Accept() (net.Conn, error) { return l.conn, nil }
+func (l *stubListener) Close() error {
+	if l.conn != nil {
+		return l.conn.Close()
+	}
+	return nil
+}
+func (l *stubListener) Addr() net.Addr            { return &net.TCPAddr{} }
+
+type stubConn struct {
+	readErr error
+}
+
+func (c *stubConn) Read([]byte) (int, error)         { return 0, c.readErr }
+func (c *stubConn) Write(b []byte) (int, error)      { return len(b), nil }
+func (c *stubConn) Close() error                     { return nil }
+func (c *stubConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (c *stubConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (c *stubConn) SetDeadline(time.Time) error      { return nil }
+func (c *stubConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *stubConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestFTPServer_CmdStorSanitizesCopyErrors(t *testing.T) {
+	root := t.TempDir()
+	copyErr := errors.New("copy failed while reading /srv/secret.txt")
+	var control bytes.Buffer
+	controlConn := &stubConn{}
+	dataConn := &stubConn{readErr: copyErr}
+
+	fs := &ftpSession{
+		server: &Server{
+			CompletedUploads: make(chan CompletedUpload, 1),
+		},
+		conn:   controlConn,
+		w:      bufio.NewWriter(&control),
+		user:   UserInfo{Root: root, CanWrite: true},
+		dataLn: &stubListener{conn: dataConn},
+	}
+
+	fs.cmdStor("upload.txt", false)
+
+	got := control.String()
+	if !strings.Contains(got, "426 "+ftpErrMsg(copyErr)+"\r\n") {
+		t.Fatalf("cmdStor reply = %q; want sanitized FTP error reply", got)
+	}
+	if strings.Contains(got, "/srv/secret.txt") {
+		t.Fatalf("cmdStor reply leaked internal path: %q", got)
+	}
+}
+
 // TestNextAcceptBackoff verifies that the accept backoff schedule starts at
 // 5ms, doubles, and caps at 1s.
 func TestNextAcceptBackoff(t *testing.T) {
