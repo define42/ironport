@@ -395,6 +395,58 @@ func TestServer_AddUser_Replace(t *testing.T) {
 	_ = dialSFTP(t, addr, "user1", "newpw")
 }
 
+// TestServer_RemoveAllUsers verifies that RemoveAllUsers blocks future logins
+// without deleting any on-disk data in the users' roots.
+func TestServer_RemoveAllUsers(t *testing.T) {
+	root1 := t.TempDir()
+	root2 := t.TempDir()
+	file1 := filepath.Join(root1, "keep.txt")
+	file2 := filepath.Join(root2, "keep.txt")
+	if err := os.WriteFile(file1, []byte("alice data"), 0600); err != nil {
+		t.Fatalf("WriteFile(%q): %v", file1, err)
+	}
+	if err := os.WriteFile(file2, []byte("bob data"), 0600); err != nil {
+		t.Fatalf("WriteFile(%q): %v", file2, err)
+	}
+
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: root1, CanRead: true, CanWrite: true},
+		"bob":   {Password: "bobpw", Root: root2, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	_ = dialSFTP(t, addr, "alice", "alicepw")
+	_ = dialSFTP(t, addr, "bob", "bobpw")
+
+	srv.RemoveAllUsers()
+
+	srv.mu.RLock()
+	n := len(srv.Users)
+	srv.mu.RUnlock()
+	if n != 0 {
+		t.Fatalf("expected no users after RemoveAllUsers, got %d", n)
+	}
+
+	for username, password := range map[string]string{"alice": "alicepw", "bob": "bobpw"} {
+		sshCfg := &ssh.ClientConfig{
+			User:            username,
+			Auth:            []ssh.AuthMethod{ssh.Password(password)},
+			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		}
+		if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
+			t.Fatalf("expected auth failure for %q after RemoveAllUsers, got nil", username)
+		}
+	}
+
+	if _, err := os.Stat(file1); err != nil {
+		t.Fatalf("Stat(%q): %v", file1, err)
+	}
+	if _, err := os.Stat(file2); err != nil {
+		t.Fatalf("Stat(%q): %v", file2, err)
+	}
+}
+
 // TestNewSignerFromFile verifies that NewSignerFromFile loads a valid PEM key file
 // and returns a usable signer, and that it returns an error for invalid inputs.
 func TestNewSignerFromFile(t *testing.T) {
