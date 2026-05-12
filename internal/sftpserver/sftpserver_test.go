@@ -116,7 +116,7 @@ func startTestServer(t *testing.T, users map[string]UserInfo) (srv *Server, addr
 	}
 	addr = ln.Addr().String()
 
-	srv = NewServer(addr, users, signer)
+	srv = NewServer(addr, "", users, signer)
 	cfg := srv.sshServerConfig()
 
 	go func() {
@@ -247,9 +247,12 @@ func TestNewServer(t *testing.T) {
 		"alice": {Password: "pw", Root: "/tmp/alice", CanRead: true, CanWrite: true},
 	}
 	signer := testSigner(t)
-	srv := NewServer(":0", users, signer)
+	srv := NewServer(":0", ":0", users, signer)
 	if srv.Addr != ":0" {
 		t.Errorf("Addr = %q; want :0", srv.Addr)
+	}
+	if srv.FTPAddr != ":0" {
+		t.Errorf("FTPAddr = %q; want :0", srv.FTPAddr)
 	}
 	if len(srv.Users) != 1 {
 		t.Errorf("Users len = %d; want 1", len(srv.Users))
@@ -554,7 +557,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 	}
 	addr := ln.Addr().String()
 
-	srv := NewServer(addr, users, signer)
+	srv := NewServer(addr, "", users, signer)
 	cfg := srv.sshServerConfig()
 
 	go func() {
@@ -930,7 +933,7 @@ func TestServer_AddUserKey_NoDuplicate(t *testing.T) {
 	root := t.TempDir()
 	_, pubKey := testClientKey(t)
 
-	srv := NewServer(":0", map[string]UserInfo{
+	srv := NewServer(":0", "", map[string]UserInfo{
 		"carol": {Root: root, CanRead: true},
 	}, testSigner(t))
 
@@ -950,7 +953,7 @@ func TestServer_AddUserKey_NoDuplicate(t *testing.T) {
 // TestServer_AddRemoveUserKey_NonExistentUser verifies that calling AddUserKey
 // or RemoveUserKey for a user that does not exist is a safe no-op.
 func TestServer_AddRemoveUserKey_NonExistentUser(t *testing.T) {
-	srv := NewServer(":0", map[string]UserInfo{}, testSigner(t))
+	srv := NewServer(":0", "", map[string]UserInfo{}, testSigner(t))
 	_, pub := testClientKey(t)
 
 	// Neither call should panic or create phantom entries.
@@ -996,7 +999,7 @@ func TestServer_NilKeyInAuthorizedKeys(t *testing.T) {
 func TestServer_AddUserKey_NilKey(t *testing.T) {
 	root := t.TempDir()
 	_, pub := testClientKey(t)
-	srv := NewServer(":0", map[string]UserInfo{
+	srv := NewServer(":0", "", map[string]UserInfo{
 		"eve": {AuthorizedKeys: []ssh.PublicKey{pub}, Root: root, CanRead: true},
 	}, testSigner(t))
 
@@ -1016,7 +1019,7 @@ func TestServer_AddUserKey_NilKey(t *testing.T) {
 func TestServer_RemoveUserKey_NilEntry(t *testing.T) {
 	root := t.TempDir()
 	_, pub := testClientKey(t)
-	srv := NewServer(":0", map[string]UserInfo{
+	srv := NewServer(":0", "", map[string]UserInfo{
 		"frank": {
 			// Mix nil entries with a real key.
 			AuthorizedKeys: []ssh.PublicKey{nil, pub, nil},
@@ -1044,7 +1047,7 @@ func TestServer_RemoveUserKey_NilEntry(t *testing.T) {
 func TestServer_RemoveUserKey_NilKey(t *testing.T) {
 	root := t.TempDir()
 	_, pub := testClientKey(t)
-	srv := NewServer(":0", map[string]UserInfo{
+	srv := NewServer(":0", "", map[string]UserInfo{
 		"grace": {AuthorizedKeys: []ssh.PublicKey{pub}, Root: root, CanRead: true},
 	}, testSigner(t))
 
@@ -1553,7 +1556,7 @@ func TestServer_ListenAndServe_Close(t *testing.T) {
 	}
 	signer := testSigner(t)
 
-	srv := NewServer("127.0.0.1:0", users, signer)
+	srv := NewServer("127.0.0.1:0", "", users, signer)
 
 	errc := make(chan error, 1)
 	go func() {
@@ -1608,7 +1611,7 @@ func TestServer_ListenAndServe_Close(t *testing.T) {
 // TestServer_Close_BeforeListenAndServe verifies that calling Close before
 // ListenAndServe is a safe no-op and does not panic or return an error.
 func TestServer_Close_BeforeListenAndServe(t *testing.T) {
-	srv := NewServer(":0", map[string]UserInfo{}, testSigner(t))
+	srv := NewServer(":0", "", map[string]UserInfo{}, testSigner(t))
 	if err := srv.Close(); err != nil {
 		t.Errorf("Close before ListenAndServe returned %v; want nil", err)
 	}
@@ -1684,7 +1687,7 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
 	signer := testSigner(t)
-	srv := NewServer("127.0.0.1:0", users, signer)
+	srv := NewServer("127.0.0.1:0", "", users, signer)
 	cfg := srv.sshServerConfig()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
