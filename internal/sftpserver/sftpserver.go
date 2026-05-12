@@ -1,4 +1,4 @@
-// Package sftpserver provides an embeddable, security-hardened SFTP server.
+// Package sftpserver provides an embeddable, security-hardened SFTP and FTP server.
 //
 // Core features:
 //
@@ -7,14 +7,17 @@
 //   - Fine-grained CanRead / CanWrite per-user permission flags.
 //   - Runtime user management (AddUser, RemoveUser, RemoveAllUsers, AddUserKey, RemoveUserKey).
 //   - Graceful shutdown via Close; upload-completion notifications via CompletedUploads.
+//   - Optional passive-mode FTP listener sharing the same users, jails, permissions,
+//     temp-extension handling, and CompletedUploads channel as SFTP.
 //
 // Typical usage:
 //
-//	srv := sftpserver.NewServer(":2022", users, signer)
+//	srv := sftpserver.NewServer(":2022", ":2121", users, signer)
 //	log.Fatal(srv.ListenAndServe())
 package sftpserver
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/binary"
@@ -24,7 +27,9 @@ import (
 	"log"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,10 +53,10 @@ func NewSignerFromFile(path string) (ssh.Signer, error) {
 	return signer, nil
 }
 
-// UserInfo holds the credentials and jail root for a single SFTP user.
+// UserInfo holds the credentials and jail root for a single SFTP/FTP user.
 type UserInfo struct {
 	Password       string
-	AuthorizedKeys []ssh.PublicKey // public keys allowed for authentication; nil or empty means public-key auth is disabled for this user
+	AuthorizedKeys []ssh.PublicKey // public keys allowed for SFTP authentication; nil or empty means public-key auth is disabled for this user
 	Root           string          // jail root on disk, e.g. /srv/sftp/alice
 	CanRead        bool            // allow read/download/list operations
 	CanWrite       bool            // allow write/upload/delete/rename operations
@@ -60,36 +65,41 @@ type UserInfo struct {
 // CompletedUpload describes a file upload that has finished successfully.
 // It is the payload delivered on Server.CompletedUploads.
 type CompletedUpload struct {
-	// Username is the authenticated SFTP user that performed the upload.
+	// Username is the authenticated SFTP/FTP user that performed the upload.
 	Username string
 	// FullFilePath is the absolute path of the uploaded file on the server's
 	// local filesystem (i.e. resolved through the user's jail root).
 	FullFilePath string
-	// FilePath is the file path as seen by the SFTP client, relative to the
+	// FilePath is the file path as seen by the client, relative to the
 	// user's jail root (e.g. "/incoming/foo.txt").
 	FilePath string
-	// ClientIP is the remote IP address of the SFTP client that performed
-	// the upload, without the port.  It is empty if the address could not
+	// ClientIP is the remote IP address of the client that performed
+	// the upload, without the port. It is empty if the address could not
 	// be parsed.
 	ClientIP string
 }
 
-// Server is a self-contained SFTP server.
+// Server is a self-contained SFTP server with optional FTP support.
 type Server struct {
-	// Addr is the TCP address to listen on, e.g. ":2022".
+	// Addr is the TCP address to listen on for SFTP, e.g. ":2022".
 	Addr string
+	// FTPAddr is the TCP address to listen on for FTP, e.g. ":2121".
+	// Set it to "" to disable FTP.
+	FTPAddr string
 	// Users maps usernames to their credentials and jail roots.
 	Users map[string]UserInfo
-	// mu protects Users and ln for concurrent reads and writes.
+	// mu protects Users and listeners for concurrent reads and writes.
 	mu sync.RWMutex
-	// ln is the active listener; set by ListenAndServe and closed by Close.
+	// ln is the active SFTP listener; set by ListenAndServe and closed by Close.
 	ln net.Listener
+	// ftpLn is the active FTP listener; set by ListenAndServe and closed by Close.
+	ftpLn net.Listener
 	// Signer is the host key used for the SSH handshake.
 	Signer ssh.Signer
 	// CompletedUploads receives a CompletedUpload describing each file whose
 	// write has finished successfully (i.e. the client closed the file
-	// without error).  The channel is buffered; sends are non-blocking so a
-	// slow consumer never stalls an upload.  Callers should drain the
+	// without error). The channel is buffered; sends are non-blocking so a
+	// slow consumer never stalls an upload. Callers should drain the
 	// channel continuously.
 	CompletedUploads chan CompletedUpload
 	// TempExtensions is an optional list of file extensions (each beginning
@@ -104,7 +114,7 @@ type Server struct {
 	//     path is announced on CompletedUploads, signalling that the upload
 	//     is finally complete.
 	//
-	// Matching is case-insensitive.  Setting this field after the server has
+	// Matching is case-insensitive. Setting this field after the server has
 	// started has effect only on connections accepted afterwards.
 	TempExtensions []string
 }
@@ -192,56 +202,102 @@ func (s *Server) RemoveUserKey(username string, key ssh.PublicKey) {
 	s.Users[username] = u
 }
 
-// NewServer creates a new Server with the given address, user map, and host key.
-func NewServer(addr string, users map[string]UserInfo, signer ssh.Signer) *Server {
+// NewServer creates a new Server with the given SFTP address, FTP address, user
+// map, and host key. Pass ftpAddr as "" to disable FTP.
+func NewServer(addr, ftpAddr string, users map[string]UserInfo, signer ssh.Signer) *Server {
 	return &Server{
 		Addr:             addr,
+		FTPAddr:          ftpAddr,
 		Users:            users,
 		Signer:           signer,
 		CompletedUploads: make(chan CompletedUpload, 64),
 	}
 }
 
-// ListenAndServe starts the SFTP server and blocks, accepting connections.
-// It returns a non-nil error only if the listener cannot be created or fails
-// with an unexpected error.  It returns nil when the server is stopped via
-// Close.
+// ListenAndServe starts the SFTP server and, when FTPAddr is non-empty, the FTP
+// server too. It blocks until Close is called or an unexpected listener error
+// occurs. It returns nil when stopped via Close.
 func (s *Server) ListenAndServe() error {
 	cfg := s.sshServerConfig()
 
-	ln, err := net.Listen("tcp", s.Addr)
+	sftpLn, err := net.Listen("tcp", s.Addr)
 	if err != nil {
 		return err
 	}
 
+	var ftpLn net.Listener
+	if strings.TrimSpace(s.FTPAddr) != "" {
+		ftpLn, err = net.Listen("tcp", s.FTPAddr)
+		if err != nil {
+			_ = sftpLn.Close()
+			return err
+		}
+	}
+
 	s.mu.Lock()
-	s.ln = ln
+	s.ln = sftpLn
+	s.ftpLn = ftpLn
 	s.mu.Unlock()
 
 	defer func() {
 		s.mu.Lock()
 		s.ln = nil
+		s.ftpLn = nil
 		s.mu.Unlock()
 	}()
 
-	log.Printf("SFTP listening on %s", ln.Addr())
+	log.Printf("SFTP listening on %s", sftpLn.Addr())
+	workers := 1
+	errCh := make(chan error, 2)
+	go func() { errCh <- s.serveSFTP(sftpLn, cfg) }()
 
+	if ftpLn != nil {
+		workers++
+		log.Printf("FTP listening on %s", ftpLn.Addr())
+		go func() { errCh <- s.serveFTP(ftpLn) }()
+	}
+
+	var ret error
+	for i := 0; i < workers; i++ {
+		if err := <-errCh; err != nil && ret == nil {
+			ret = err
+			_ = s.closeListeners()
+		}
+	}
+	return ret
+}
+
+func (s *Server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig) error {
 	for {
 		nc, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			log.Println("accept:", err)
+			log.Println("sftp accept:", err)
 			return err
 		}
 		go handleConn(nc, cfg, s.CompletedUploads, s.tempExtensions())
 	}
 }
 
+func (s *Server) serveFTP(ln net.Listener) error {
+	for {
+		nc, err := ln.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			log.Println("ftp accept:", err)
+			return err
+		}
+		go s.handleFTPConn(nc, s.tempExtensions())
+	}
+}
+
 // tempExtensions returns a normalised copy of s.TempExtensions: each entry is
-// lower-cased and guaranteed to start with a single leading dot.  Empty entries
-// are dropped.  The result is safe to use without holding s.mu because it is
+// lower-cased and guaranteed to start with a single leading dot. Empty entries
+// are dropped. The result is safe to use without holding s.mu because it is
 // a freshly allocated slice.
 func (s *Server) tempExtensions() []string {
 	s.mu.RLock()
@@ -265,7 +321,7 @@ func (s *Server) tempExtensions() []string {
 }
 
 // hasTempExt reports whether name ends with one of the given (already
-// normalised, lower-case, dot-prefixed) extensions.  Matching is
+// normalised, lower-case, dot-prefixed) extensions. Matching is
 // case-insensitive on the filename.
 func hasTempExt(name string, tempExts []string) bool {
 	if len(tempExts) == 0 {
@@ -280,22 +336,35 @@ func hasTempExt(name string, tempExts []string) bool {
 	return false
 }
 
-// Close stops the server by closing the listener, causing ListenAndServe to
-// return nil.  It is safe to call concurrently with active connections; in-
-// flight connections are not terminated.  Calling Close before ListenAndServe
-// has been called, or after it has already returned, is a no-op.
+// Close stops both listeners, causing ListenAndServe to return nil. It is safe
+// to call concurrently with active connections; in-flight connections are not
+// terminated. Calling Close before ListenAndServe has been called, or after it
+// has already returned, is a no-op.
 func (s *Server) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ln == nil {
-		return nil
-	}
-	return s.ln.Close()
+	return s.closeListeners()
 }
 
-// ListeningAddr returns the actual network address the server is listening on,
-// or nil if the server is not currently listening.  It is useful when the
-// server was started with port 0 (OS-assigned port).
+func (s *Server) closeListeners() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var ret error
+	if s.ln != nil {
+		if err := s.ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			ret = err
+		}
+	}
+	if s.ftpLn != nil {
+		if err := s.ftpLn.Close(); err != nil && !errors.Is(err, net.ErrClosed) && ret == nil {
+			ret = err
+		}
+	}
+	return ret
+}
+
+// ListeningAddr returns the actual SFTP network address the server is listening
+// on, or nil if the SFTP listener is not currently listening. It is useful when
+// the server was started with port 0 (OS-assigned port).
 func (s *Server) ListeningAddr() net.Addr {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -303,6 +372,17 @@ func (s *Server) ListeningAddr() net.Addr {
 		return nil
 	}
 	return s.ln.Addr()
+}
+
+// FTPListeningAddr returns the actual FTP network address the server is
+// listening on, or nil if FTP is disabled or not currently listening.
+func (s *Server) FTPListeningAddr() net.Addr {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.ftpLn == nil {
+		return nil
+	}
+	return s.ftpLn.Addr()
 }
 
 // permissionsFor builds the ssh.Permissions for an authenticated user,
@@ -336,7 +416,7 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 			s.mu.RUnlock()
 			// Compare SHA-256 hashes of both passwords so that the comparison
 			// always operates on the same 32-byte length regardless of whether
-			// the username exists or what length the stored password has.  A
+			// the username exists or what length the stored password has. A
 			// direct subtle.ConstantTimeCompare on the raw strings would return
 			// immediately on a length mismatch, leaking username existence via
 			// timing side-channel (non-existent users have an empty stored
@@ -360,12 +440,12 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 			keyBytes := key.Marshal()
 			// Hash the presented key's wire-format bytes to a fixed 32-byte
 			// value so that all comparisons in the loop are the same length
-			// regardless of key algorithm.  RSA, ECDSA, and Ed25519 wire
+			// regardless of key algorithm. RSA, ECDSA, and Ed25519 wire
 			// formats all differ in length; a raw ConstantTimeCompare would
 			// short-circuit on any length mismatch, leaking type information.
 			keyHash := sha256.Sum256(keyBytes)
 			// Perform a dummy fixed-length comparison against an all-zero hash
-			// before the loop.  When the user does not exist (or has no
+			// before the loop. When the user does not exist (or has no
 			// AuthorizedKeys), the loop is a no-op; without this baseline, such
 			// cases would be measurably faster than users who have keys to check.
 			// The all-zero value will never match a real key's SHA-256 hash.
@@ -415,7 +495,7 @@ func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUplo
 	canRead := sshConn.Permissions.Extensions["canRead"] == "true"
 	canWrite := sshConn.Permissions.Extensions["canWrite"] == "true"
 	clientIP := remoteIP(sshConn.RemoteAddr())
-	log.Printf("login user=%s root=%s from=%s", user, jailRoot, sshConn.RemoteAddr())
+	log.Printf("login protocol=sftp user=%s root=%s from=%s", user, jailRoot, sshConn.RemoteAddr())
 
 	// Discard global requests
 	go ssh.DiscardRequests(reqs)
@@ -436,9 +516,9 @@ func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUplo
 	}
 }
 
-// remoteIP extracts the IP portion of a net.Addr.  If the address contains a
+// remoteIP extracts the IP portion of a net.Addr. If the address contains a
 // host:port pair (as is the case for TCP) only the host is returned; otherwise
-// the full string form of the address is returned.  Returns "" for a nil addr.
+// the full string form of the address is returned. Returns "" for a nil addr.
 func remoteIP(addr net.Addr) string {
 	if addr == nil {
 		return ""
@@ -494,49 +574,75 @@ type jail struct {
 	canWrite bool
 	uploads  chan<- CompletedUpload
 	// tempExts is the list of "still being written" extensions (lower-case,
-	// dot-prefixed).  Uploads ending in one of these extensions are not
+	// dot-prefixed). Uploads ending in one of these extensions are not
 	// announced on uploads; renaming such a file to a name without any of
 	// these extensions announces the final path on uploads instead.
 	tempExts []string
 }
 
-// resolve maps an SFTP path (possibly relative) into an absolute on-disk path
+// resolve maps a client path (possibly relative) into an absolute on-disk path
 // under j.root, rejecting escapes and symlink escapes.
 func (j jail) resolve(p string) (string, error) {
 	if p == "" {
 		p = "/"
 	}
 
-	// Force absolute + clean: "/../../etc" => "/etc"
-	clean := filepath.Clean("/" + filepath.ToSlash(p))
-
-	// Join to root. clean starts with "/", Join will drop earlier elems,
-	// so we strip the leading "/" first.
-	full := filepath.Join(j.root, strings.TrimPrefix(clean, "/"))
-
-	// First prefix check (string check)
-	if !withinRoot(full, j.root) {
+	rootAbs, err := filepath.Abs(filepath.Clean(j.root))
+	if err != nil {
+		return "", err
+	}
+	rootReal, err := filepath.EvalSymlinks(rootAbs)
+	if err != nil {
+		return "", err
+	}
+	if !withinRoot(rootReal, rootReal) {
 		return "", os.ErrPermission
 	}
 
-	// Prevent symlink escapes:
-	// EvalSymlinks fails if path doesn't exist; that's OK for create paths.
-	// For create paths, check the parent directory's symlinks instead.
-	target, err := filepath.EvalSymlinks(full)
-	if err == nil {
-		if !withinRoot(target, j.root) {
-			return "", os.ErrPermission
+	// Force absolute + clean: "/../../etc" => "/etc".
+	clean := path.Clean("/" + strings.TrimPrefix(filepath.ToSlash(p), "/"))
+	if clean == "/" {
+		return rootReal, nil
+	}
+
+	parts := strings.Split(strings.TrimPrefix(clean, "/"), "/")
+	cur := rootReal
+	for i, part := range parts {
+		if part == "" || part == "." {
+			continue
 		}
-		return target, nil
+
+		next := filepath.Join(cur, part)
+		real, err := filepath.EvalSymlinks(next)
+		if err == nil {
+			if !withinRoot(real, rootReal) {
+				return "", os.ErrPermission
+			}
+			cur = real
+			continue
+		}
+
+		// The first path component that does not yet exist is allowed only if
+		// all already-existing ancestors have been resolved and are still inside
+		// the jail. Return a canonical path under the resolved ancestor so that
+		// create operations cannot traverse a previously encountered symlink.
+		if os.IsNotExist(err) {
+			rest := []string{next}
+			rest = append(rest, parts[i+1:]...)
+			candidate := filepath.Join(rest...)
+			if !withinRoot(candidate, rootReal) {
+				return "", os.ErrPermission
+			}
+			return candidate, nil
+		}
+
+		return "", err
 	}
 
-	// If full doesn't exist yet, validate parent
-	parent := filepath.Dir(full)
-	parentReal, perr := filepath.EvalSymlinks(parent)
-	if perr == nil && !withinRoot(parentReal, j.root) {
+	if !withinRoot(cur, rootReal) {
 		return "", os.ErrPermission
 	}
-	return full, nil
+	return cur, nil
 }
 
 func withinRoot(path, root string) bool {
@@ -793,4 +899,821 @@ func listerFromDirEntries(dir string, entries []os.DirEntry) sftp.ListerAt {
 		infos = append(infos, fi)
 	}
 	return fileInfoLister{infos: infos}
+}
+
+// FTP implementation. It is deliberately passive-mode only. Active FTP (PORT / EPRT)
+// is disabled because it is harder to firewall safely and opens client-chosen
+// outbound connections from the server.
+
+type ftpSession struct {
+	server        *Server
+	conn          net.Conn
+	r             *bufio.Reader
+	w             *bufio.Writer
+	username      string
+	user          UserInfo
+	authenticated bool
+	cwd           string
+	dataLn        net.Listener
+	rnfrPath      string
+	rnfrFullPath  string
+	restartOffset int64
+	clientIP      string
+	tempExts      []string
+}
+
+func (s *Server) handleFTPConn(nc net.Conn, tempExts []string) {
+	defer nc.Close()
+
+	fs := &ftpSession{
+		server:   s,
+		conn:     nc,
+		r:        bufio.NewReader(nc),
+		w:        bufio.NewWriter(nc),
+		cwd:      "/",
+		clientIP: remoteIP(nc.RemoteAddr()),
+		tempExts: tempExts,
+	}
+	defer fs.closeDataListener()
+
+	if err := fs.reply(220, "ready"); err != nil {
+		return
+	}
+
+	for {
+		_ = nc.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		line, err := fs.r.ReadString('\n')
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				log.Printf("ftp control read from=%s: %v", nc.RemoteAddr(), err)
+			}
+			return
+		}
+		_ = nc.SetReadDeadline(time.Time{})
+
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			continue
+		}
+		cmd, arg := parseFTPCommand(line)
+		quit := fs.handleFTPCommand(cmd, arg)
+		if quit {
+			return
+		}
+	}
+}
+
+func parseFTPCommand(line string) (string, string) {
+	line = strings.TrimLeft(line, " \t")
+	if line == "" {
+		return "", ""
+	}
+	cmd := line
+	arg := ""
+	if i := strings.IndexAny(line, " \t"); i >= 0 {
+		cmd = line[:i]
+		arg = strings.TrimLeft(line[i+1:], " \t")
+	}
+	return strings.ToUpper(cmd), arg
+}
+
+func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
+	switch cmd {
+	case "USER":
+		f.username = arg
+		f.authenticated = false
+		f.user = UserInfo{}
+		_ = f.reply(331, "password required")
+		return false
+
+	case "PASS":
+		if f.username == "" {
+			_ = f.reply(503, "send USER first")
+			return false
+		}
+		if !f.authenticate(arg) {
+			_ = f.reply(530, "invalid credentials")
+			return false
+		}
+		log.Printf("login protocol=ftp user=%s root=%s from=%s", f.username, f.user.Root, f.conn.RemoteAddr())
+		_ = f.reply(230, "login successful")
+		return false
+
+	case "QUIT":
+		_ = f.reply(221, "goodbye")
+		return true
+
+	case "NOOP":
+		_ = f.reply(200, "ok")
+		return false
+
+	case "SYST":
+		_ = f.reply(215, "UNIX Type: L8")
+		return false
+
+	case "FEAT":
+		_ = f.multilineReply(211, "Features:", []string{
+			"UTF8",
+			"EPSV",
+			"PASV",
+			"SIZE",
+			"MDTM",
+			"REST STREAM",
+		}, "End")
+		return false
+
+	case "AUTH":
+		// This implementation does not provide FTPS. Keep SFTP enabled for
+		// encrypted transport; expose FTP only where plaintext FTP is acceptable.
+		_ = f.reply(502, "AUTH not supported")
+		return false
+	}
+
+	if !f.authenticated {
+		_ = f.reply(530, "not logged in")
+		return false
+	}
+
+	switch cmd {
+	case "PWD", "XPWD":
+		_ = f.reply(257, fmt.Sprintf("%s is the current directory", ftpQuotePath(f.cwd)))
+
+	case "CWD":
+		f.cmdCWD(arg)
+
+	case "CDUP":
+		f.cmdCWD("..")
+
+	case "TYPE":
+		// Transfers are binary-safe. Accept ASCII and binary mode for client
+		// compatibility, but do not transform bytes.
+		upper := strings.ToUpper(strings.TrimSpace(arg))
+		if upper == "A" || upper == "A N" || upper == "I" || upper == "L 8" {
+			_ = f.reply(200, "type set")
+		} else {
+			_ = f.reply(504, "unsupported type")
+		}
+
+	case "MODE":
+		if strings.EqualFold(strings.TrimSpace(arg), "S") {
+			_ = f.reply(200, "mode set")
+		} else {
+			_ = f.reply(504, "unsupported mode")
+		}
+
+	case "STRU":
+		if strings.EqualFold(strings.TrimSpace(arg), "F") {
+			_ = f.reply(200, "structure set")
+		} else {
+			_ = f.reply(504, "unsupported structure")
+		}
+
+	case "OPTS":
+		if strings.EqualFold(strings.TrimSpace(arg), "UTF8 ON") {
+			_ = f.reply(200, "UTF8 enabled")
+		} else {
+			_ = f.reply(501, "unsupported option")
+		}
+
+	case "PASV":
+		f.enterPassive(false)
+
+	case "EPSV":
+		f.enterPassive(true)
+
+	case "PORT", "EPRT":
+		_ = f.reply(502, "active mode is disabled; use PASV or EPSV")
+
+	case "LIST":
+		f.cmdList(arg, false)
+
+	case "NLST":
+		f.cmdList(arg, true)
+
+	case "RETR":
+		f.cmdRetr(arg)
+
+	case "STOR":
+		f.cmdStor(arg, false)
+
+	case "APPE":
+		f.cmdStor(arg, true)
+
+	case "REST":
+		f.cmdRest(arg)
+
+	case "SIZE":
+		f.cmdSize(arg)
+
+	case "MDTM":
+		f.cmdMDTM(arg)
+
+	case "DELE":
+		f.cmdDelete(arg)
+
+	case "MKD", "XMKD":
+		f.cmdMkdir(arg)
+
+	case "RMD", "XRMD":
+		f.cmdRmdir(arg)
+
+	case "RNFR":
+		f.cmdRnfr(arg)
+
+	case "RNTO":
+		f.cmdRnto(arg)
+
+	case "ABOR":
+		f.closeDataListener()
+		f.restartOffset = 0
+		_ = f.reply(226, "abort successful")
+
+	default:
+		_ = f.reply(502, "command not implemented")
+	}
+	return false
+}
+
+func (f *ftpSession) authenticate(pass string) bool {
+	f.server.mu.RLock()
+	u, ok := f.server.Users[f.username]
+	f.server.mu.RUnlock()
+
+	var storedPw string
+	if ok {
+		storedPw = u.Password
+	}
+	storedHash := sha256.Sum256([]byte(storedPw))
+	passHash := sha256.Sum256([]byte(pass))
+	match := subtle.ConstantTimeCompare(storedHash[:], passHash[:]) == 1
+	if !ok || !match {
+		return false
+	}
+
+	f.user = u
+	f.authenticated = true
+	f.cwd = "/"
+	f.rnfrPath = ""
+	f.rnfrFullPath = ""
+	f.restartOffset = 0
+	return true
+}
+
+func (f *ftpSession) jail() jail {
+	return jail{
+		root:     filepath.Clean(f.user.Root),
+		username: f.username,
+		clientIP: f.clientIP,
+		canRead:  f.user.CanRead,
+		canWrite: f.user.CanWrite,
+		uploads:  f.server.CompletedUploads,
+		tempExts: f.tempExts,
+	}
+}
+
+func (f *ftpSession) reply(code int, message string) error {
+	_, err := fmt.Fprintf(f.w, "%d %s\r\n", code, message)
+	if err != nil {
+		return err
+	}
+	return f.w.Flush()
+}
+
+func (f *ftpSession) multilineReply(code int, first string, lines []string, last string) error {
+	if _, err := fmt.Fprintf(f.w, "%d-%s\r\n", code, first); err != nil {
+		return err
+	}
+	for _, line := range lines {
+		if _, err := fmt.Fprintf(f.w, " %s\r\n", line); err != nil {
+			return err
+		}
+	}
+	if _, err := fmt.Fprintf(f.w, "%d %s\r\n", code, last); err != nil {
+		return err
+	}
+	return f.w.Flush()
+}
+
+func (f *ftpSession) cleanPath(p string) string {
+	p = strings.TrimSpace(unquoteFTPPath(p))
+	p = strings.ReplaceAll(p, "\\", "/")
+	if p == "" {
+		return f.cwd
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = path.Join(f.cwd, p)
+	}
+	p = path.Clean("/" + strings.TrimPrefix(p, "/"))
+	if p == "." {
+		return "/"
+	}
+	return p
+}
+
+func unquoteFTPPath(p string) string {
+	p = strings.TrimSpace(p)
+	if len(p) >= 2 && p[0] == '"' && p[len(p)-1] == '"' {
+		p = p[1 : len(p)-1]
+		p = strings.ReplaceAll(p, "\"\"", "\"")
+	}
+	return p
+}
+
+func ftpQuotePath(p string) string {
+	return "\"" + strings.ReplaceAll(p, "\"", "\"\"") + "\""
+}
+
+func listPathArg(arg string) string {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return ""
+	}
+	fields := strings.Fields(arg)
+	if len(fields) == 0 {
+		return ""
+	}
+	for i, field := range fields {
+		if strings.HasPrefix(field, "-") {
+			continue
+		}
+		return strings.Join(fields[i:], " ")
+	}
+	return ""
+}
+
+func (f *ftpSession) cmdCWD(arg string) {
+	if !f.user.CanRead && !f.user.CanWrite {
+		_ = f.reply(550, "permission denied")
+		return
+	}
+	ftpPath := f.cleanPath(arg)
+	full, err := f.jail().resolve(ftpPath)
+	if err != nil {
+		_ = f.reply(550, err.Error())
+		return
+	}
+	st, err := os.Stat(full)
+	if err != nil {
+		_ = f.reply(550, err.Error())
+		return
+	}
+	if !st.IsDir() {
+		_ = f.reply(550, "not a directory")
+		return
+	}
+	f.cwd = ftpPath
+	_ = f.reply(250, "directory changed")
+}
+
+func (f *ftpSession) enterPassive(epsv bool) {
+	f.closeDataListener()
+
+	host, _, err := net.SplitHostPort(f.conn.LocalAddr().String())
+	if err != nil || host == "" {
+		_ = f.reply(425, "cannot determine local address")
+		return
+	}
+
+	ip := net.ParseIP(host)
+	if !epsv && ip.To4() == nil {
+		_ = f.reply(522, "network protocol not supported, use EPSV")
+		return
+	}
+
+	ln, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
+	if err != nil {
+		_ = f.reply(425, err.Error())
+		return
+	}
+	f.dataLn = ln
+
+	port := ln.Addr().(*net.TCPAddr).Port
+	if epsv {
+		_ = f.reply(229, fmt.Sprintf("Entering Extended Passive Mode (|||%d|)", port))
+		return
+	}
+
+	v4 := ip.To4()
+	p1 := port / 256
+	p2 := port % 256
+	_ = f.reply(227, fmt.Sprintf("Entering Passive Mode (%d,%d,%d,%d,%d,%d)", v4[0], v4[1], v4[2], v4[3], p1, p2))
+}
+
+func (f *ftpSession) acceptDataConn() (net.Conn, error) {
+	if f.dataLn == nil {
+		return nil, errors.New("passive mode not enabled")
+	}
+	ln := f.dataLn
+	f.dataLn = nil
+	defer ln.Close()
+
+	if tcpLn, ok := ln.(*net.TCPListener); ok {
+		_ = tcpLn.SetDeadline(time.Now().Add(30 * time.Second))
+	}
+
+	dc, err := ln.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	// Prevent passive data-port stealing by requiring the data connection to
+	// originate from the same IP as the control connection.
+	if f.clientIP != "" && remoteIP(dc.RemoteAddr()) != f.clientIP {
+		_ = dc.Close()
+		return nil, fmt.Errorf("data connection from unexpected IP %s", remoteIP(dc.RemoteAddr()))
+	}
+
+	return dc, nil
+}
+
+func (f *ftpSession) closeDataListener() {
+	if f.dataLn != nil {
+		_ = f.dataLn.Close()
+		f.dataLn = nil
+	}
+}
+
+func (f *ftpSession) cmdList(arg string, namesOnly bool) {
+	if !f.user.CanRead {
+		_ = f.reply(550, "permission denied")
+		return
+	}
+	ftpPath := f.cleanPath(listPathArg(arg))
+	full, err := f.jail().resolve(ftpPath)
+	if err != nil {
+		_ = f.reply(550, err.Error())
+		return
+	}
+	st, err := os.Stat(full)
+	if err != nil {
+		_ = f.reply(550, err.Error())
+		return
+	}
+
+	var lines []string
+	if st.IsDir() {
+		entries, err := os.ReadDir(full)
+		if err != nil {
+			_ = f.reply(550, err.Error())
+			return
+		}
+		for _, entry := range entries {
+			info, err := entry.Info()
+			if err != nil {
+				log.Printf("ftp list: stat %s/%s: %v", full, entry.Name(), err)
+				continue
+			}
+			if namesOnly {
+				lines = append(lines, entry.Name())
+			} else {
+				lines = append(lines, ftpListLine(info, entry.Name()))
+			}
+		}
+	} else if namesOnly {
+		lines = append(lines, path.Base(ftpPath))
+	} else {
+		lines = append(lines, ftpListLine(st, path.Base(ftpPath)))
+	}
+
+	if err := f.reply(150, "opening data connection"); err != nil {
+		return
+	}
+	dc, err := f.acceptDataConn()
+	if err != nil {
+		_ = f.reply(425, err.Error())
+		return
+	}
+	defer dc.Close()
+
+	for _, line := range lines {
+		if _, err := io.WriteString(dc, line+"\r\n"); err != nil {
+			_ = f.reply(426, err.Error())
+			return
+		}
+	}
+	_ = f.reply(226, "transfer complete")
+}
+
+func ftpListLine(info os.FileInfo, name string) string {
+	mtime := info.ModTime()
+	now := time.Now()
+	timePart := mtime.Format("Jan _2 15:04")
+	if mtime.Before(now.Add(-180*24*time.Hour)) || mtime.After(now.Add(24*time.Hour)) {
+		timePart = mtime.Format("Jan _2  2006")
+	}
+	return fmt.Sprintf("%s 1 ftp ftp %12d %s %s", ftpModeString(info.Mode()), info.Size(), timePart, name)
+}
+
+func ftpModeString(mode os.FileMode) string {
+	buf := []byte("----------")
+	if mode.IsDir() {
+		buf[0] = 'd'
+	} else if mode&os.ModeSymlink != 0 {
+		buf[0] = 'l'
+	}
+	bits := []struct {
+		bit os.FileMode
+		idx int
+		chr byte
+	}{
+		{0400, 1, 'r'}, {0200, 2, 'w'}, {0100, 3, 'x'},
+		{0040, 4, 'r'}, {0020, 5, 'w'}, {0010, 6, 'x'},
+		{0004, 7, 'r'}, {0002, 8, 'w'}, {0001, 9, 'x'},
+	}
+	for _, b := range bits {
+		if mode&b.bit != 0 {
+			buf[b.idx] = b.chr
+		}
+	}
+	return string(buf)
+}
+
+func (f *ftpSession) cmdRetr(arg string) {
+	if !f.user.CanRead {
+		_ = f.reply(550, "permission denied")
+		return
+	}
+	ftpPath := f.cleanPath(arg)
+	full, err := f.jail().resolve(ftpPath)
+	if err != nil {
+		f.restartOffset = 0
+		_ = f.reply(550, err.Error())
+		return
+	}
+	file, err := os.Open(full)
+	if err != nil {
+		f.restartOffset = 0
+		_ = f.reply(550, err.Error())
+		return
+	}
+	defer file.Close()
+
+	if f.restartOffset > 0 {
+		if _, err := file.Seek(f.restartOffset, io.SeekStart); err != nil {
+			f.restartOffset = 0
+			_ = f.reply(550, err.Error())
+			return
+		}
+	}
+	f.restartOffset = 0
+
+	if err := f.reply(150, "opening data connection"); err != nil {
+		return
+	}
+	dc, err := f.acceptDataConn()
+	if err != nil {
+		_ = f.reply(425, err.Error())
+		return
+	}
+	defer dc.Close()
+
+	if _, err := io.Copy(dc, file); err != nil {
+		_ = f.reply(426, err.Error())
+		return
+	}
+	_ = f.reply(226, "transfer complete")
+}
+
+func (f *ftpSession) cmdStor(arg string, appendMode bool) {
+	if !f.user.CanWrite {
+		f.restartOffset = 0
+		_ = f.reply(550, "permission denied")
+		return
+	}
+	ftpPath := f.cleanPath(arg)
+	full, err := f.jail().resolve(ftpPath)
+	if err != nil {
+		f.restartOffset = 0
+		_ = f.reply(550, err.Error())
+		return
+	}
+
+	if err := f.reply(150, "opening data connection"); err != nil {
+		f.restartOffset = 0
+		return
+	}
+	dc, err := f.acceptDataConn()
+	if err != nil {
+		f.restartOffset = 0
+		_ = f.reply(425, err.Error())
+		return
+	}
+	defer dc.Close()
+
+	flags := os.O_CREATE | os.O_WRONLY
+	switch {
+	case appendMode:
+		flags |= os.O_APPEND
+	case f.restartOffset > 0:
+		// Keep existing bytes and resume at requested offset.
+	default:
+		flags |= os.O_TRUNC
+	}
+
+	file, err := os.OpenFile(full, flags, 0600)
+	if err != nil {
+		f.restartOffset = 0
+		_ = f.reply(550, err.Error())
+		return
+	}
+
+	if f.restartOffset > 0 && !appendMode {
+		if _, err := file.Seek(f.restartOffset, io.SeekStart); err != nil {
+			f.restartOffset = 0
+			_ = file.Close()
+			_ = f.reply(550, err.Error())
+			return
+		}
+	}
+	f.restartOffset = 0
+
+	log.Printf("upload protocol=ftp path=%q", ftpPath)
+	_, copyErr := io.Copy(file, dc)
+	closeErr := file.Close()
+	if copyErr != nil {
+		_ = f.reply(426, copyErr.Error())
+		return
+	}
+	if closeErr != nil {
+		_ = f.reply(451, closeErr.Error())
+		return
+	}
+
+	f.announceUpload(ftpPath, full)
+	_ = f.reply(226, "transfer complete")
+}
+
+func (f *ftpSession) announceUpload(ftpPath, fullPath string) {
+	log.Printf("upload complete: %q", ftpPath)
+	if hasTempExt(ftpPath, f.tempExts) {
+		log.Printf("upload complete: %q has temp extension, deferring CompletedUploads notification", ftpPath)
+		return
+	}
+	evt := CompletedUpload{
+		Username:     f.username,
+		FullFilePath: fullPath,
+		FilePath:     ftpPath,
+		ClientIP:     f.clientIP,
+	}
+	select {
+	case f.server.CompletedUploads <- evt:
+	default:
+		log.Printf("upload complete: CompletedUploads queue full, notification for %q dropped", ftpPath)
+	}
+}
+
+func (f *ftpSession) cmdRest(arg string) {
+	offset, err := strconv.ParseInt(strings.TrimSpace(arg), 10, 64)
+	if err != nil || offset < 0 {
+		f.restartOffset = 0
+		_ = f.reply(501, "invalid restart offset")
+		return
+	}
+	f.restartOffset = offset
+	_ = f.reply(350, "restart position accepted")
+}
+
+func (f *ftpSession) cmdSize(arg string) {
+	if !f.user.CanRead {
+		_ = f.reply(550, "permission denied")
+		return
+	}
+	full, err := f.jail().resolve(f.cleanPath(arg))
+	if err != nil {
+		_ = f.reply(550, err.Error())
+		return
+	}
+	st, err := os.Stat(full)
+	if err != nil {
+		_ = f.reply(550, err.Error())
+		return
+	}
+	if st.IsDir() {
+		_ = f.reply(550, "not a regular file")
+		return
+	}
+	_ = f.reply(213, strconv.FormatInt(st.Size(), 10))
+}
+
+func (f *ftpSession) cmdMDTM(arg string) {
+	if !f.user.CanRead {
+		_ = f.reply(550, "permission denied")
+		return
+	}
+	full, err := f.jail().resolve(f.cleanPath(arg))
+	if err != nil {
+		_ = f.reply(550, err.Error())
+		return
+	}
+	st, err := os.Stat(full)
+	if err != nil {
+		_ = f.reply(550, err.Error())
+		return
+	}
+	_ = f.reply(213, st.ModTime().UTC().Format("20060102150405"))
+}
+
+func (f *ftpSession) cmdDelete(arg string) {
+	if !f.user.CanWrite {
+		_ = f.reply(550, "permission denied")
+		return
+	}
+	full, err := f.jail().resolve(f.cleanPath(arg))
+	if err != nil {
+		_ = f.reply(550, err.Error())
+		return
+	}
+	if err := os.Remove(full); err != nil {
+		_ = f.reply(550, err.Error())
+		return
+	}
+	_ = f.reply(250, "deleted")
+}
+
+func (f *ftpSession) cmdMkdir(arg string) {
+	if !f.user.CanWrite {
+		_ = f.reply(550, "permission denied")
+		return
+	}
+	ftpPath := f.cleanPath(arg)
+	full, err := f.jail().resolve(ftpPath)
+	if err != nil {
+		_ = f.reply(550, err.Error())
+		return
+	}
+	if err := os.Mkdir(full, 0750); err != nil {
+		_ = f.reply(550, err.Error())
+		return
+	}
+	_ = f.reply(257, fmt.Sprintf("%s created", ftpQuotePath(ftpPath)))
+}
+
+func (f *ftpSession) cmdRmdir(arg string) {
+	if !f.user.CanWrite {
+		_ = f.reply(550, "permission denied")
+		return
+	}
+	full, err := f.jail().resolve(f.cleanPath(arg))
+	if err != nil {
+		_ = f.reply(550, err.Error())
+		return
+	}
+	if err := os.Remove(full); err != nil {
+		_ = f.reply(550, err.Error())
+		return
+	}
+	_ = f.reply(250, "removed")
+}
+
+func (f *ftpSession) cmdRnfr(arg string) {
+	if !f.user.CanWrite {
+		_ = f.reply(550, "permission denied")
+		return
+	}
+	ftpPath := f.cleanPath(arg)
+	full, err := f.jail().resolve(ftpPath)
+	if err != nil {
+		_ = f.reply(550, err.Error())
+		return
+	}
+	if _, err := os.Stat(full); err != nil {
+		_ = f.reply(550, err.Error())
+		return
+	}
+	f.rnfrPath = ftpPath
+	f.rnfrFullPath = full
+	_ = f.reply(350, "ready for RNTO")
+}
+
+func (f *ftpSession) cmdRnto(arg string) {
+	if !f.user.CanWrite {
+		f.rnfrPath = ""
+		f.rnfrFullPath = ""
+		_ = f.reply(550, "permission denied")
+		return
+	}
+	if f.rnfrPath == "" || f.rnfrFullPath == "" {
+		_ = f.reply(503, "send RNFR first")
+		return
+	}
+	oldPath := f.rnfrPath
+	oldFull := f.rnfrFullPath
+	f.rnfrPath = ""
+	f.rnfrFullPath = ""
+
+	newPath := f.cleanPath(arg)
+	newFull, err := f.jail().resolve(newPath)
+	if err != nil {
+		_ = f.reply(550, err.Error())
+		return
+	}
+	if err := os.Rename(oldFull, newFull); err != nil {
+		_ = f.reply(550, err.Error())
+		return
+	}
+	if hasTempExt(oldPath, f.tempExts) && !hasTempExt(newPath, f.tempExts) {
+		log.Printf("upload complete via rename: %q -> %q", oldPath, newPath)
+		f.announceUpload(newPath, newFull)
+	}
+	_ = f.reply(250, "renamed")
 }
