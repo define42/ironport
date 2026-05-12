@@ -40,7 +40,7 @@ func main() {
         signer, _ = ssh.NewSignerFromKey(priv)
     }
 
-    srv := sftpserver.NewServer(":2022", users, signer)
+    srv := sftpserver.NewServer(":2022", ":2121", users, signer)
 
     // Drain upload notifications in the background.
     go func() {
