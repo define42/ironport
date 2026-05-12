@@ -12,6 +12,9 @@ A production-ready, embeddable SFTP server library for Go with a security-first 
 - **Graceful shutdown** — `Close()` stops the listener; in-flight sessions are not terminated
 - **Thread-safe** — all shared state is protected by `sync.RWMutex`
 - **Handshake timeout** — connections that do not complete the SSH handshake within 30 seconds are dropped
+- **Idle-session timeout** — configurable via `Server.IdleTimeout` (default 15 minutes); inactive authenticated SFTP sessions are reaped
+- **Empty-password protection** — users whose stored `Password` is empty cannot authenticate via password, and empty supplied passwords are always rejected
+- **Chown opt-in** — `Setstat`/`Fsetstat` requests that try to change file ownership (uid/gid) are rejected with a permission error unless `Server.AllowChown` is explicitly set to `true`. Symlink creation by clients is always refused so a planted link cannot be followed to escape the jail.
 
 ## Quick start
 
@@ -40,7 +43,8 @@ func main() {
         signer, _ = ssh.NewSignerFromKey(priv)
     }
 
-    srv := sftpserver.NewServer(":2022", users, signer)
+    // ftpAddr is "" to disable the (plaintext) FTP listener.
+    srv := sftpserver.NewServer(":2022", "", "", users, signer)
 
     // Drain upload notifications in the background.
     go func() {
@@ -53,6 +57,22 @@ func main() {
     log.Fatal(srv.ListenAndServe())
 }
 ```
+
+## FTP support (plaintext, opt-in)
+
+This package also exposes a passive-mode FTP listener that shares the SFTP
+user database, jails, and permission flags. **FTP transmits credentials and
+data in the clear and this server does not implement FTPS.** FTP is therefore
+disabled by default; enable it only on a trusted network segment where you
+control all clients and intermediate hops:
+
+```go
+srv := sftpserver.NewServer(":2022", ":2121", "5000-5010", users, signer)
+```
+
+When FTP is enabled, only passive mode (`PASV` / `EPSV`) is supported; active
+mode (`PORT` / `EPRT`) is refused, and the data connection peer IP is checked
+against the control connection to prevent passive-port stealing.
 
 ## Public-key authentication
 
