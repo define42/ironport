@@ -18,6 +18,7 @@ package sftpserver
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/binary"
@@ -39,6 +40,10 @@ import (
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
+
+// ErrServerClosed is returned by ListenAndServe and ListenAndServeContext
+// after Shutdown or Close has been called.
+var ErrServerClosed = errors.New("sftpserver: server closed")
 
 // Default timeouts and limits applied unless callers override them.
 const (
@@ -155,31 +160,69 @@ type CompletedUpload struct {
 }
 
 // Server is a self-contained SFTP server with optional FTP support.
+//
+// Concurrency model and field-mutation rules:
+//
+// The following fields configure the server and MUST NOT be mutated after
+// ListenAndServe or ListenAndServeContext has been called. Set them via
+// NewServer or by direct assignment before starting the server:
+//
+//   - Addr, FTPAddr, FTPPassivePortRange: read once when listeners are
+//     created.
+//   - Signer: captured when the SSH server config is built at startup.
+//   - CompletedUploads: read once per accepted connection at startup-time
+//     plumbing; replacing the channel while the server is running races
+//     with handler goroutines.
+//
+// The following fields MAY be mutated while the server is running. They are
+// read under s.mu and applied to connections accepted after the change:
+//
+//   - TempExtensions, IdleTimeout, AllowChown.
+//
+// The Users map MUST NOT be mutated directly by external callers, even
+// before the server is started, because background handler goroutines read
+// it under s.mu. Use AddUser, RemoveUser, RemoveAllUsers, AddUserKey, and
+// RemoveUserKey to make all mutations safely.
 type Server struct {
 	// Addr is the TCP address to listen on for SFTP, e.g. ":2022".
+	// Must not be modified after ListenAndServe has been called.
 	Addr string
 	// FTPAddr is the TCP address to listen on for FTP, e.g. ":2121".
 	// Set it to "" to disable FTP.
+	// Must not be modified after ListenAndServe has been called.
 	FTPAddr string
 	// FTPPassivePortRange optionally constrains FTP passive-mode data listeners
 	// to a single port or inclusive range such as "5000-5010". Leave it empty
 	// to let the OS choose any available port.
+	// Must not be modified after ListenAndServe has been called.
 	FTPPassivePortRange string
 	// Users maps usernames to their credentials and jail roots.
+	// External callers must not mutate this map directly; use AddUser,
+	// RemoveUser, RemoveAllUsers, AddUserKey, or RemoveUserKey instead so
+	// that mutations are serialised against background handler goroutines.
 	Users map[string]UserInfo
-	// mu protects Users and listeners for concurrent reads and writes.
+	// mu protects Users, listeners, and the lifecycle fields below for
+	// concurrent reads and writes.
 	mu sync.RWMutex
 	// ln is the active SFTP listener; set by ListenAndServe and closed by Close.
 	ln net.Listener
 	// ftpLn is the active FTP listener; set by ListenAndServe and closed by Close.
 	ftpLn net.Listener
 	// Signer is the host key used for the SSH handshake.
+	// Must not be modified after ListenAndServe has been called.
 	Signer ssh.Signer
 	// CompletedUploads receives a CompletedUpload describing each file whose
 	// write has finished successfully (i.e. the client closed the file
 	// without error). The channel is buffered; sends are non-blocking so a
 	// slow consumer never stalls an upload. Callers should drain the
 	// channel continuously.
+	//
+	// The channel is closed automatically after a successful Shutdown
+	// completes (all in-flight handler goroutines have returned), so a
+	// `for ev := range srv.CompletedUploads` consumer loop terminates
+	// cleanly. Close() does not close this channel.
+	//
+	// Must not be replaced after ListenAndServe has been called.
 	CompletedUploads chan CompletedUpload
 	// TempExtensions is an optional list of file extensions (each beginning
 	// with a leading dot, e.g. ".tmp", ".writing") that mark files as still
@@ -211,6 +254,28 @@ type Server struct {
 	// Setting this field after the server has started has effect only on
 	// connections accepted afterwards.
 	AllowChown bool
+
+	// --- lifecycle state (guarded by mu unless noted) ---
+
+	// lifecycleOnce lazily allocates shutdownCh / activeConns the first
+	// time the server is started or has its lifecycle state queried.
+	lifecycleOnce sync.Once
+	// shutdownCh is closed when Shutdown or Close is invoked. Goroutines
+	// can select on it to learn that the server is going away. Allocated
+	// by lifecycleOnce.
+	shutdownCh chan struct{}
+	// shutdownOnce guards exactly-once shutdown initiation (closing
+	// shutdownCh, force-closing active connections).
+	shutdownOnce sync.Once
+	// activeConns tracks accepted connections so Shutdown can force-close
+	// them and unblock in-flight handshakes, uploads, and listings.
+	activeConns map[net.Conn]struct{}
+	// wg counts in-flight connection-handler goroutines. Shutdown waits
+	// on it (or until its context expires).
+	wg sync.WaitGroup
+	// uploadsCloseOnce guards closing of CompletedUploads after all
+	// handlers have returned.
+	uploadsCloseOnce sync.Once
 }
 
 // AddUser adds or replaces a user entry in the server's user map.
@@ -366,9 +431,35 @@ func (s *Server) listenFTPData(host string) (net.Listener, error) {
 }
 
 // ListenAndServe starts the SFTP server and, when FTPAddr is non-empty, the FTP
-// server too. It blocks until Close is called or an unexpected listener error
-// occurs. It returns nil when stopped via Close.
+// server too. It blocks until Close or Shutdown is called or an unexpected
+// listener error occurs. It returns nil when stopped via Close or Shutdown.
+//
+// ListenAndServe does NOT wait for in-flight session goroutines to finish
+// before returning. Use Shutdown for an orderly drain.
 func (s *Server) ListenAndServe() error {
+	return s.ListenAndServeContext(context.Background())
+}
+
+// ListenAndServeContext is like ListenAndServe but additionally observes
+// ctx: cancelling ctx triggers a Shutdown with a background context so that
+// listeners are closed and active connections are signalled. Like
+// ListenAndServe, it returns when the listeners stop accepting; it does not
+// wait for in-flight handlers.
+//
+// A nil ctx is treated as context.Background().
+func (s *Server) ListenAndServeContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.ensureLifecycle()
+
+	// If the server is already shut down, refuse to start again.
+	select {
+	case <-s.shutdownCh:
+		return ErrServerClosed
+	default:
+	}
+
 	cfg := s.sshServerConfig()
 
 	sftpLn, err := net.Listen("tcp", s.Addr)
@@ -396,6 +487,20 @@ func (s *Server) ListenAndServe() error {
 		s.ftpLn = nil
 		s.mu.Unlock()
 	}()
+
+	// Bridge context cancellation to Shutdown so callers can stop the
+	// server by cancelling ctx. The watcher exits when the server has
+	// finished shutting down (shutdownCh closed) to avoid leaking the
+	// goroutine across server restarts.
+	if ctx != context.Background() && ctx.Done() != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = s.Shutdown(context.Background())
+			case <-s.shutdownCh:
+			}
+		}()
+	}
 
 	log.Printf("SFTP listening on %s", sftpLn.Addr())
 	workers := 1
@@ -435,7 +540,18 @@ func (s *Server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig) error {
 			continue
 		}
 		backoff = 0
-		go handleConn(nc, cfg, s.CompletedUploads, s.tempExtensions(), s.idleTimeout(), s.allowChown())
+		deregister, ok := s.registerConn(nc)
+		if !ok {
+			// Server is shutting down; the connection has already been
+			// closed by registerConn.
+			continue
+		}
+		s.wg.Add(1)
+		go func(nc net.Conn) {
+			defer s.wg.Done()
+			defer deregister()
+			handleConn(nc, cfg, s.CompletedUploads, s.tempExtensions(), s.idleTimeout(), s.allowChown())
+		}(nc)
 	}
 }
 
@@ -453,7 +569,16 @@ func (s *Server) serveFTP(ln net.Listener) error {
 			continue
 		}
 		backoff = 0
-		go s.handleFTPConn(nc, s.tempExtensions())
+		deregister, ok := s.registerConn(nc)
+		if !ok {
+			continue
+		}
+		s.wg.Add(1)
+		go func(nc net.Conn) {
+			defer s.wg.Done()
+			defer deregister()
+			s.handleFTPConn(nc, s.tempExtensions())
+		}(nc)
 	}
 }
 
@@ -536,10 +661,146 @@ func hasTempExt(name string, tempExts []string) bool {
 
 // Close stops both listeners, causing ListenAndServe to return nil. It is safe
 // to call concurrently with active connections; in-flight connections are not
-// terminated. Calling Close before ListenAndServe has been called, or after it
-// has already returned, is a no-op.
+// terminated and the CompletedUploads channel is not closed. Calling Close
+// before ListenAndServe has been called, or after it has already returned, is
+// a no-op.
+//
+// For an orderly shutdown that signals in-flight sessions to stop, waits for
+// them to return, and closes CompletedUploads, use Shutdown.
 func (s *Server) Close() error {
 	return s.closeListeners()
+}
+
+// Shutdown gracefully stops the server:
+//
+//  1. Both listeners are closed (causing ListenAndServe to return nil).
+//  2. All currently-active SFTP and FTP connections are force-closed, which
+//     unblocks any in-flight SSH handshakes, file reads, file writes, and
+//     directory listings with an error.
+//  3. Shutdown waits until every handler goroutine has returned, or until
+//     ctx is done — whichever comes first.
+//  4. Once all handlers have returned (whether before or after Shutdown
+//     itself returns) the CompletedUploads channel is closed exactly once
+//     so that consumers using `for ev := range srv.CompletedUploads` exit
+//     cleanly.
+//
+// Shutdown returns ctx.Err() if it timed out waiting for handlers, otherwise
+// it returns any error from closing the listeners. It is safe to call
+// concurrently and multiple times: subsequent calls observe that shutdown
+// has already begun and only wait for completion.
+//
+// A nil ctx is treated as context.Background() (wait indefinitely).
+func (s *Server) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.ensureLifecycle()
+
+	s.shutdownOnce.Do(func() {
+		s.mu.Lock()
+		close(s.shutdownCh)
+		// Force-close every active connection so handlers unblock.
+		for c := range s.activeConns {
+			_ = c.Close()
+		}
+		s.mu.Unlock()
+
+		// Close CompletedUploads exactly once, after every handler has
+		// returned. Doing this in a goroutine (rather than synchronously
+		// in Shutdown) means a Shutdown that times out still leaves the
+		// channel to be closed when handlers eventually finish, avoiding
+		// a send-on-closed-channel panic.
+		go func() {
+			s.wg.Wait()
+			s.uploadsCloseOnce.Do(func() {
+				if s.CompletedUploads != nil {
+					close(s.CompletedUploads)
+				}
+			})
+		}()
+	})
+
+	closeErr := s.closeListeners()
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return closeErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// ShutdownContext returns a context that is cancelled when Shutdown or Close
+// has been initiated. It is useful for plumbing server lifecycle into custom
+// handlers, callbacks, or external workers that should stop when the server
+// is going away. The returned context is shared across callers and is never
+// cancelled by anything other than a server shutdown.
+func (s *Server) ShutdownContext() context.Context {
+	s.ensureLifecycle()
+	return shutdownContext{done: s.shutdownCh}
+}
+
+// shutdownContext implements context.Context backed by a server's shutdownCh.
+// It carries no values or deadline.
+type shutdownContext struct {
+	done <-chan struct{}
+}
+
+func (c shutdownContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c shutdownContext) Done() <-chan struct{}       { return c.done }
+func (c shutdownContext) Err() error {
+	select {
+	case <-c.done:
+		return ErrServerClosed
+	default:
+		return nil
+	}
+}
+func (c shutdownContext) Value(key any) any { return nil }
+
+// ensureLifecycle lazily allocates the shutdownCh and activeConns map. It is
+// safe to call multiple times and concurrently.
+func (s *Server) ensureLifecycle() {
+	s.lifecycleOnce.Do(func() {
+		s.mu.Lock()
+		if s.shutdownCh == nil {
+			s.shutdownCh = make(chan struct{})
+		}
+		if s.activeConns == nil {
+			s.activeConns = make(map[net.Conn]struct{})
+		}
+		s.mu.Unlock()
+	})
+}
+
+// registerConn records nc in the active-connection set so that Shutdown can
+// force-close it. The returned deregister function MUST be called by the
+// caller (typically via defer) when the connection's handler returns. The
+// ok return is false if the server is already shutting down, in which case
+// nc has been closed and no goroutine should be spawned.
+func (s *Server) registerConn(nc net.Conn) (deregister func(), ok bool) {
+	s.ensureLifecycle()
+	s.mu.Lock()
+	select {
+	case <-s.shutdownCh:
+		s.mu.Unlock()
+		_ = nc.Close()
+		return func() {}, false
+	default:
+	}
+	s.activeConns[nc] = struct{}{}
+	s.mu.Unlock()
+	return func() {
+		s.mu.Lock()
+		delete(s.activeConns, nc)
+		s.mu.Unlock()
+	}, true
 }
 
 func (s *Server) closeListeners() error {

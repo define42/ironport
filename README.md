@@ -8,8 +8,9 @@ A production-ready, embeddable SFTP server library for Go with a security-first 
 - **Per-user jail (chroot)** — each user is confined to a configurable root directory; path traversal and symlink escapes are blocked
 - **Fine-grained permissions** — independent `CanRead` / `CanWrite` flags per user
 - **Dynamic user management** — add, remove, and update users and their authorized keys at runtime without restarting the server
-- **Upload notifications** — a buffered `CompletedUploads` channel delivers a `CompletedUpload` struct (username, full on-disk path, jail-relative path, and client IP) for every successfully closed upload
-- **Graceful shutdown** — `Close()` stops the listener; in-flight sessions are not terminated
+- **Upload notifications** — a buffered `CompletedUploads` channel delivers a `CompletedUpload` struct (username, full on-disk path, jail-relative path, and client IP) for every successfully closed upload. The channel is closed automatically by `Shutdown` once all in-flight handlers have finished, so a `for ev := range srv.CompletedUploads` consumer loop terminates cleanly.
+- **Graceful shutdown** — `Shutdown(ctx)` closes the listeners, force-closes active sessions to unblock in-flight handshakes/uploads/listings, waits for handler goroutines to return (or until `ctx` is done), and closes `CompletedUploads`. `Close()` remains available for a non-graceful stop that only closes the listeners.
+- **Context propagation** — `ListenAndServeContext(ctx)` ties the server lifetime to a `context.Context`: cancelling the context triggers `Shutdown`. `ShutdownContext()` exposes a context that fires when the server starts shutting down.
 - **Thread-safe** — all shared state is protected by `sync.RWMutex`
 - **Handshake timeout** — connections that do not complete the SSH handshake within 30 seconds are dropped
 - **Idle-session timeout** — configurable via `Server.IdleTimeout` (default 15 minutes); inactive authenticated SFTP sessions are reaped

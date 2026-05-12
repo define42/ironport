@@ -3,6 +3,7 @@ package sftpserver
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -2667,5 +2668,210 @@ func TestSFTPServer_SymlinkRejected(t *testing.T) {
 	// Confirm no link was created on disk.
 	if _, err := os.Lstat(filepath.Join(root, "link.txt")); !os.IsNotExist(err) {
 		t.Errorf("link.txt exists on disk after rejected Symlink: err=%v", err)
+	}
+}
+
+// TestServer_Shutdown_ClosesCompletedUploads verifies that a graceful
+// Shutdown closes the CompletedUploads channel exactly once after all
+// in-flight handlers have returned, so consumers using `for range` exit
+// cleanly.
+func TestServer_Shutdown_ClosesCompletedUploads(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"u": {Password: "pw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv := NewServer("127.0.0.1:0", "", "", users, testSigner(t))
+
+	errc := make(chan error, 1)
+	go func() { errc <- srv.ListenAndServe() }()
+
+	// Wait until the listener is up.
+	for i := 0; i < 100 && srv.ListeningAddr() == nil; i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.ListeningAddr() == nil {
+		t.Fatal("server did not start in time")
+	}
+
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Errorf("ListenAndServe returned %v; want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ListenAndServe did not return after Shutdown")
+	}
+
+	// Channel must be closed; ranging must terminate without panicking.
+	timeout := time.After(2 * time.Second)
+	done := make(chan struct{})
+	go func() {
+		for range srv.CompletedUploads {
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-timeout:
+		t.Fatal("CompletedUploads was not closed by Shutdown")
+	}
+
+	// A second Shutdown must not panic (channel already closed) and must
+	// return promptly.
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Errorf("second Shutdown: %v", err)
+	}
+}
+
+// TestServer_Shutdown_DrainsActiveSession verifies that Shutdown force-closes
+// active SSH connections so in-flight sessions return, and that Shutdown
+// itself returns once all handlers have finished.
+func TestServer_Shutdown_DrainsActiveSession(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"u": {Password: "pw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv := NewServer("127.0.0.1:0", "", "", users, testSigner(t))
+
+	errc := make(chan error, 1)
+	go func() { errc <- srv.ListenAndServe() }()
+
+	for i := 0; i < 100 && srv.ListeningAddr() == nil; i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	addr := srv.ListeningAddr()
+	if addr == nil {
+		t.Fatal("server did not start in time")
+	}
+
+	sshCfg := &ssh.ClientConfig{
+		User:            "u",
+		Auth:            []ssh.AuthMethod{ssh.Password("pw")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	conn, err := ssh.Dial("tcp", addr.String(), sshCfg)
+	if err != nil {
+		t.Fatalf("ssh.Dial: %v", err)
+	}
+	client, err := sftp.NewClient(conn)
+	if err != nil {
+		conn.Close()
+		t.Fatalf("sftp.NewClient: %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+		_ = conn.Close()
+	}()
+
+	// Sanity: session is usable before Shutdown.
+	if _, err := client.ReadDir("/"); err != nil {
+		t.Fatalf("ReadDir before Shutdown: %v", err)
+	}
+
+	// Shutdown must return promptly because the connection is force-closed.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
+		t.Errorf("Shutdown took %v; expected fast drain", elapsed)
+	}
+
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Errorf("ListenAndServe returned %v; want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ListenAndServe did not return after Shutdown")
+	}
+
+	// Further client operations on the now-closed session must fail.
+	if _, err := client.ReadDir("/"); err == nil {
+		t.Error("ReadDir after Shutdown succeeded; expected error")
+	}
+}
+
+// TestServer_ListenAndServeContext_Cancellation verifies that cancelling the
+// context passed to ListenAndServeContext shuts the server down.
+func TestServer_ListenAndServeContext_Cancellation(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"u": {Password: "pw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv := NewServer("127.0.0.1:0", "", "", users, testSigner(t))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() { errc <- srv.ListenAndServeContext(ctx) }()
+
+	for i := 0; i < 100 && srv.ListeningAddr() == nil; i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.ListeningAddr() == nil {
+		cancel()
+		t.Fatal("server did not start in time")
+	}
+
+	cancel()
+
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Errorf("ListenAndServeContext returned %v; want nil", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ListenAndServeContext did not return after ctx cancel")
+	}
+
+	// ShutdownContext must reflect the closed state.
+	if err := srv.ShutdownContext().Err(); !errors.Is(err, ErrServerClosed) {
+		t.Errorf("ShutdownContext().Err() = %v; want ErrServerClosed", err)
+	}
+}
+
+// TestServer_Shutdown_BeforeListenAndServe verifies that Shutdown is a safe
+// no-op when the server has never been started: it returns nil and closes
+// CompletedUploads so consumers don't deadlock.
+func TestServer_Shutdown_BeforeListenAndServe(t *testing.T) {
+	srv := NewServer(":0", "", "", map[string]UserInfo{}, testSigner(t))
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Errorf("Shutdown before ListenAndServe: %v", err)
+	}
+	// Channel should now be closed.
+	select {
+	case _, ok := <-srv.CompletedUploads:
+		if ok {
+			t.Error("CompletedUploads delivered a value after pre-start Shutdown")
+		}
+	case <-time.After(time.Second):
+		t.Error("CompletedUploads not closed by pre-start Shutdown")
+	}
+}
+
+// TestServer_ShutdownContext_Cancelled verifies that ShutdownContext returns
+// a context that is cancelled when the server is shut down.
+func TestServer_ShutdownContext_Cancelled(t *testing.T) {
+	srv := NewServer(":0", "", "", map[string]UserInfo{}, testSigner(t))
+	sc := srv.ShutdownContext()
+	if err := sc.Err(); err != nil {
+		t.Fatalf("ShutdownContext().Err() before shutdown = %v; want nil", err)
+	}
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	select {
+	case <-sc.Done():
+	case <-time.After(time.Second):
+		t.Fatal("ShutdownContext.Done() did not fire after Shutdown")
+	}
+	if err := sc.Err(); !errors.Is(err, ErrServerClosed) {
+		t.Errorf("ShutdownContext().Err() after shutdown = %v; want ErrServerClosed", err)
 	}
 }
