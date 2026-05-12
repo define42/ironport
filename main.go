@@ -12,6 +12,9 @@ import (
 
 func main() {
 	hostKeyPath := flag.String("host-key", "", "path to a PEM-encoded private key file to use as the server host key (generated if not provided)")
+	sftpAddr := flag.String("sftp-addr", ":2022", "TCP address to listen on for SFTP")
+	ftpAddr := flag.String("ftp-addr", "", "TCP address to listen on for plaintext FTP (empty to disable; credentials are sent in the clear, see README)")
+	ftpPassive := flag.String("ftp-passive", "5000-5010", "FTP passive-mode data port range (used only when -ftp-addr is set)")
 	flag.Parse()
 
 	// Example user DB (replace with your auth source).
@@ -32,7 +35,7 @@ func main() {
 		signer = mustHostKey()
 	}
 
-	srv := sftpserver.NewServer(":2022", ":2121", "5000-5010", users, signer)
+	srv := sftpserver.NewServer(*sftpAddr, *ftpAddr, *ftpPassive, users, signer)
 	// Files written with one of these extensions are considered "still being
 	// written" and won't be announced on CompletedUploads until the client
 	// renames them to a final (non-temp) name.

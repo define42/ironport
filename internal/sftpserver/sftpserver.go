@@ -32,11 +32,86 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
+
+// Default timeouts and limits applied unless callers override them.
+const (
+	// defaultSFTPIdleTimeout is the default per-connection inactivity timeout
+	// applied to SFTP sessions when Server.IdleTimeout is zero. A client that
+	// sends no data for this duration has its connection closed.
+	defaultSFTPIdleTimeout = 15 * time.Minute
+	// sshHandshakeTimeout bounds the time the raw TCP connection has to
+	// complete the SSH handshake before being dropped.
+	sshHandshakeTimeout = 30 * time.Second
+	// ftpMaxControlLineLen caps the size of a single FTP control command in
+	// bytes (including the CRLF terminator). Longer commands are rejected to
+	// prevent unbounded memory growth from malicious clients.
+	ftpMaxControlLineLen = 4096
+)
+
+// errFTPLineTooLong is returned when an FTP client sends a control-channel
+// command that exceeds ftpMaxControlLineLen bytes.
+var errFTPLineTooLong = errors.New("ftp control line too long")
+
+// idleConn wraps a net.Conn and resets the read deadline before each Read so
+// that a connection is closed when no data has been received within the
+// configured idle timeout. A timeout of zero disables the deadline.
+type idleConn struct {
+	net.Conn
+	timeoutNs atomic.Int64
+}
+
+func (c *idleConn) Read(b []byte) (int, error) {
+	if d := time.Duration(c.timeoutNs.Load()); d > 0 {
+		_ = c.Conn.SetReadDeadline(time.Now().Add(d))
+	} else {
+		_ = c.Conn.SetReadDeadline(time.Time{})
+	}
+	return c.Conn.Read(b)
+}
+
+// setTimeout configures the idle timeout. A zero or negative value disables
+// the deadline.
+func (c *idleConn) setTimeout(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	c.timeoutNs.Store(int64(d))
+}
+
+// ftpErrMsg maps an internal error to a generic, client-safe FTP reply
+// message. Raw os/syscall errors are not exposed to clients because they
+// often include absolute on-disk paths or other server-side details that
+// would leak filesystem layout.
+func ftpErrMsg(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, errFTPLineTooLong):
+		return "command line too long"
+	case errors.Is(err, syscall.ENOTEMPTY):
+		return "directory not empty"
+	case errors.Is(err, syscall.EISDIR):
+		return "is a directory"
+	case errors.Is(err, syscall.ENOTDIR):
+		return "not a directory"
+	case errors.Is(err, syscall.EINVAL):
+		return "invalid argument"
+	case errors.Is(err, os.ErrNotExist):
+		return "no such file or directory"
+	case errors.Is(err, os.ErrPermission):
+		return "permission denied"
+	case errors.Is(err, os.ErrExist):
+		return "file exists"
+	}
+	return "request failed"
+}
 
 // NewSignerFromFile reads a PEM-encoded private key from the given file path
 // and returns an ssh.Signer suitable for use as a server host key.
@@ -121,6 +196,12 @@ type Server struct {
 	// Matching is case-insensitive. Setting this field after the server has
 	// started has effect only on connections accepted afterwards.
 	TempExtensions []string
+	// IdleTimeout bounds how long an authenticated SFTP connection may sit
+	// without receiving any data before being closed. A zero value selects
+	// the package default (15 minutes); a negative value disables the idle
+	// timeout entirely. Setting this field after the server has started has
+	// effect only on connections accepted afterwards.
+	IdleTimeout time.Duration
 }
 
 // AddUser adds or replaces a user entry in the server's user map.
@@ -329,31 +410,55 @@ func (s *Server) ListenAndServe() error {
 }
 
 func (s *Server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig) error {
+	var backoff time.Duration
 	for {
 		nc, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			log.Println("sftp accept:", err)
-			return err
+			// Transient accept errors should not tear the server down: a
+			// momentary EMFILE/ENFILE or similar would otherwise kill all
+			// listeners. Apply exponential backoff between 5ms and 1s.
+			backoff = nextAcceptBackoff(backoff)
+			log.Printf("sftp accept: %v; retrying in %s", err, backoff)
+			time.Sleep(backoff)
+			continue
 		}
-		go handleConn(nc, cfg, s.CompletedUploads, s.tempExtensions())
+		backoff = 0
+		go handleConn(nc, cfg, s.CompletedUploads, s.tempExtensions(), s.idleTimeout())
 	}
 }
 
 func (s *Server) serveFTP(ln net.Listener) error {
+	var backoff time.Duration
 	for {
 		nc, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			log.Println("ftp accept:", err)
-			return err
+			backoff = nextAcceptBackoff(backoff)
+			log.Printf("ftp accept: %v; retrying in %s", err, backoff)
+			time.Sleep(backoff)
+			continue
 		}
+		backoff = 0
 		go s.handleFTPConn(nc, s.tempExtensions())
 	}
+}
+
+// nextAcceptBackoff returns the next exponential backoff duration to sleep
+// after a transient Accept error. The schedule starts at 5ms and caps at 1s.
+func nextAcceptBackoff(prev time.Duration) time.Duration {
+	if prev == 0 {
+		return 5 * time.Millisecond
+	}
+	next := prev * 2
+	if next > time.Second {
+		next = time.Second
+	}
+	return next
 }
 
 // tempExtensions returns a normalised copy of s.TempExtensions: each entry is
@@ -379,6 +484,22 @@ func (s *Server) tempExtensions() []string {
 		out = append(out, ext)
 	}
 	return out
+}
+
+// idleTimeout returns the effective idle timeout for SFTP connections.
+// A zero IdleTimeout selects the package default; a negative IdleTimeout
+// disables the deadline.
+func (s *Server) idleTimeout() time.Duration {
+	s.mu.RLock()
+	d := s.IdleTimeout
+	s.mu.RUnlock()
+	switch {
+	case d == 0:
+		return defaultSFTPIdleTimeout
+	case d < 0:
+		return 0
+	}
+	return d
 }
 
 // hasTempExt reports whether name ends with one of the given (already
@@ -489,7 +610,12 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 			storedHash := sha256.Sum256([]byte(storedPw))
 			passHash := sha256.Sum256(pass)
 			match := subtle.ConstantTimeCompare(storedHash[:], passHash[:]) == 1
-			if !ok || !match {
+			// Reject empty stored or supplied passwords. An empty stored
+			// password disables password authentication for that user (or
+			// indicates a non-existent user); an empty supplied password is
+			// never a valid credential. This guards against accidentally
+			// permitting login when a UserInfo is added with Password: "".
+			if !ok || !match || len(pass) == 0 || len(storedPw) == 0 {
 				return nil, fmt.Errorf("invalid credentials")
 			}
 			return permissionsFor(u, c.User()), nil
@@ -534,21 +660,25 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 	return cfg
 }
 
-func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload, tempExts []string) {
+func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload, tempExts []string, idleTimeout time.Duration) {
 	defer nc.Close()
 
-	// Enforce a deadline for the SSH handshake to prevent malicious clients
-	// from holding goroutines open indefinitely without completing the
-	// handshake (denial-of-service via resource exhaustion).
-	_ = nc.SetDeadline(time.Now().Add(30 * time.Second))
-	sshConn, chans, reqs, err := ssh.NewServerConn(nc, cfg)
+	// Wrap the raw connection so that every Read resets the read deadline.
+	// During the handshake we use sshHandshakeTimeout to prevent malicious
+	// clients from holding goroutines open indefinitely without completing
+	// the handshake (denial-of-service via resource exhaustion). After the
+	// handshake succeeds we switch to the per-session idle timeout so that
+	// authenticated but inactive sessions are eventually reaped.
+	ic := &idleConn{Conn: nc}
+	ic.setTimeout(sshHandshakeTimeout)
+	sshConn, chans, reqs, err := ssh.NewServerConn(ic, cfg)
 	if err != nil {
 		log.Println("ssh handshake:", err)
 		return
 	}
-	// Handshake complete – remove the deadline so session I/O is not
-	// artificially limited.
-	_ = nc.SetDeadline(time.Time{})
+	// Handshake complete – switch to the idle-session deadline. A zero value
+	// disables the deadline.
+	ic.setTimeout(idleTimeout)
 	defer sshConn.Close()
 
 	jailRoot := sshConn.Permissions.Extensions["jailRoot"]
@@ -814,9 +944,7 @@ func (j jail) Filecmd(r *sftp.Request) error {
 		if err != nil {
 			return err
 		}
-		// Minimal: allow chmod/chown/times only if you want; here we ignore.
-		_ = p
-		return nil
+		return applyAttrs(p, r)
 
 	case "Rename":
 		oldP, err := j.resolve(r.Filepath)
@@ -914,6 +1042,48 @@ func (j jail) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	}
 }
 
+// applyAttrs applies SFTP Setstat/Fsetstat attributes to the file at p,
+// constrained to the operations that can run safely as the server process.
+//
+// Supported flags:
+//   - Permissions       → os.Chmod
+//   - UidGid            → os.Chown (typically requires the server process to
+//     own the file or have CAP_CHOWN; failures are propagated to the client)
+//   - Acmodtime         → os.Chtimes
+//   - Size              → os.Truncate
+//
+// Operations are applied in a deterministic order. The first error is
+// returned and remaining attributes are not applied, mirroring how OpenSSH's
+// sftp-server reports errors.
+func applyAttrs(p string, r *sftp.Request) error {
+	flags := r.AttrFlags()
+	attrs := r.Attributes()
+	if attrs == nil {
+		return nil
+	}
+	if flags.Size {
+		if err := os.Truncate(p, int64(attrs.Size)); err != nil {
+			return err
+		}
+	}
+	if flags.Permissions {
+		if err := os.Chmod(p, attrs.FileMode().Perm()); err != nil {
+			return err
+		}
+	}
+	if flags.UidGid {
+		if err := os.Chown(p, int(attrs.UID), int(attrs.GID)); err != nil {
+			return err
+		}
+	}
+	if flags.Acmodtime {
+		if err := os.Chtimes(p, attrs.AccessTime(), attrs.ModTime()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func jailedHandlers(root, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string) sftp.Handlers {
 	j := jail{
 		root:     filepath.Clean(root),
@@ -1003,8 +1173,13 @@ func (s *Server) handleFTPConn(nc net.Conn, tempExts []string) {
 
 	for {
 		_ = nc.SetReadDeadline(time.Now().Add(5 * time.Minute))
-		line, err := fs.r.ReadString('\n')
+		line, err := readFTPControlLine(fs.r, ftpMaxControlLineLen)
 		if err != nil {
+			if errors.Is(err, errFTPLineTooLong) {
+				_ = fs.reply(500, ftpErrMsg(err))
+				log.Printf("ftp control read from=%s: line exceeded %d bytes", nc.RemoteAddr(), ftpMaxControlLineLen)
+				return
+			}
 			if !errors.Is(err, io.EOF) {
 				log.Printf("ftp control read from=%s: %v", nc.RemoteAddr(), err)
 			}
@@ -1021,6 +1196,38 @@ func (s *Server) handleFTPConn(nc net.Conn, tempExts []string) {
 		if quit {
 			return
 		}
+	}
+}
+
+// readFTPControlLine reads a single FTP control command terminated by '\n'
+// from r, capped at maxLen bytes (including the terminator). When a client
+// sends a longer line, the excess is discarded up to the next '\n' (or
+// connection close) and errFTPLineTooLong is returned so the caller can
+// reject the command and tear the session down.
+func readFTPControlLine(r *bufio.Reader, maxLen int) (string, error) {
+	buf := make([]byte, 0, 64)
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		if b == '\n' {
+			return string(buf) + "\n", nil
+		}
+		if len(buf)+1 >= maxLen {
+			// Drain the rest of the offending line so the protocol stream
+			// stays aligned for the caller's error reply.
+			for {
+				b2, err := r.ReadByte()
+				if err != nil {
+					return "", errFTPLineTooLong
+				}
+				if b2 == '\n' {
+					return "", errFTPLineTooLong
+				}
+			}
+		}
+		buf = append(buf, b)
 	}
 }
 
@@ -1207,7 +1414,10 @@ func (f *ftpSession) authenticate(pass string) bool {
 	storedHash := sha256.Sum256([]byte(storedPw))
 	passHash := sha256.Sum256([]byte(pass))
 	match := subtle.ConstantTimeCompare(storedHash[:], passHash[:]) == 1
-	if !ok || !match {
+	// Reject empty stored or supplied passwords. An empty stored password
+	// disables password authentication for the user; an empty supplied
+	// password is never a valid credential.
+	if !ok || !match || len(pass) == 0 || len(storedPw) == 0 {
 		return false
 	}
 
@@ -1310,12 +1520,12 @@ func (f *ftpSession) cmdCWD(arg string) {
 	ftpPath := f.cleanPath(arg)
 	full, err := f.jail().resolve(ftpPath)
 	if err != nil {
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	st, err := os.Stat(full)
 	if err != nil {
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	if !st.IsDir() {
@@ -1343,7 +1553,7 @@ func (f *ftpSession) enterPassive(epsv bool) {
 
 	ln, err := f.server.listenFTPData(host)
 	if err != nil {
-		_ = f.reply(425, err.Error())
+		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
 	f.dataLn = ln
@@ -1402,12 +1612,12 @@ func (f *ftpSession) cmdList(arg string, namesOnly bool) {
 	ftpPath := f.cleanPath(listPathArg(arg))
 	full, err := f.jail().resolve(ftpPath)
 	if err != nil {
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	st, err := os.Stat(full)
 	if err != nil {
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 
@@ -1415,7 +1625,7 @@ func (f *ftpSession) cmdList(arg string, namesOnly bool) {
 	if st.IsDir() {
 		entries, err := os.ReadDir(full)
 		if err != nil {
-			_ = f.reply(550, err.Error())
+			_ = f.reply(550, ftpErrMsg(err))
 			return
 		}
 		for _, entry := range entries {
@@ -1441,14 +1651,14 @@ func (f *ftpSession) cmdList(arg string, namesOnly bool) {
 	}
 	dc, err := f.acceptDataConn()
 	if err != nil {
-		_ = f.reply(425, err.Error())
+		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
 	defer dc.Close()
 
 	for _, line := range lines {
 		if _, err := io.WriteString(dc, line+"\r\n"); err != nil {
-			_ = f.reply(426, err.Error())
+			_ = f.reply(426, ftpErrMsg(err))
 			return
 		}
 	}
@@ -1498,13 +1708,13 @@ func (f *ftpSession) cmdRetr(arg string) {
 	full, err := f.jail().resolve(ftpPath)
 	if err != nil {
 		f.restartOffset = 0
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	file, err := os.Open(full)
 	if err != nil {
 		f.restartOffset = 0
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	defer file.Close()
@@ -1512,7 +1722,7 @@ func (f *ftpSession) cmdRetr(arg string) {
 	if f.restartOffset > 0 {
 		if _, err := file.Seek(f.restartOffset, io.SeekStart); err != nil {
 			f.restartOffset = 0
-			_ = f.reply(550, err.Error())
+			_ = f.reply(550, ftpErrMsg(err))
 			return
 		}
 	}
@@ -1523,13 +1733,13 @@ func (f *ftpSession) cmdRetr(arg string) {
 	}
 	dc, err := f.acceptDataConn()
 	if err != nil {
-		_ = f.reply(425, err.Error())
+		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
 	defer dc.Close()
 
 	if _, err := io.Copy(dc, file); err != nil {
-		_ = f.reply(426, err.Error())
+		_ = f.reply(426, ftpErrMsg(err))
 		return
 	}
 	_ = f.reply(226, "transfer complete")
@@ -1545,7 +1755,7 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 	full, err := f.jail().resolve(ftpPath)
 	if err != nil {
 		f.restartOffset = 0
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 
@@ -1556,7 +1766,7 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 	dc, err := f.acceptDataConn()
 	if err != nil {
 		f.restartOffset = 0
-		_ = f.reply(425, err.Error())
+		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
 	defer dc.Close()
@@ -1574,7 +1784,7 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 	file, err := os.OpenFile(full, flags, 0600)
 	if err != nil {
 		f.restartOffset = 0
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 
@@ -1582,7 +1792,7 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 		if _, err := file.Seek(f.restartOffset, io.SeekStart); err != nil {
 			f.restartOffset = 0
 			_ = file.Close()
-			_ = f.reply(550, err.Error())
+			_ = f.reply(550, ftpErrMsg(err))
 			return
 		}
 	}
@@ -1641,12 +1851,12 @@ func (f *ftpSession) cmdSize(arg string) {
 	}
 	full, err := f.jail().resolve(f.cleanPath(arg))
 	if err != nil {
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	st, err := os.Stat(full)
 	if err != nil {
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	if st.IsDir() {
@@ -1663,12 +1873,12 @@ func (f *ftpSession) cmdMDTM(arg string) {
 	}
 	full, err := f.jail().resolve(f.cleanPath(arg))
 	if err != nil {
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	st, err := os.Stat(full)
 	if err != nil {
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	_ = f.reply(213, st.ModTime().UTC().Format("20060102150405"))
@@ -1681,11 +1891,11 @@ func (f *ftpSession) cmdDelete(arg string) {
 	}
 	full, err := f.jail().resolve(f.cleanPath(arg))
 	if err != nil {
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	if err := os.Remove(full); err != nil {
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	_ = f.reply(250, "deleted")
@@ -1699,11 +1909,11 @@ func (f *ftpSession) cmdMkdir(arg string) {
 	ftpPath := f.cleanPath(arg)
 	full, err := f.jail().resolve(ftpPath)
 	if err != nil {
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	if err := os.Mkdir(full, 0750); err != nil {
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	_ = f.reply(257, fmt.Sprintf("%s created", ftpQuotePath(ftpPath)))
@@ -1716,11 +1926,11 @@ func (f *ftpSession) cmdRmdir(arg string) {
 	}
 	full, err := f.jail().resolve(f.cleanPath(arg))
 	if err != nil {
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	if err := os.Remove(full); err != nil {
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	_ = f.reply(250, "removed")
@@ -1734,11 +1944,11 @@ func (f *ftpSession) cmdRnfr(arg string) {
 	ftpPath := f.cleanPath(arg)
 	full, err := f.jail().resolve(ftpPath)
 	if err != nil {
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	if _, err := os.Stat(full); err != nil {
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	f.rnfrPath = ftpPath
@@ -1765,11 +1975,11 @@ func (f *ftpSession) cmdRnto(arg string) {
 	newPath := f.cleanPath(arg)
 	newFull, err := f.jail().resolve(newPath)
 	if err != nil {
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	if err := os.Rename(oldFull, newFull); err != nil {
-		_ = f.reply(550, err.Error())
+		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	if hasTempExt(oldPath, f.tempExts) && !hasTempExt(newPath, f.tempExts) {
