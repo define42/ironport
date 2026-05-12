@@ -1802,11 +1802,11 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 	_, copyErr := io.Copy(file, dc)
 	closeErr := file.Close()
 	if copyErr != nil {
-		_ = f.reply(426, copyErr.Error())
+		_ = f.reply(426, ftpErrMsg(copyErr))
 		return
 	}
 	if closeErr != nil {
-		_ = f.reply(451, closeErr.Error())
+		_ = f.reply(451, ftpErrMsg(closeErr))
 		return
 	}
 
