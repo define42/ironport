@@ -615,8 +615,18 @@ func TestSFTPServer_CompletedUploadsQueue(t *testing.T) {
 
 		select {
 		case got := <-srv.CompletedUploads:
-			if got != name {
-				t.Errorf("CompletedUploads received %q; want %q", got, name)
+			if got.FilePath != name {
+				t.Errorf("CompletedUploads received FilePath %q; want %q", got.FilePath, name)
+			}
+			if got.Username != "testuser" {
+				t.Errorf("CompletedUploads Username = %q; want %q", got.Username, "testuser")
+			}
+			wantFull := filepath.Join(root, name)
+			if got.FullFilePath != wantFull {
+				t.Errorf("CompletedUploads FullFilePath = %q; want %q", got.FullFilePath, wantFull)
+			}
+			if got.ClientIP == "" {
+				t.Errorf("CompletedUploads ClientIP is empty; want non-empty")
 			}
 		case <-time.After(2 * time.Second):
 			t.Fatalf("timed out waiting for CompletedUploads signal for %q", name)
@@ -1741,7 +1751,7 @@ func TestSFTPServer_TempExtensions_SuppressesUploadAndAnnouncesOnRename(t *testi
 
 	select {
 	case got := <-srv.CompletedUploads:
-		t.Fatalf("CompletedUploads received %q for a temp-extension upload; expected suppression", got)
+		t.Fatalf("CompletedUploads received %+v for a temp-extension upload; expected suppression", got)
 	case <-time.After(300 * time.Millisecond):
 		// expected: nothing
 	}
@@ -1754,8 +1764,18 @@ func TestSFTPServer_TempExtensions_SuppressesUploadAndAnnouncesOnRename(t *testi
 
 	select {
 	case got := <-srv.CompletedUploads:
-		if got != finalName {
-			t.Errorf("CompletedUploads received %q; want %q", got, finalName)
+		if got.FilePath != finalName {
+			t.Errorf("CompletedUploads FilePath = %q; want %q", got.FilePath, finalName)
+		}
+		if got.Username != "testuser" {
+			t.Errorf("CompletedUploads Username = %q; want %q", got.Username, "testuser")
+		}
+		wantFull := filepath.Join(root, finalName)
+		if got.FullFilePath != wantFull {
+			t.Errorf("CompletedUploads FullFilePath = %q; want %q", got.FullFilePath, wantFull)
+		}
+		if got.ClientIP == "" {
+			t.Errorf("CompletedUploads ClientIP is empty; want non-empty")
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for CompletedUploads signal for renamed file %q", finalName)
@@ -1789,7 +1809,7 @@ func TestSFTPServer_TempExtensions_RenameBetweenTempNamesDoesNotAnnounce(t *test
 	}
 	select {
 	case got := <-srv.CompletedUploads:
-		t.Fatalf("CompletedUploads received %q; expected no notification for temp->temp rename", got)
+		t.Fatalf("CompletedUploads received %+v; expected no notification for temp->temp rename", got)
 	case <-time.After(300 * time.Millisecond):
 		// expected
 	}
@@ -1819,8 +1839,8 @@ func TestSFTPServer_TempExtensions_PlainUploadStillAnnounced(t *testing.T) {
 	}
 	select {
 	case got := <-srv.CompletedUploads:
-		if got != name {
-			t.Errorf("CompletedUploads received %q; want %q", got, name)
+		if got.FilePath != name {
+			t.Errorf("CompletedUploads FilePath = %q; want %q", got.FilePath, name)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for CompletedUploads for plain upload")

@@ -8,7 +8,7 @@ A production-ready, embeddable SFTP server library for Go with a security-first 
 - **Per-user jail (chroot)** — each user is confined to a configurable root directory; path traversal and symlink escapes are blocked
 - **Fine-grained permissions** — independent `CanRead` / `CanWrite` flags per user
 - **Dynamic user management** — add, remove, and update users and their authorized keys at runtime without restarting the server
-- **Upload notifications** — a buffered `CompletedUploads` channel delivers the SFTP path of every successfully closed upload
+- **Upload notifications** — a buffered `CompletedUploads` channel delivers a `CompletedUpload` struct (username, full on-disk path, jail-relative path, and client IP) for every successfully closed upload
 - **Graceful shutdown** — `Close()` stops the listener; in-flight sessions are not terminated
 - **Thread-safe** — all shared state is protected by `sync.RWMutex`
 - **Handshake timeout** — connections that do not complete the SSH handshake within 30 seconds are dropped
@@ -44,8 +44,9 @@ func main() {
 
     // Drain upload notifications in the background.
     go func() {
-        for path := range srv.CompletedUploads {
-            log.Printf("upload complete: %q", path)
+        for ev := range srv.CompletedUploads {
+            log.Printf("upload complete: user=%q ip=%q path=%q full=%q",
+                ev.Username, ev.ClientIP, ev.FilePath, ev.FullFilePath)
         }
     }()
 

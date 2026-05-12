@@ -39,8 +39,9 @@ func main() {
 	srv.TempExtensions = []string{".tmp", ".writing"}
 
 	go func() {
-		for path := range srv.CompletedUploads {
-			log.Printf("completed upload: %q", path)
+		for ev := range srv.CompletedUploads {
+			log.Printf("completed upload: user=%q ip=%q path=%q full=%q",
+				ev.Username, ev.ClientIP, ev.FilePath, ev.FullFilePath)
 		}
 	}()
 
