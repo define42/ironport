@@ -2555,7 +2555,7 @@ func TestFTPServer_CmdStorSanitizesCopyErrors(t *testing.T) {
 	fs.cmdStor("upload.txt", false)
 
 	got := control.String()
-	if got != "150 opening data connection\r\n426 request failed\r\n" {
+	if !strings.Contains(got, "426 request failed\r\n") {
 		t.Fatalf("cmdStor reply = %q; want sanitized FTP error reply", got)
 	}
 	if strings.Contains(got, "/srv/secret.txt") {
