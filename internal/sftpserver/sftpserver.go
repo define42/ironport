@@ -5,7 +5,7 @@
 //   - Per-user jail roots enforced via path resolution and symlink checks.
 //   - Password and SSH public-key authentication with constant-time comparisons.
 //   - Fine-grained CanRead / CanWrite per-user permission flags.
-//   - Runtime user management (AddUser, RemoveUser, AddUserKey, RemoveUserKey).
+//   - Runtime user management (AddUser, RemoveUser, RemoveAllUsers, AddUserKey, RemoveUserKey).
 //   - Graceful shutdown via Close; upload-completion notifications via CompletedUploads.
 //
 // Typical usage:
@@ -127,6 +127,15 @@ func (s *Server) RemoveUser(username string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.Users, username)
+}
+
+// RemoveAllUsers removes every user entry from the server's user map.
+// Active connections are not terminated, and no on-disk user data is removed.
+// It is safe to call concurrently with active connections.
+func (s *Server) RemoveAllUsers() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	clear(s.Users)
 }
 
 // AddUserKey appends key to the AuthorizedKeys of an existing user.

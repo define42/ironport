@@ -85,6 +85,9 @@ srv.AddUser("carol", sftpserver.UserInfo{
 
 // Remove a user (active sessions for that user are not terminated).
 srv.RemoveUser("carol")
+
+// Remove all users without deleting any on-disk user data.
+srv.RemoveAllUsers()
 ```
 
 ## Host key
