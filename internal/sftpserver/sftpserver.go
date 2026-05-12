@@ -74,6 +74,21 @@ type Server struct {
 	// The channel is buffered; sends are non-blocking so a slow consumer
 	// never stalls an upload.  Callers should drain the channel continuously.
 	CompletedUploads chan string
+	// TempExtensions is an optional list of file extensions (each beginning
+	// with a leading dot, e.g. ".tmp", ".writing") that mark files as still
+	// being written and therefore not yet "complete".
+	//
+	// When set:
+	//   - A successful upload whose filename ends with one of these
+	//     extensions is NOT announced on CompletedUploads.
+	//   - When a file is renamed from a name ending with one of these
+	//     extensions to a name that does NOT end with any of them, the new
+	//     path is announced on CompletedUploads, signalling that the upload
+	//     is finally complete.
+	//
+	// Matching is case-insensitive.  Setting this field after the server has
+	// started has effect only on connections accepted afterwards.
+	TempExtensions []string
 }
 
 // AddUser adds or replaces a user entry in the server's user map.
@@ -193,8 +208,49 @@ func (s *Server) ListenAndServe() error {
 			log.Println("accept:", err)
 			return err
 		}
-		go handleConn(nc, cfg, s.CompletedUploads)
+		go handleConn(nc, cfg, s.CompletedUploads, s.tempExtensions())
 	}
+}
+
+// tempExtensions returns a normalised copy of s.TempExtensions: each entry is
+// lower-cased and guaranteed to start with a single leading dot.  Empty entries
+// are dropped.  The result is safe to use without holding s.mu because it is
+// a freshly allocated slice.
+func (s *Server) tempExtensions() []string {
+	s.mu.RLock()
+	src := s.TempExtensions
+	s.mu.RUnlock()
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(src))
+	for _, ext := range src {
+		ext = strings.ToLower(strings.TrimSpace(ext))
+		if ext == "" {
+			continue
+		}
+		if !strings.HasPrefix(ext, ".") {
+			ext = "." + ext
+		}
+		out = append(out, ext)
+	}
+	return out
+}
+
+// hasTempExt reports whether name ends with one of the given (already
+// normalised, lower-case, dot-prefixed) extensions.  Matching is
+// case-insensitive on the filename.
+func hasTempExt(name string, tempExts []string) bool {
+	if len(tempExts) == 0 {
+		return false
+	}
+	lower := strings.ToLower(name)
+	for _, ext := range tempExts {
+		if strings.HasSuffix(lower, ext) {
+			return true
+		}
+	}
+	return false
 }
 
 // Close stops the server by closing the listener, causing ListenAndServe to
@@ -310,7 +366,7 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 	return cfg
 }
 
-func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- string) {
+func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- string, tempExts []string) {
 	defer nc.Close()
 
 	// Enforce a deadline for the SSH handshake to prevent malicious clients
@@ -348,11 +404,11 @@ func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- string) {
 			continue
 		}
 
-		go handleSession(ch, inReqs, jailRoot, canRead, canWrite, uploads)
+		go handleSession(ch, inReqs, jailRoot, canRead, canWrite, uploads, tempExts)
 	}
 }
 
-func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot string, canRead, canWrite bool, uploads chan<- string) {
+func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot string, canRead, canWrite bool, uploads chan<- string, tempExts []string) {
 	defer ch.Close()
 
 	for req := range inReqs {
@@ -373,7 +429,7 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot string, 
 			}
 			_ = req.Reply(true, nil)
 
-			handlers := jailedHandlers(jailRoot, canRead, canWrite, uploads)
+			handlers := jailedHandlers(jailRoot, canRead, canWrite, uploads, tempExts)
 
 			server := sftp.NewRequestServer(ch, handlers)
 			if err := server.Serve(); err != nil && !errors.Is(err, io.EOF) {
@@ -393,6 +449,11 @@ type jail struct {
 	canRead  bool
 	canWrite bool
 	uploads  chan<- string
+	// tempExts is the list of "still being written" extensions (lower-case,
+	// dot-prefixed).  Uploads ending in one of these extensions are not
+	// announced on uploads; renaming such a file to a name without any of
+	// these extensions announces the final path on uploads instead.
+	tempExts []string
 }
 
 // resolve maps an SFTP path (possibly relative) into an absolute on-disk path
@@ -463,16 +524,28 @@ func (j jail) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 // writeLogger wraps an *os.File and logs the filename when the file is closed,
 // signalling that the upload is complete. The sftp request server calls Close()
 // on the returned io.WriterAt when it detects an io.Closer.
+//
+// If the uploaded filename ends with one of tempExts (e.g. ".tmp", ".writing"),
+// the file is considered still in progress and no notification is sent on
+// uploads; the completion notification will instead be emitted when the client
+// renames the file to its final name (see jail.Filecmd "Rename").
 type writeLogger struct {
 	*os.File
 	filepath string
 	uploads  chan<- string
+	tempExts []string
 }
 
 func (w *writeLogger) Close() error {
 	err := w.File.Close()
 	if err == nil {
 		log.Printf("upload complete: %q", w.filepath)
+		if hasTempExt(w.filepath, w.tempExts) {
+			// File is still considered "in progress"; defer notification
+			// until the client renames it to its final (non-temp) name.
+			log.Printf("upload complete: %q has temp extension, deferring CompletedUploads notification", w.filepath)
+			return nil
+		}
 		// Announce the completed upload on the queue; non-blocking so a slow
 		// consumer never stalls the upload handler.
 		select {
@@ -499,7 +572,7 @@ func (j jail) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &writeLogger{File: f, filepath: r.Filepath, uploads: j.uploads}, nil
+	return &writeLogger{File: f, filepath: r.Filepath, uploads: j.uploads, tempExts: j.tempExts}, nil
 }
 
 // Filecmd implements sftp.FileCmder.
@@ -526,7 +599,21 @@ func (j jail) Filecmd(r *sftp.Request) error {
 		if err != nil {
 			return err
 		}
-		return os.Rename(oldP, newP)
+		if err := os.Rename(oldP, newP); err != nil {
+			return err
+		}
+		// If a file with a "still being written" extension is renamed to a
+		// final (non-temp) name, treat the rename as the moment the upload
+		// completes and announce the new SFTP path on uploads.
+		if hasTempExt(r.Filepath, j.tempExts) && !hasTempExt(r.Target, j.tempExts) {
+			log.Printf("upload complete via rename: %q -> %q", r.Filepath, r.Target)
+			select {
+			case j.uploads <- r.Target:
+			default:
+				log.Printf("upload complete: CompletedUploads queue full, notification for %q dropped", r.Target)
+			}
+		}
+		return nil
 
 	case "Rmdir":
 		p, err := j.resolve(r.Filepath)
@@ -593,8 +680,8 @@ func (j jail) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	}
 }
 
-func jailedHandlers(root string, canRead, canWrite bool, uploads chan<- string) sftp.Handlers {
-	j := jail{root: filepath.Clean(root), canRead: canRead, canWrite: canWrite, uploads: uploads}
+func jailedHandlers(root string, canRead, canWrite bool, uploads chan<- string, tempExts []string) sftp.Handlers {
+	j := jail{root: filepath.Clean(root), canRead: canRead, canWrite: canWrite, uploads: uploads, tempExts: tempExts}
 	return sftp.Handlers{
 		FileGet:  j,
 		FilePut:  j,

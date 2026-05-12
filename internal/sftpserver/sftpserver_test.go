@@ -125,7 +125,7 @@ func startTestServer(t *testing.T, users map[string]UserInfo) (srv *Server, addr
 			if err != nil {
 				return // listener closed
 			}
-			go handleConn(nc, cfg, srv.CompletedUploads)
+			go handleConn(nc, cfg, srv.CompletedUploads, srv.tempExtensions())
 		}
 	}()
 
@@ -511,7 +511,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleConn(nc, cfg, srv.CompletedUploads)
+			go handleConn(nc, cfg, srv.CompletedUploads, srv.tempExtensions())
 		}
 	}()
 	t.Cleanup(func() { ln.Close() })
@@ -1637,7 +1637,7 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleConn(nc, cfg, srv.CompletedUploads)
+			go handleConn(nc, cfg, srv.CompletedUploads, srv.tempExtensions())
 		}
 	}()
 
@@ -1666,5 +1666,163 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 	var netErr net.Error
 	if errors.As(lastErr, &netErr) && netErr.Timeout() {
 		t.Error("server did not close the idle connection before the 35 s outer deadline; handshake timeout may not be working")
+	}
+}
+
+// ---- TempExtensions tests ----
+
+// TestHasTempExt covers the case-insensitive matching of temp extensions.
+func TestHasTempExt(t *testing.T) {
+	exts := []string{".tmp", ".writing"}
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"foo.tmp", true},
+		{"foo.TMP", true},
+		{"path/to/foo.writing", true},
+		{"foo.txt", false},
+		{"foo.tmp.bak", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := hasTempExt(c.name, exts); got != c.want {
+			t.Errorf("hasTempExt(%q) = %v; want %v", c.name, got, c.want)
+		}
+	}
+	// Nil ext list never matches.
+	if hasTempExt("foo.tmp", nil) {
+		t.Error("hasTempExt with nil exts should return false")
+	}
+}
+
+// TestServer_TempExtensionsNormalisation verifies that TempExtensions are
+// normalised (lower-cased, dot-prefixed, empty entries stripped) before use.
+func TestServer_TempExtensionsNormalisation(t *testing.T) {
+	srv := &Server{TempExtensions: []string{"TMP", ".Writing", "  ", ".part"}}
+	got := srv.tempExtensions()
+	want := []string{".tmp", ".writing", ".part"}
+	if len(got) != len(want) {
+		t.Fatalf("tempExtensions() = %v; want %v", got, want)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("tempExtensions()[%d] = %q; want %q", i, got[i], w)
+		}
+	}
+}
+
+// TestSFTPServer_TempExtensions_SuppressesUploadAndAnnouncesOnRename verifies
+// the end-to-end flow: a file uploaded with a temp extension does NOT produce
+// a CompletedUploads notification, and renaming it to its final name does.
+func TestSFTPServer_TempExtensions_SuppressesUploadAndAnnouncesOnRename(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestServer(t, users)
+	srv.TempExtensions = []string{".tmp", ".writing"}
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	// Upload a file with a temp extension — must NOT be announced.
+	tmpName := "/foo.txt.tmp"
+	f, err := client.Create(tmpName)
+	if err != nil {
+		t.Fatalf("client.Create(%q): %v", tmpName, err)
+	}
+	if _, err = f.Write([]byte("hello")); err != nil {
+		t.Fatalf("f.Write: %v", err)
+	}
+	if err = f.Close(); err != nil {
+		t.Fatalf("f.Close: %v", err)
+	}
+
+	select {
+	case got := <-srv.CompletedUploads:
+		t.Fatalf("CompletedUploads received %q for a temp-extension upload; expected suppression", got)
+	case <-time.After(300 * time.Millisecond):
+		// expected: nothing
+	}
+
+	// Rename to final name — must announce the new path on CompletedUploads.
+	finalName := "/foo.txt"
+	if err := client.Rename(tmpName, finalName); err != nil {
+		t.Fatalf("client.Rename(%q, %q): %v", tmpName, finalName, err)
+	}
+
+	select {
+	case got := <-srv.CompletedUploads:
+		if got != finalName {
+			t.Errorf("CompletedUploads received %q; want %q", got, finalName)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for CompletedUploads signal for renamed file %q", finalName)
+	}
+}
+
+// TestSFTPServer_TempExtensions_RenameBetweenTempNamesDoesNotAnnounce verifies
+// that renaming a temp file to another temp name (e.g. .tmp -> .writing) does
+// not produce a CompletedUploads notification.
+func TestSFTPServer_TempExtensions_RenameBetweenTempNamesDoesNotAnnounce(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestServer(t, users)
+	srv.TempExtensions = []string{".tmp", ".writing"}
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	// Upload .tmp file (suppressed).
+	if f, err := client.Create("/foo.tmp"); err != nil {
+		t.Fatalf("create: %v", err)
+	} else {
+		_, _ = f.Write([]byte("x"))
+		_ = f.Close()
+	}
+	// Rename .tmp -> .writing (still temp): no notification expected.
+	if err := client.Rename("/foo.tmp", "/foo.writing"); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	select {
+	case got := <-srv.CompletedUploads:
+		t.Fatalf("CompletedUploads received %q; expected no notification for temp->temp rename", got)
+	case <-time.After(300 * time.Millisecond):
+		// expected
+	}
+}
+
+// TestSFTPServer_TempExtensions_PlainUploadStillAnnounced verifies that
+// configuring TempExtensions does not break notifications for normal uploads.
+func TestSFTPServer_TempExtensions_PlainUploadStillAnnounced(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestServer(t, users)
+	srv.TempExtensions = []string{".tmp", ".writing"}
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	name := "/plain.txt"
+	f, err := client.Create(name)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	_, _ = f.Write([]byte("hi"))
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	select {
+	case got := <-srv.CompletedUploads:
+		if got != name {
+			t.Errorf("CompletedUploads received %q; want %q", got, name)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for CompletedUploads for plain upload")
 	}
 }
