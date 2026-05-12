@@ -251,6 +251,9 @@ func TestNewServer(t *testing.T) {
 	if srv.Addr != ":0" {
 		t.Errorf("Addr = %q; want :0", srv.Addr)
 	}
+	if srv.FTPAddr != ":0" {
+		t.Errorf("FTPAddr = %q; want :0", srv.FTPAddr)
+	}
 	if len(srv.Users) != 1 {
 		t.Errorf("Users len = %d; want 1", len(srv.Users))
 	}
