@@ -272,9 +272,6 @@ func (s *Server) listenFTPData(host string) (net.Listener, error) {
 		}
 		lastErr = err
 	}
-	if lastErr == nil {
-		lastErr = errors.New("no FTP passive ports configured")
-	}
 	return nil, fmt.Errorf("all FTP passive ports in range %q are unavailable: %w", portRange, lastErr)
 }
 
