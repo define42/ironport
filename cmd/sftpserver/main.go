@@ -6,7 +6,7 @@ import (
 	"flag"
 	"log"
 
-	"github.com/define42/sftpserver/internal/sftpserver"
+	"github.com/define42/sftpserver"
 	"golang.org/x/crypto/ssh"
 )
 

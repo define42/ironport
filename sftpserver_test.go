@@ -2205,315 +2205,315 @@ func TestSFTPServer_TempExtensions_PlainUploadStillAnnounced(t *testing.T) {
 // TestSFTPServer_EmptyStoredPassword_Rejected verifies that a user whose
 // stored Password is "" cannot authenticate by sending an empty password.
 func TestSFTPServer_EmptyStoredPassword_Rejected(t *testing.T) {
-root := t.TempDir()
-users := map[string]UserInfo{
-"nopw": {Password: "", Root: root, CanRead: true, CanWrite: true},
-}
-_, addr, stop := startTestServer(t, users)
-t.Cleanup(stop)
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"nopw": {Password: "", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
 
-sshCfg := &ssh.ClientConfig{
-User:            "nopw",
-Auth:            []ssh.AuthMethod{ssh.Password("")},
-HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-}
-if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
-t.Fatal("expected auth failure when both stored and supplied passwords are empty, got nil")
-}
+	sshCfg := &ssh.ClientConfig{
+		User:            "nopw",
+		Auth:            []ssh.AuthMethod{ssh.Password("")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
+		t.Fatal("expected auth failure when both stored and supplied passwords are empty, got nil")
+	}
 }
 
 // TestSFTPServer_EmptySuppliedPassword_Rejected verifies that an empty
 // password supplied by the client is always rejected, even when the stored
 // password is non-empty.
 func TestSFTPServer_EmptySuppliedPassword_Rejected(t *testing.T) {
-root := t.TempDir()
-users := map[string]UserInfo{
-"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
-}
-_, addr, stop := startTestServer(t, users)
-t.Cleanup(stop)
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
 
-sshCfg := &ssh.ClientConfig{
-User:            "alice",
-Auth:            []ssh.AuthMethod{ssh.Password("")},
-HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-}
-if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
-t.Fatal("expected auth failure for empty supplied password, got nil")
-}
+	sshCfg := &ssh.ClientConfig{
+		User:            "alice",
+		Auth:            []ssh.AuthMethod{ssh.Password("")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
+		t.Fatal("expected auth failure for empty supplied password, got nil")
+	}
 }
 
 // TestFTPServer_EmptyStoredPassword_Rejected verifies that FTP password auth
 // rejects users with an empty stored password.
 func TestFTPServer_EmptyStoredPassword_Rejected(t *testing.T) {
-root := t.TempDir()
-users := map[string]UserInfo{
-"nopw": {Password: "", Root: root, CanRead: true, CanWrite: true},
-}
-_, addr, stop := startTestFTPServer(t, users, "")
-t.Cleanup(stop)
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"nopw": {Password: "", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestFTPServer(t, users, "")
+	t.Cleanup(stop)
 
-c := dialFTP(t, addr)
-c.command(331, "USER nopw")
-c.command(530, "PASS ")
+	c := dialFTP(t, addr)
+	c.command(331, "USER nopw")
+	c.command(530, "PASS ")
 }
 
 // TestFTPServer_EmptySuppliedPassword_Rejected verifies that FTP rejects an
 // empty supplied password even when the stored password is non-empty.
 func TestFTPServer_EmptySuppliedPassword_Rejected(t *testing.T) {
-root := t.TempDir()
-users := map[string]UserInfo{
-"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
-}
-_, addr, stop := startTestFTPServer(t, users, "")
-t.Cleanup(stop)
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestFTPServer(t, users, "")
+	t.Cleanup(stop)
 
-c := dialFTP(t, addr)
-c.command(331, "USER alice")
-c.command(530, "PASS ")
+	c := dialFTP(t, addr)
+	c.command(331, "USER alice")
+	c.command(530, "PASS ")
 }
 
 // TestFTPServer_ControlLineTooLong verifies that an oversized FTP control
 // line is rejected with a 500 reply and the connection is closed, so that a
 // malicious client cannot grow per-connection memory without bound.
 func TestFTPServer_ControlLineTooLong(t *testing.T) {
-root := t.TempDir()
-users := map[string]UserInfo{
-"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
-}
-_, addr, stop := startTestFTPServer(t, users, "")
-t.Cleanup(stop)
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestFTPServer(t, users, "")
+	t.Cleanup(stop)
 
-conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-if err != nil {
-t.Fatalf("dial: %v", err)
-}
-defer conn.Close()
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
 
-// Drain the 220 greeting.
-br := bufio.NewReader(conn)
-if _, err := br.ReadString('\n'); err != nil {
-t.Fatalf("read greeting: %v", err)
-}
+	// Drain the 220 greeting.
+	br := bufio.NewReader(conn)
+	if _, err := br.ReadString('\n'); err != nil {
+		t.Fatalf("read greeting: %v", err)
+	}
 
-// Send a single line larger than ftpMaxControlLineLen.
-huge := make([]byte, ftpMaxControlLineLen+128)
-for i := range huge {
-huge[i] = 'A'
-}
-huge[len(huge)-2] = '\r'
-huge[len(huge)-1] = '\n'
-if _, err := conn.Write(huge); err != nil {
-t.Fatalf("write: %v", err)
-}
+	// Send a single line larger than ftpMaxControlLineLen.
+	huge := make([]byte, ftpMaxControlLineLen+128)
+	for i := range huge {
+		huge[i] = 'A'
+	}
+	huge[len(huge)-2] = '\r'
+	huge[len(huge)-1] = '\n'
+	if _, err := conn.Write(huge); err != nil {
+		t.Fatalf("write: %v", err)
+	}
 
-_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-reply, err := br.ReadString('\n')
-if err != nil {
-t.Fatalf("read reply: %v", err)
-}
-if !strings.HasPrefix(reply, "500 ") {
-t.Fatalf("expected 500 reply, got %q", reply)
-}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	reply, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read reply: %v", err)
+	}
+	if !strings.HasPrefix(reply, "500 ") {
+		t.Fatalf("expected 500 reply, got %q", reply)
+	}
 }
 
 // TestFTPServer_ErrorMessagesSanitized verifies that error replies sent over
 // the FTP control channel do not leak server-side filesystem paths.
 func TestFTPServer_ErrorMessagesSanitized(t *testing.T) {
-root := t.TempDir()
-users := map[string]UserInfo{
-"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
-}
-_, addr, stop := startTestFTPServer(t, users, "")
-t.Cleanup(stop)
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestFTPServer(t, users, "")
+	t.Cleanup(stop)
 
-c := dialFTP(t, addr)
-c.login("alice", "alicepw")
-msg := c.command(550, "SIZE /does-not-exist.txt")
-if strings.Contains(msg, root) {
-t.Errorf("error reply leaked server path %q: %q", root, msg)
-}
-if strings.Contains(strings.ToLower(msg), "no such") == false &&
-strings.Contains(strings.ToLower(msg), "request failed") == false {
-t.Errorf("unexpected error reply: %q", msg)
-}
+	c := dialFTP(t, addr)
+	c.login("alice", "alicepw")
+	msg := c.command(550, "SIZE /does-not-exist.txt")
+	if strings.Contains(msg, root) {
+		t.Errorf("error reply leaked server path %q: %q", root, msg)
+	}
+	if strings.Contains(strings.ToLower(msg), "no such") == false &&
+		strings.Contains(strings.ToLower(msg), "request failed") == false {
+		t.Errorf("unexpected error reply: %q", msg)
+	}
 }
 
 // TestSFTPServer_Setstat_TruncateAndTimes verifies that Setstat applies size
 // and modification time changes to the underlying file.
 func TestSFTPServer_Setstat_TruncateAndTimes(t *testing.T) {
-root := t.TempDir()
-users := map[string]UserInfo{
-"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
-}
-_, addr, stop := startTestServer(t, users)
-t.Cleanup(stop)
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
 
-client := dialSFTP(t, addr, "alice", "alicepw")
+	client := dialSFTP(t, addr, "alice", "alicepw")
 
-f, err := client.Create("/setstat.txt")
-if err != nil {
-t.Fatalf("Create: %v", err)
-}
-if _, err = f.Write(bytes.Repeat([]byte{'x'}, 1024)); err != nil {
-t.Fatalf("Write: %v", err)
-}
-if err := f.Close(); err != nil {
-t.Fatalf("Close: %v", err)
-}
+	f, err := client.Create("/setstat.txt")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err = f.Write(bytes.Repeat([]byte{'x'}, 1024)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 
-// Truncate via Setstat.
-if err := client.Truncate("/setstat.txt", 16); err != nil {
-t.Fatalf("Truncate: %v", err)
-}
-info, err := os.Stat(filepath.Join(root, "setstat.txt"))
-if err != nil {
-t.Fatalf("os.Stat: %v", err)
-}
-if info.Size() != 16 {
-t.Errorf("size = %d; want 16", info.Size())
-}
+	// Truncate via Setstat.
+	if err := client.Truncate("/setstat.txt", 16); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(root, "setstat.txt"))
+	if err != nil {
+		t.Fatalf("os.Stat: %v", err)
+	}
+	if info.Size() != 16 {
+		t.Errorf("size = %d; want 16", info.Size())
+	}
 
-// Chtimes via Setstat.
-want := time.Unix(1_700_000_000, 0)
-if err := client.Chtimes("/setstat.txt", want, want); err != nil {
-t.Fatalf("Chtimes: %v", err)
-}
-info, err = os.Stat(filepath.Join(root, "setstat.txt"))
-if err != nil {
-t.Fatalf("os.Stat: %v", err)
-}
-if !info.ModTime().Equal(want) {
-t.Errorf("mtime = %v; want %v", info.ModTime(), want)
-}
+	// Chtimes via Setstat.
+	want := time.Unix(1_700_000_000, 0)
+	if err := client.Chtimes("/setstat.txt", want, want); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+	info, err = os.Stat(filepath.Join(root, "setstat.txt"))
+	if err != nil {
+		t.Fatalf("os.Stat: %v", err)
+	}
+	if !info.ModTime().Equal(want) {
+		t.Errorf("mtime = %v; want %v", info.ModTime(), want)
+	}
 }
 
 // TestSFTPServer_Setstat_PermissionDeniedForReadOnly verifies that Setstat is
 // rejected when the user lacks write permission, rather than silently
 // pretending to succeed.
 func TestSFTPServer_Setstat_PermissionDeniedForReadOnly(t *testing.T) {
-root := t.TempDir()
-if err := os.WriteFile(filepath.Join(root, "ro.txt"), []byte("ro"), 0644); err != nil {
-t.Fatal(err)
-}
-users := map[string]UserInfo{
-"reader": {Password: "rpw", Root: root, CanRead: true, CanWrite: false},
-}
-_, addr, stop := startTestServer(t, users)
-t.Cleanup(stop)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "ro.txt"), []byte("ro"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	users := map[string]UserInfo{
+		"reader": {Password: "rpw", Root: root, CanRead: true, CanWrite: false},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
 
-client := dialSFTP(t, addr, "reader", "rpw")
-if err := client.Chmod("/ro.txt", 0600); err == nil {
-t.Fatal("expected permission error for Chmod by a read-only user, got nil")
-}
+	client := dialSFTP(t, addr, "reader", "rpw")
+	if err := client.Chmod("/ro.txt", 0600); err == nil {
+		t.Fatal("expected permission error for Chmod by a read-only user, got nil")
+	}
 }
 
 // TestServer_IdleTimeout verifies the resolution rules of Server.idleTimeout.
 func TestServer_IdleTimeout(t *testing.T) {
-s := &Server{}
-if got := s.idleTimeout(); got != defaultSFTPIdleTimeout {
-t.Errorf("default idleTimeout = %v; want %v", got, defaultSFTPIdleTimeout)
-}
-s.IdleTimeout = 7 * time.Second
-if got := s.idleTimeout(); got != 7*time.Second {
-t.Errorf("custom idleTimeout = %v; want 7s", got)
-}
-s.IdleTimeout = -1
-if got := s.idleTimeout(); got != 0 {
-t.Errorf("negative idleTimeout = %v; want 0", got)
-}
+	s := &Server{}
+	if got := s.idleTimeout(); got != defaultSFTPIdleTimeout {
+		t.Errorf("default idleTimeout = %v; want %v", got, defaultSFTPIdleTimeout)
+	}
+	s.IdleTimeout = 7 * time.Second
+	if got := s.idleTimeout(); got != 7*time.Second {
+		t.Errorf("custom idleTimeout = %v; want 7s", got)
+	}
+	s.IdleTimeout = -1
+	if got := s.idleTimeout(); got != 0 {
+		t.Errorf("negative idleTimeout = %v; want 0", got)
+	}
 }
 
 // TestIdleConn_ResetsReadDeadline verifies that the per-Read deadline is
 // applied and that subsequent Reads beyond the timeout fail.
 func TestIdleConn_ResetsReadDeadline(t *testing.T) {
-ln, err := net.Listen("tcp", "127.0.0.1:0")
-if err != nil {
-t.Fatal(err)
-}
-defer ln.Close()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
 
-go func() {
-c, err := ln.Accept()
-if err != nil {
-return
-}
-// Hold the connection open without sending anything.
-<-time.After(2 * time.Second)
-_ = c.Close()
-}()
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		// Hold the connection open without sending anything.
+		<-time.After(2 * time.Second)
+		_ = c.Close()
+	}()
 
-c, err := net.Dial("tcp", ln.Addr().String())
-if err != nil {
-t.Fatal(err)
-}
-defer c.Close()
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
 
-ic := &idleConn{Conn: c}
-ic.setTimeout(100 * time.Millisecond)
-buf := make([]byte, 1)
-start := time.Now()
-if _, err := ic.Read(buf); err == nil {
-t.Fatal("expected idle Read to fail with a deadline error, got nil")
-}
-if elapsed := time.Since(start); elapsed > 1*time.Second {
-t.Errorf("idle Read took too long: %v", elapsed)
-}
+	ic := &idleConn{Conn: c}
+	ic.setTimeout(100 * time.Millisecond)
+	buf := make([]byte, 1)
+	start := time.Now()
+	if _, err := ic.Read(buf); err == nil {
+		t.Fatal("expected idle Read to fail with a deadline error, got nil")
+	}
+	if elapsed := time.Since(start); elapsed > 1*time.Second {
+		t.Errorf("idle Read took too long: %v", elapsed)
+	}
 }
 
 // TestReadFTPControlLine_Normal verifies a normal CRLF-terminated line is
 // returned including the trailing '\n'.
 func TestReadFTPControlLine_Normal(t *testing.T) {
-r := bufio.NewReader(strings.NewReader("USER alice\r\nPASS pw\r\n"))
-got, err := readFTPControlLine(r, ftpMaxControlLineLen)
-if err != nil {
-t.Fatalf("readFTPControlLine: %v", err)
-}
-if got != "USER alice\r\n" {
-t.Errorf("got %q; want %q", got, "USER alice\r\n")
-}
+	r := bufio.NewReader(strings.NewReader("USER alice\r\nPASS pw\r\n"))
+	got, err := readFTPControlLine(r, ftpMaxControlLineLen)
+	if err != nil {
+		t.Fatalf("readFTPControlLine: %v", err)
+	}
+	if got != "USER alice\r\n" {
+		t.Errorf("got %q; want %q", got, "USER alice\r\n")
+	}
 }
 
 // TestReadFTPControlLine_TooLong verifies an oversized line returns
 // errFTPLineTooLong after discarding the remainder of the line.
 func TestReadFTPControlLine_TooLong(t *testing.T) {
-long := strings.Repeat("A", ftpMaxControlLineLen+50) + "\r\nNEXT\r\n"
-r := bufio.NewReader(strings.NewReader(long))
-if _, err := readFTPControlLine(r, ftpMaxControlLineLen); !errors.Is(err, errFTPLineTooLong) {
-t.Fatalf("err = %v; want errFTPLineTooLong", err)
-}
-// The reader should now be positioned at the start of the next line.
-next, err := readFTPControlLine(r, ftpMaxControlLineLen)
-if err != nil {
-t.Fatalf("readFTPControlLine (second): %v", err)
-}
-if next != "NEXT\r\n" {
-t.Errorf("next line = %q; want %q", next, "NEXT\r\n")
-}
+	long := strings.Repeat("A", ftpMaxControlLineLen+50) + "\r\nNEXT\r\n"
+	r := bufio.NewReader(strings.NewReader(long))
+	if _, err := readFTPControlLine(r, ftpMaxControlLineLen); !errors.Is(err, errFTPLineTooLong) {
+		t.Fatalf("err = %v; want errFTPLineTooLong", err)
+	}
+	// The reader should now be positioned at the start of the next line.
+	next, err := readFTPControlLine(r, ftpMaxControlLineLen)
+	if err != nil {
+		t.Fatalf("readFTPControlLine (second): %v", err)
+	}
+	if next != "NEXT\r\n" {
+		t.Errorf("next line = %q; want %q", next, "NEXT\r\n")
+	}
 }
 
 // TestFTPErrMsg verifies that ftpErrMsg returns generic, path-free messages
 // for the well-known error categories.
 func TestFTPErrMsg(t *testing.T) {
-cases := []struct {
-err  error
-want string
-}{
-{nil, "ok"},
-{os.ErrNotExist, "no such file or directory"},
-{os.ErrPermission, "permission denied"},
-{os.ErrExist, "file exists"},
-{syscall.ENOTEMPTY, "directory not empty"},
-{syscall.EISDIR, "is a directory"},
-{syscall.ENOTDIR, "not a directory"},
-{errFTPLineTooLong, "command line too long"},
-{errors.New("something with /etc/passwd in it"), "request failed"},
-}
-for _, tc := range cases {
-if got := ftpErrMsg(tc.err); got != tc.want {
-t.Errorf("ftpErrMsg(%v) = %q; want %q", tc.err, got, tc.want)
-}
-}
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{nil, "ok"},
+		{os.ErrNotExist, "no such file or directory"},
+		{os.ErrPermission, "permission denied"},
+		{os.ErrExist, "file exists"},
+		{syscall.ENOTEMPTY, "directory not empty"},
+		{syscall.EISDIR, "is a directory"},
+		{syscall.ENOTDIR, "not a directory"},
+		{errFTPLineTooLong, "command line too long"},
+		{errors.New("something with /etc/passwd in it"), "request failed"},
+	}
+	for _, tc := range cases {
+		if got := ftpErrMsg(tc.err); got != tc.want {
+			t.Errorf("ftpErrMsg(%v) = %q; want %q", tc.err, got, tc.want)
+		}
+	}
 }
 
 type stubListener struct {
@@ -2527,7 +2527,7 @@ func (l *stubListener) Close() error {
 	}
 	return nil
 }
-func (l *stubListener) Addr() net.Addr            { return &net.TCPAddr{} }
+func (l *stubListener) Addr() net.Addr { return &net.TCPAddr{} }
 
 type stubConn struct {
 	readErr error
@@ -2573,18 +2573,18 @@ func TestFTPServer_CmdStorSanitizesCopyErrors(t *testing.T) {
 // TestNextAcceptBackoff verifies that the accept backoff schedule starts at
 // 5ms, doubles, and caps at 1s.
 func TestNextAcceptBackoff(t *testing.T) {
-if got := nextAcceptBackoff(0); got != 5*time.Millisecond {
-t.Errorf("nextAcceptBackoff(0) = %v; want 5ms", got)
-}
-if got := nextAcceptBackoff(5 * time.Millisecond); got != 10*time.Millisecond {
-t.Errorf("nextAcceptBackoff(5ms) = %v; want 10ms", got)
-}
-if got := nextAcceptBackoff(900 * time.Millisecond); got != time.Second {
-t.Errorf("nextAcceptBackoff(900ms) = %v; want 1s", got)
-}
-if got := nextAcceptBackoff(time.Second); got != time.Second {
-t.Errorf("nextAcceptBackoff(1s) = %v; want 1s", got)
-}
+	if got := nextAcceptBackoff(0); got != 5*time.Millisecond {
+		t.Errorf("nextAcceptBackoff(0) = %v; want 5ms", got)
+	}
+	if got := nextAcceptBackoff(5 * time.Millisecond); got != 10*time.Millisecond {
+		t.Errorf("nextAcceptBackoff(5ms) = %v; want 10ms", got)
+	}
+	if got := nextAcceptBackoff(900 * time.Millisecond); got != time.Second {
+		t.Errorf("nextAcceptBackoff(900ms) = %v; want 1s", got)
+	}
+	if got := nextAcceptBackoff(time.Second); got != time.Second {
+		t.Errorf("nextAcceptBackoff(1s) = %v; want 1s", got)
+	}
 }
 
 // TestSFTPServer_Chown_DefaultDenied verifies that a chown request is
