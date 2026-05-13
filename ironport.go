@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -180,6 +181,38 @@ func sanitizeSFTPErr(err error) error {
 		return os.ErrExist
 	}
 	return errSFTPRequestFailed
+}
+
+// hasCRLF reports whether s contains a CR or LF byte. Used to reject
+// client-supplied filenames that, if accepted, would let a later listing or
+// path-echoing reply inject fake FTP control-channel lines.
+func hasCRLF(s string) bool {
+	return strings.ContainsAny(s, "\r\n")
+}
+
+// sanitizeFTPText returns s with every ASCII control byte (0x00–0x1F, 0x7F)
+// replaced by '?'. Defense in depth for filenames that reach the FTP control
+// channel (257 replies) or the LIST/NLST data channel: even if a control byte
+// slips past the write-time guards (e.g. file created out-of-band), it cannot
+// forge reply lines or corrupt line-oriented listing output.
+func sanitizeFTPText(s string) string {
+	needs := false
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c == 0x7F {
+			needs = true
+			break
+		}
+	}
+	if !needs {
+		return s
+	}
+	b := []byte(s)
+	for i, c := range b {
+		if c < 0x20 || c == 0x7F {
+			b[i] = '?'
+		}
+	}
+	return string(b)
 }
 
 // NewSignerFromFile reads a PEM-encoded private key from the given file path
@@ -601,7 +634,15 @@ func (s *server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig, uploads chan<
 			continue
 		}
 		backoff = 0
-		go handleConn(nc, cfg, uploads, s.tempExtensions(), s.idleTimeout(), s.allowChown())
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("sftp handler panic from=%s: %v\n%s", nc.RemoteAddr(), r, debug.Stack())
+					_ = nc.Close()
+				}
+			}()
+			handleConn(nc, cfg, uploads, s.tempExtensions(), s.idleTimeout(), s.allowChown())
+		}()
 	}
 }
 
@@ -619,7 +660,15 @@ func (s *server) serveFTP(ln net.Listener, uploads chan<- CompletedUpload) error
 			continue
 		}
 		backoff = 0
-		go s.handleFTPConn(nc, s.tempExtensions(), uploads)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("ftp handler panic from=%s: %v\n%s", nc.RemoteAddr(), r, debug.Stack())
+					_ = nc.Close()
+				}
+			}()
+			s.handleFTPConn(nc, s.tempExtensions(), uploads)
+		}()
 	}
 }
 
@@ -1131,6 +1180,9 @@ func (j jail) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	if !j.canWrite {
 		return nil, os.ErrPermission
 	}
+	if hasCRLF(r.Filepath) {
+		return nil, syscall.EINVAL
+	}
 	clientPath := cleanSFTPClientPath(r.Filepath)
 	log.Printf("upload: %q", clientPath)
 	f, err := j.fs.OpenWrite(r.Filepath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
@@ -1158,6 +1210,9 @@ func (j jail) Filecmd(r *sftp.Request) error {
 		return sanitizeSFTPErr(j.applyAttrs(r))
 
 	case "Rename":
+		if hasCRLF(r.Target) {
+			return syscall.EINVAL
+		}
 		if err := j.fs.Rename(r.Filepath, r.Target); err != nil {
 			return sanitizeSFTPErr(err)
 		}
@@ -1189,6 +1244,9 @@ func (j jail) Filecmd(r *sftp.Request) error {
 		return sanitizeSFTPErr(j.fs.Remove(r.Filepath))
 
 	case "Mkdir":
+		if hasCRLF(r.Filepath) {
+			return syscall.EINVAL
+		}
 		return sanitizeSFTPErr(j.fs.Mkdir(r.Filepath, 0750))
 
 	case "Symlink":
@@ -1714,6 +1772,7 @@ func unquoteFTPPath(p string) string {
 }
 
 func ftpQuotePath(p string) string {
+	p = sanitizeFTPText(p)
 	return "\"" + strings.ReplaceAll(p, "\"", "\"\"") + "\""
 }
 
@@ -1843,13 +1902,13 @@ func (f *ftpSession) cmdList(arg string, namesOnly bool) {
 		}
 		for _, info := range entries {
 			if namesOnly {
-				lines = append(lines, info.Name())
+				lines = append(lines, sanitizeFTPText(info.Name()))
 			} else {
 				lines = append(lines, ftpListLine(info, info.Name()))
 			}
 		}
 	} else if namesOnly {
-		lines = append(lines, path.Base(ftpPath))
+		lines = append(lines, sanitizeFTPText(path.Base(ftpPath)))
 	} else {
 		lines = append(lines, ftpListLine(st, path.Base(ftpPath)))
 	}
@@ -1885,7 +1944,7 @@ func ftpListLine(info os.FileInfo, name string) string {
 	if mtime.Before(now.Add(-180*24*time.Hour)) || mtime.After(now.Add(24*time.Hour)) {
 		timePart = mtime.Format("Jan _2  2006")
 	}
-	return fmt.Sprintf("%s 1 ftp ftp %12d %s %s", ftpModeString(info.Mode()), info.Size(), timePart, name)
+	return fmt.Sprintf("%s 1 ftp ftp %12d %s %s", ftpModeString(info.Mode()), info.Size(), timePart, sanitizeFTPText(name))
 }
 
 func ftpModeString(mode os.FileMode) string {
@@ -1961,6 +2020,11 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 	if !f.user.CanWrite {
 		f.restartOffset = 0
 		_ = f.reply(550, "permission denied")
+		return
+	}
+	if hasCRLF(arg) {
+		f.restartOffset = 0
+		_ = f.reply(553, "invalid filename")
 		return
 	}
 	ftpPath := f.cleanPath(arg)
@@ -2113,6 +2177,10 @@ func (f *ftpSession) cmdMkdir(arg string) {
 		_ = f.reply(550, "permission denied")
 		return
 	}
+	if hasCRLF(arg) {
+		_ = f.reply(553, "invalid filename")
+		return
+	}
 	ftpPath := f.cleanPath(arg)
 	if err := f.fs.Mkdir(ftpPath, 0750); err != nil {
 		_ = f.reply(550, ftpErrMsg(err))
@@ -2155,6 +2223,11 @@ func (f *ftpSession) cmdRnto(arg string) {
 	}
 	if f.rnfrPath == "" {
 		_ = f.reply(503, "send RNFR first")
+		return
+	}
+	if hasCRLF(arg) {
+		f.rnfrPath = ""
+		_ = f.reply(553, "invalid filename")
 		return
 	}
 	oldPath := f.rnfrPath

@@ -3470,3 +3470,197 @@ func TestSFTPServer_InterruptedUploadNotAnnounced(t *testing.T) {
 		// expected: no notification for a truncated upload.
 	}
 }
+
+// ---- CRLF/control-byte sanitization tests ----
+
+func TestSanitizeFTPText(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"normal.txt", "normal.txt"},
+		{"with\rCR", "with?CR"},
+		{"with\nLF", "with?LF"},
+		{"with\r\nboth", "with??both"},
+		{"tab\there", "tab?here"},
+		{"del\x7Fhere", "del?here"},
+		{"null\x00byte", "null?byte"},
+		{"", ""},
+		{"αβγ", "αβγ"}, // multi-byte UTF-8 (all bytes ≥ 0x80) passes through
+	}
+	for _, tc := range cases {
+		if got := sanitizeFTPText(tc.in); got != tc.want {
+			t.Errorf("sanitizeFTPText(%q) = %q; want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestHasCRLF(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"normal", false},
+		{"with\rCR", true},
+		{"with\nLF", true},
+		{"with\r\nboth", true},
+		{"tab\there", false}, // tab is a control byte but not CR/LF
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := hasCRLF(tc.in); got != tc.want {
+			t.Errorf("hasCRLF(%q) = %v; want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestFtpQuotePath_SanitizesControlBytes(t *testing.T) {
+	if got, want := ftpQuotePath("/foo\r\nbar"), `"/foo??bar"`; got != want {
+		t.Errorf("ftpQuotePath CR/LF = %q; want %q", got, want)
+	}
+	if got, want := ftpQuotePath(`/has"quote`), `"/has""quote"`; got != want {
+		t.Errorf("ftpQuotePath quote escape = %q; want %q", got, want)
+	}
+	if got, want := ftpQuotePath("/clean"), `"/clean"`; got != want {
+		t.Errorf("ftpQuotePath clean = %q; want %q", got, want)
+	}
+}
+
+func TestFtpListLine_SanitizesName(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "stub")
+	if err := os.WriteFile(p, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := ftpListLine(info, "name\r\nFAKE 200 injected")
+	if strings.ContainsAny(line, "\r\n") {
+		t.Errorf("ftpListLine output contains raw CR/LF: %q", line)
+	}
+	if !strings.Contains(line, "name??FAKE 200 injected") {
+		t.Errorf("ftpListLine output = %q; want sanitized name substring", line)
+	}
+}
+
+// TestFTPServer_RejectsCRLFInWriteCommands verifies that STOR, MKD, and RNTO
+// reject a bare CR in the client-supplied filename. The CR survives the
+// CRLF-framed control read (only the trailing CR is trimmed), so without
+// explicit rejection at the write commands a hostile client could create a
+// file whose name later forges reply lines when echoed back via PWD/MKD or
+// LIST.
+func TestFTPServer_RejectsCRLFInWriteCommands(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "renameable.txt"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	users := map[string]UserInfo{
+		"u": {Password: "p", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestFTPServer(t, users, "5000-5010")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("u", "p")
+
+	// STOR
+	client.command(553, "STOR foo\rbar")
+	// MKD
+	client.command(553, "MKD foo\rbar")
+	// RNFR + RNTO
+	client.command(350, "RNFR renameable.txt")
+	client.command(553, "RNTO foo\rbar")
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("os.ReadDir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "renameable.txt" {
+		t.Fatalf("root contents = %v; want only renameable.txt (no CR-named entries created)", entries)
+	}
+}
+
+// TestFTPServer_LISTSanitizesEmbeddedCRLF verifies that a filename containing
+// raw CR/LF (created out-of-band — pkg/sftp + our write-time guards now
+// reject these, but the host filesystem can still hold one) does not let a
+// LIST response inject extra reply lines onto the data channel.
+func TestFTPServer_LISTSanitizesEmbeddedCRLF(t *testing.T) {
+	root := t.TempDir()
+	const badName = "good\r\nFAKE 200 injected"
+	if err := os.WriteFile(filepath.Join(root, badName), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	users := map[string]UserInfo{
+		"u": {Password: "p", Root: root, CanRead: true},
+	}
+	_, addr, stop := startTestFTPServer(t, users, "5000-5010")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("u", "p")
+	client.command(200, "TYPE I")
+
+	dc, _ := client.passiveConn()
+	client.send("LIST")
+	client.read(150)
+	listing, err := io.ReadAll(dc)
+	if err != nil {
+		t.Fatalf("io.ReadAll(dc): %v", err)
+	}
+	_ = dc.Close()
+	client.read(226)
+
+	// The data channel is line-oriented ("\r\n" per entry). With sanitization,
+	// the single directory entry should produce a single non-empty line; the
+	// CR and LF bytes inside the filename must have been replaced with '?'.
+	lines := strings.Split(strings.TrimRight(string(listing), "\r\n"), "\r\n")
+	if len(lines) != 1 {
+		t.Fatalf("LIST emitted %d lines; want 1 (CR/LF injection bypassed sanitization): %q", len(lines), listing)
+	}
+	if !strings.Contains(lines[0], "good??FAKE 200 injected") {
+		t.Errorf("LIST line = %q; want sanitized name substring %q", lines[0], "good??FAKE 200 injected")
+	}
+}
+
+// TestSFTPServer_RejectsCRLFInFilenames verifies the write-time CR/LF guards
+// on the SFTP handler paths (Filewrite, Filecmd Mkdir, Filecmd Rename) so
+// that a hostile SFTP client cannot create a name that would later be
+// echoed back to an FTP client and forge control-channel replies.
+func TestSFTPServer_RejectsCRLFInFilenames(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "src.txt"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	users := map[string]UserInfo{
+		"u": {Password: "p", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "u", "p")
+
+	if _, err := client.Create("/bad\rname.txt"); err == nil {
+		t.Errorf("Create with CR in name unexpectedly succeeded")
+	}
+	if _, err := client.Create("/bad\nname.txt"); err == nil {
+		t.Errorf("Create with LF in name unexpectedly succeeded")
+	}
+	if err := client.Mkdir("/bad\rdir"); err == nil {
+		t.Errorf("Mkdir with CR in name unexpectedly succeeded")
+	}
+	if err := client.Rename("/src.txt", "/bad\nrenamed.txt"); err == nil {
+		t.Errorf("Rename to CR/LF target unexpectedly succeeded")
+	}
+
+	// The valid source should still exist after the failed rename.
+	if _, err := os.Stat(filepath.Join(root, "src.txt")); err != nil {
+		t.Errorf("src.txt missing after rejected Rename: %v", err)
+	}
+	// No bad-named files should have been created on the host.
+	for _, n := range []string{"bad\rname.txt", "bad\nname.txt", "bad\rdir", "bad\nrenamed.txt"} {
+		if _, err := os.Stat(filepath.Join(root, n)); err == nil {
+			t.Errorf("CR/LF-named entry %q exists on disk; write-time guard bypassed", n)
+		}
+	}
+}
