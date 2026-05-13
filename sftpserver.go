@@ -1582,10 +1582,13 @@ func (f *ftpSession) authenticate(pass string) bool {
 	if err != nil {
 		return false
 	}
-	authUser := u
-	authUser.Root = jailRoot
-
-	f.user = authUser
+	f.user = UserInfo{
+		Password:       u.Password,
+		Root:           jailRoot,
+		CanRead:        u.CanRead,
+		CanWrite:       u.CanWrite,
+		AuthorizedKeys: u.AuthorizedKeys,
+	}
 	f.authenticated = true
 	f.cwd = "/"
 	f.rnfrPath = ""
