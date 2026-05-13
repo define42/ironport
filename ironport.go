@@ -10,7 +10,7 @@
 //   - Runtime user management (AddUser, RemoveUser, RemoveAllUsers, AddUserKey, RemoveUserKey).
 //   - Graceful shutdown via Close; upload-completion notifications via CompletedUploads.
 //   - Optional passive-mode FTP listener sharing the same users, jails, permissions,
-//     temp-extension handling, and CompletedUploads channel as SFTP.
+//     temp-extension handling, and CompletedUploads stream as SFTP.
 //
 // Typical usage:
 //
@@ -253,7 +253,7 @@ type Server struct {
 	FTPPassivePortRange string
 	// Users maps usernames to their credentials and jail roots.
 	Users map[string]UserInfo
-	// mu protects Users and listeners for concurrent reads and writes.
+	// mu protects Users, completedUploads, and listeners for concurrent reads and writes.
 	mu sync.RWMutex
 	// ln is the active SFTP listener; set by ListenAndServe and closed by Close.
 	ln net.Listener
@@ -261,21 +261,9 @@ type Server struct {
 	ftpLn net.Listener
 	// Signer is the host key used for the SSH handshake.
 	Signer ssh.Signer
-	// CompletedUploads receives a CompletedUpload describing each file whose
-	// write has finished successfully (i.e. the client closed the file
-	// without error). The channel is buffered; sends are non-blocking so a
-	// slow consumer never stalls an upload. Callers should drain the
-	// channel continuously.
-	//
-	// The buffer capacity is set by the completedUploadsSize argument of
-	// NewServer. A non-positive value falls back to the package default (64).
-	// It can also be overridden by assigning a new channel to this field
-	// before calling ListenAndServe.
-	//
-	// When a Server is constructed via a struct literal rather than NewServer,
-	// set CompletedUploadsSize and leave this field nil — ListenAndServe will
-	// initialize it automatically using that size.
-	CompletedUploads chan CompletedUpload
+	// completedUploads receives upload notifications. Use CompletedUploads to
+	// access it as a receive-only stream.
+	completedUploads chan CompletedUpload
 	// CompletedUploadsSize controls the buffer capacity of the
 	// CompletedUploads channel. It is set automatically by the
 	// completedUploadsSize argument of NewServer. When constructing a Server
@@ -426,14 +414,36 @@ func NewServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserI
 // CompletedUploadsSize; a zero or negative value falls back to
 // defaultCompletedUploadsSize.
 func (s *Server) initCompletedUploads() {
-	if s.CompletedUploads != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.completedUploads != nil {
 		return
 	}
 	size := s.CompletedUploadsSize
 	if size <= 0 {
 		size = defaultCompletedUploadsSize
 	}
-	s.CompletedUploads = make(chan CompletedUpload, size)
+	s.completedUploads = make(chan CompletedUpload, size)
+}
+
+func (s *Server) completedUploadsChan() chan CompletedUpload {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.completedUploads
+}
+
+// CompletedUploads returns a receive-only stream of successful upload
+// notifications. The channel is buffered; sends are non-blocking so a slow
+// consumer never stalls an upload. Callers should drain the stream
+// continuously.
+//
+// The buffer capacity is set by the completedUploadsSize argument of
+// NewServer. A non-positive value falls back to the package default (64).
+// When constructing a Server via a struct literal, set CompletedUploadsSize
+// before calling CompletedUploads or ListenAndServe.
+func (s *Server) CompletedUploads() <-chan CompletedUpload {
+	s.initCompletedUploads()
+	return s.completedUploadsChan()
 }
 
 func parseFTPPassivePortRange(portRange string) (start, end int, err error) {
@@ -508,6 +518,7 @@ func (s *Server) ListenAndServe() error {
 		return fmt.Errorf("ironport: %w", err)
 	}
 	s.initCompletedUploads()
+	uploads := s.completedUploadsChan()
 	cfg := s.sshServerConfig()
 
 	sftpLn, err := net.Listen("tcp", s.Addr)
@@ -539,12 +550,12 @@ func (s *Server) ListenAndServe() error {
 	log.Printf("SFTP listening on %s", sftpLn.Addr())
 	workers := 1
 	errCh := make(chan error, 2)
-	go func() { errCh <- s.serveSFTP(sftpLn, cfg) }()
+	go func() { errCh <- s.serveSFTP(sftpLn, cfg, uploads) }()
 
 	if ftpLn != nil {
 		workers++
 		log.Printf("FTP listening on %s", ftpLn.Addr())
-		go func() { errCh <- s.serveFTP(ftpLn) }()
+		go func() { errCh <- s.serveFTP(ftpLn, uploads) }()
 	}
 
 	var ret error
@@ -557,7 +568,7 @@ func (s *Server) ListenAndServe() error {
 	return ret
 }
 
-func (s *Server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig) error {
+func (s *Server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload) error {
 	var backoff time.Duration
 	for {
 		nc, err := ln.Accept()
@@ -574,11 +585,11 @@ func (s *Server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig) error {
 			continue
 		}
 		backoff = 0
-		go handleConn(nc, cfg, s.CompletedUploads, s.tempExtensions(), s.idleTimeout(), s.allowChown())
+		go handleConn(nc, cfg, uploads, s.tempExtensions(), s.idleTimeout(), s.allowChown())
 	}
 }
 
-func (s *Server) serveFTP(ln net.Listener) error {
+func (s *Server) serveFTP(ln net.Listener, uploads chan<- CompletedUpload) error {
 	var backoff time.Duration
 	for {
 		nc, err := ln.Accept()
@@ -592,7 +603,7 @@ func (s *Server) serveFTP(ln net.Listener) error {
 			continue
 		}
 		backoff = 0
-		go s.handleFTPConn(nc, s.tempExtensions())
+		go s.handleFTPConn(nc, s.tempExtensions(), uploads)
 	}
 }
 
@@ -1307,13 +1318,14 @@ type ftpSession struct {
 	restartOffset int64
 	clientIP      string
 	tempExts      []string
+	uploads       chan<- CompletedUpload
 	// fs is the fd-relative filesystem backing this session's jail. It is
 	// constructed by authenticate on successful login and released when the
 	// session ends (closeJail). Until login succeeds it is nil.
 	fs *jailFS
 }
 
-func (s *Server) handleFTPConn(nc net.Conn, tempExts []string) {
+func (s *Server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- CompletedUpload) {
 	defer func() { _ = nc.Close() }()
 
 	sess := &ftpSession{
@@ -1324,6 +1336,7 @@ func (s *Server) handleFTPConn(nc net.Conn, tempExts []string) {
 		cwd:      "/",
 		clientIP: remoteIP(nc.RemoteAddr()),
 		tempExts: tempExts,
+		uploads:  uploads,
 	}
 	defer sess.closeDataListener()
 	defer sess.closeJail()
@@ -2013,7 +2026,7 @@ func (f *ftpSession) announceUpload(ftpPath, fullPath string) {
 		ClientIP:     f.clientIP,
 	}
 	select {
-	case f.server.CompletedUploads <- evt:
+	case f.uploads <- evt:
 	default:
 		log.Printf("upload complete: CompletedUploads queue full, notification for %q dropped", ftpPath)
 	}

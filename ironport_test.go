@@ -234,7 +234,7 @@ func startTestServer(t *testing.T, users map[string]UserInfo, configure ...func(
 			if err != nil {
 				return // listener closed
 			}
-			go handleConn(nc, cfg, srv.CompletedUploads, srv.tempExtensions(), srv.idleTimeout(), srv.allowChown())
+			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.tempExtensions(), srv.idleTimeout(), srv.allowChown())
 		}
 	}()
 
@@ -522,32 +522,67 @@ func TestCompletedUploadsSize(t *testing.T) {
 
 	// Default capacity: zero CompletedUploadsSize selects defaultCompletedUploadsSize.
 	srv := NewServer(":0", "", "", users, signer, defaultCompletedUploadsSize)
-	if cap(srv.CompletedUploads) != defaultCompletedUploadsSize {
-		t.Errorf("default cap = %d; want %d", cap(srv.CompletedUploads), defaultCompletedUploadsSize)
+	if cap(srv.CompletedUploads()) != defaultCompletedUploadsSize {
+		t.Errorf("default cap = %d; want %d", cap(srv.CompletedUploads()), defaultCompletedUploadsSize)
 	}
 
 	// Custom capacity via NewServer required parameter.
 	srv2 := NewServer(":0", "", "", users, signer, 256)
-	if cap(srv2.CompletedUploads) != 256 {
-		t.Errorf("custom cap via NewServer = %d; want 256", cap(srv2.CompletedUploads))
+	if cap(srv2.CompletedUploads()) != 256 {
+		t.Errorf("custom cap via NewServer = %d; want 256", cap(srv2.CompletedUploads()))
 	}
 
-	// Custom capacity via struct literal + initCompletedUploads (bypasses NewServer).
+	// Custom capacity via struct literal + CompletedUploads (bypasses NewServer).
 	custom := &Server{CompletedUploadsSize: 128}
-	custom.initCompletedUploads()
-	if cap(custom.CompletedUploads) != 128 {
-		t.Errorf("custom cap = %d; want 128", cap(custom.CompletedUploads))
+	if cap(custom.CompletedUploads()) != 128 {
+		t.Errorf("custom cap = %d; want 128", cap(custom.CompletedUploads()))
 	}
 
 	// initCompletedUploads is idempotent: an already-set channel is not replaced.
 	existing := make(chan CompletedUpload, 7)
-	srv3 := &Server{CompletedUploads: existing, CompletedUploadsSize: 999}
+	srv3 := &Server{completedUploads: existing, CompletedUploadsSize: 999}
 	srv3.initCompletedUploads()
-	if srv3.CompletedUploads != existing {
+	if srv3.completedUploadsChan() != existing {
 		t.Error("initCompletedUploads replaced an already-set channel")
 	}
-	if cap(srv3.CompletedUploads) != 7 {
-		t.Errorf("cap after idempotent init = %d; want 7", cap(srv3.CompletedUploads))
+	if cap(srv3.CompletedUploads()) != 7 {
+		t.Errorf("cap after idempotent init = %d; want 7", cap(srv3.CompletedUploads()))
+	}
+}
+
+func TestFTPSessionAnnounceUploadUsesCapturedCompletedUploads(t *testing.T) {
+	serverUploads := make(chan CompletedUpload, 1)
+	sessionUploads := make(chan CompletedUpload, 1)
+	fs := &ftpSession{
+		server: &Server{
+			completedUploads: serverUploads,
+		},
+		username: "alice",
+		clientIP: "127.0.0.1",
+		uploads:  sessionUploads,
+	}
+
+	fs.announceUpload("/upload.txt", "/srv/upload.txt")
+
+	select {
+	case got := <-sessionUploads:
+		if got.Username != "alice" {
+			t.Errorf("Username = %q; want alice", got.Username)
+		}
+		if got.FilePath != "/upload.txt" {
+			t.Errorf("FilePath = %q; want /upload.txt", got.FilePath)
+		}
+		if got.FullFilePath != "/srv/upload.txt" {
+			t.Errorf("FullFilePath = %q; want /srv/upload.txt", got.FullFilePath)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected CompletedUpload on captured FTP session channel")
+	}
+
+	select {
+	case got := <-serverUploads:
+		t.Fatalf("announceUpload sent to Server.CompletedUploads after session capture: %+v", got)
+	default:
 	}
 }
 
@@ -684,7 +719,7 @@ func TestFTPServer_UploadDownloadList(t *testing.T) {
 	}
 
 	select {
-	case evt := <-srv.CompletedUploads:
+	case evt := <-srv.CompletedUploads():
 		if evt.FilePath != "/upload.txt" {
 			t.Fatalf("CompletedUploads FilePath = %q; want /upload.txt", evt.FilePath)
 		}
@@ -1031,7 +1066,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleConn(nc, cfg, srv.CompletedUploads, srv.tempExtensions(), srv.idleTimeout(), srv.allowChown())
+			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.tempExtensions(), srv.idleTimeout(), srv.allowChown())
 		}
 	}()
 	t.Cleanup(func() { _ = ln.Close() })
@@ -1134,7 +1169,7 @@ func TestSFTPServer_CompletedUploadsQueue(t *testing.T) {
 		}
 
 		select {
-		case got := <-srv.CompletedUploads:
+		case got := <-srv.CompletedUploads():
 			if got.FilePath != name {
 				t.Errorf("CompletedUploads received FilePath %q; want %q", got.FilePath, name)
 			}
@@ -2395,7 +2430,7 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleConn(nc, cfg, srv.CompletedUploads, srv.tempExtensions(), srv.idleTimeout(), srv.allowChown())
+			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.tempExtensions(), srv.idleTimeout(), srv.allowChown())
 		}
 	}()
 
@@ -2522,7 +2557,7 @@ func TestSFTPServer_TempExtensions_SuppressesUploadAndAnnouncesOnRename(t *testi
 	}
 
 	select {
-	case got := <-srv.CompletedUploads:
+	case got := <-srv.CompletedUploads():
 		t.Fatalf("CompletedUploads received %+v for a temp-extension upload; expected suppression", got)
 	case <-time.After(300 * time.Millisecond):
 		// expected: nothing
@@ -2535,7 +2570,7 @@ func TestSFTPServer_TempExtensions_SuppressesUploadAndAnnouncesOnRename(t *testi
 	}
 
 	select {
-	case got := <-srv.CompletedUploads:
+	case got := <-srv.CompletedUploads():
 		if got.FilePath != finalName {
 			t.Errorf("CompletedUploads FilePath = %q; want %q", got.FilePath, finalName)
 		}
@@ -2581,7 +2616,7 @@ func TestSFTPServer_TempExtensions_RenameBetweenTempNamesDoesNotAnnounce(t *test
 		t.Fatalf("rename: %v", err)
 	}
 	select {
-	case got := <-srv.CompletedUploads:
+	case got := <-srv.CompletedUploads():
 		t.Fatalf("CompletedUploads received %+v; expected no notification for temp->temp rename", got)
 	case <-time.After(300 * time.Millisecond):
 		// expected
@@ -2612,7 +2647,7 @@ func TestSFTPServer_TempExtensions_PlainUploadStillAnnounced(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 	select {
-	case got := <-srv.CompletedUploads:
+	case got := <-srv.CompletedUploads():
 		if got.FilePath != name {
 			t.Errorf("CompletedUploads FilePath = %q; want %q", got.FilePath, name)
 		}
@@ -3077,7 +3112,7 @@ func TestFTPServer_CmdStorSanitizesCopyErrors(t *testing.T) {
 
 	fs := &ftpSession{
 		server: &Server{
-			CompletedUploads: make(chan CompletedUpload, 1),
+			completedUploads: make(chan CompletedUpload, 1),
 		},
 		conn:   controlConn,
 		w:      bufio.NewWriter(&control),
@@ -3337,7 +3372,7 @@ func TestSFTPServer_InterruptedUploadNotAnnounced(t *testing.T) {
 	_ = conn.Close()
 
 	select {
-	case evt := <-srv.CompletedUploads:
+	case evt := <-srv.CompletedUploads():
 		t.Fatalf("CompletedUploads received notification %+v for an interrupted upload; want none", evt)
 	case <-time.After(500 * time.Millisecond):
 		// expected: no notification for a truncated upload.

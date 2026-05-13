@@ -8,10 +8,10 @@ A production-ready, embeddable SFTP server and FTP server library for Go with a 
 - **Per-user jail (chroot)** — each user is confined to a configurable root directory. Every filesystem operation is performed via Linux `openat2` with `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS`, so the kernel itself rejects path traversal and any symlink anywhere in the lookup
 - **Fine-grained permissions** — independent `CanRead` / `CanWrite` flags per user
 - **Dynamic user management** — add, remove, and update users and their authorized keys at runtime without restarting the server
-- **Upload notifications** — a buffered `CompletedUploads` channel delivers a `CompletedUpload` struct (username, full on-disk path, jail-relative path, and client IP) for every successfully closed upload
+- **Upload notifications** — a buffered `CompletedUploads()` stream delivers a `CompletedUpload` struct (username, full on-disk path, jail-relative path, and client IP) for every successfully closed upload
 - **Temp-file aware completion** — optionally set `Server.TempExtensions` (for example, `.tmp`, `.writing`) to suppress completion notifications for temporary upload names and emit the notification when the file is renamed to a non-temp name
 - **Graceful shutdown** — `Close()` stops the listener; in-flight sessions are not terminated
-- **Thread-safe** — all shared state is protected by `sync.RWMutex`
+- **Thread-safe runtime APIs** — user-management helpers and listener lifecycle methods are safe to call while the server is running
 - **Handshake timeout** — connections that do not complete the SSH handshake within 30 seconds are dropped
 - **Idle-session timeout** — configurable via `Server.IdleTimeout` (default 15 minutes); inactive authenticated SFTP sessions are reaped
 - **Empty-password protection** — users whose stored `Password` is empty cannot authenticate via password, and empty supplied passwords are always rejected
@@ -56,7 +56,7 @@ func main() {
 
     // Drain upload notifications in the background.
     go func() {
-        for ev := range srv.CompletedUploads {
+        for ev := range srv.CompletedUploads() {
             log.Printf("upload complete: user=%q ip=%q path=%q full=%q",
                 ev.Username, ev.ClientIP, ev.FilePath, ev.FullFilePath)
         }
@@ -74,9 +74,15 @@ func main() {
 srv := ironport.NewServer(":2022", "", "", users, signer, 256)
 ```
 
+Read upload notifications from the receive-only `CompletedUploads()` stream.
+The underlying channel is internal, so callers cannot send to it, close it, or
+replace it while the server is running. To change the buffer capacity, set
+`CompletedUploadsSize` before startup or pass a different size to `NewServer`.
+
 When constructing a `Server` via a struct literal instead of `NewServer`,
-set `CompletedUploadsSize` and leave `CompletedUploads` nil — `ListenAndServe`
-will initialize the channel automatically with that capacity:
+set `CompletedUploadsSize` before calling `CompletedUploads()` or
+`ListenAndServe`; either call initializes the internal channel automatically
+with that capacity:
 
 ```go
 srv := &ironport.Server{
@@ -92,7 +98,7 @@ log.Fatal(srv.ListenAndServe())
 
 Many clients upload to a temporary filename first (for example `file.txt.tmp`)
 and rename to the final filename only after the upload is fully complete.
-Configure `TempExtensions` to emit `CompletedUploads` events at that final
+Configure `TempExtensions` to emit `CompletedUploads()` events at that final
 rename boundary:
 
 ```go
