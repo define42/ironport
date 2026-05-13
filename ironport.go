@@ -1127,7 +1127,7 @@ type writeLogger struct {
 
 func (w *writeLogger) WriteAt(p []byte, off int64) (int, error) {
 	if w.appendMode {
-		return w.File.Write(p)
+		return w.Write(p)
 	}
 	return w.File.WriteAt(p, off)
 }
