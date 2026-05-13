@@ -1253,7 +1253,7 @@ func TestCanonicalJailRoot(t *testing.T) {
 	}
 }
 
-func TestSSHServerConfig_PasswordAuth_ValidatesJailRoot(t *testing.T) {
+func TestSFTPServer_PasswordAuth_ValidatesJailRoot(t *testing.T) {
 	target := t.TempDir()
 	filePath := filepath.Join(t.TempDir(), "root-file")
 	if err := os.WriteFile(filePath, []byte("x"), 0o600); err != nil {
@@ -1312,7 +1312,7 @@ func TestSSHServerConfig_PasswordAuth_ValidatesJailRoot(t *testing.T) {
 	}
 }
 
-func TestSSHServerConfig_PublicKeyAuth_RejectsInvalidJailRoot(t *testing.T) {
+func TestSFTPServer_PublicKeyAuth_RejectsInvalidJailRoot(t *testing.T) {
 	_, clientPubKey := testClientKey(t)
 	filePath := filepath.Join(t.TempDir(), "root-file")
 	if err := os.WriteFile(filePath, []byte("x"), 0o600); err != nil {
