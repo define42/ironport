@@ -67,11 +67,16 @@ type idleConn struct {
 	timeoutNs atomic.Int64
 }
 
+func (c *idleConn) setReadDeadline(t time.Time) {
+	conn := c.Conn
+	_ = conn.SetReadDeadline(t)
+}
+
 func (c *idleConn) Read(b []byte) (int, error) {
 	if d := time.Duration(c.timeoutNs.Load()); d > 0 {
-		_ = c.Conn.SetReadDeadline(time.Now().Add(d))
+		c.setReadDeadline(time.Now().Add(d))
 	} else {
-		_ = c.Conn.SetReadDeadline(time.Time{})
+		c.setReadDeadline(time.Time{})
 	}
 	return c.Conn.Read(b)
 }
@@ -677,7 +682,7 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 }
 
 func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload, tempExts []string, idleTimeout time.Duration, allowChown bool) {
-	defer nc.Close()
+	defer func() { _ = nc.Close() }()
 
 	// Wrap the raw connection so that every Read resets the read deadline.
 	// During the handshake we use sshHandshakeTimeout to prevent malicious
@@ -695,7 +700,7 @@ func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUplo
 	// Handshake complete – switch to the idle-session deadline. A zero value
 	// disables the deadline.
 	ic.setTimeout(idleTimeout)
-	defer sshConn.Close()
+	defer func() { _ = sshConn.Close() }()
 
 	jailRoot := sshConn.Permissions.Extensions["jailRoot"]
 	user := sshConn.Permissions.Extensions["user"]
@@ -738,7 +743,7 @@ func remoteIP(addr net.Addr) string {
 }
 
 func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, allowChown bool) {
-	defer ch.Close()
+	defer func() { _ = ch.Close() }()
 
 	for req := range inReqs {
 		switch req.Type {
@@ -1182,7 +1187,7 @@ type ftpSession struct {
 }
 
 func (s *Server) handleFTPConn(nc net.Conn, tempExts []string) {
-	defer nc.Close()
+	defer func() { _ = nc.Close() }()
 
 	fs := &ftpSession{
 		server:   s,
@@ -1605,7 +1610,7 @@ func (f *ftpSession) acceptDataConn() (net.Conn, error) {
 	}
 	ln := f.dataLn
 	f.dataLn = nil
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	if tcpLn, ok := ln.(*net.TCPListener); ok {
 		_ = tcpLn.SetDeadline(time.Now().Add(30 * time.Second))
@@ -1683,7 +1688,7 @@ func (f *ftpSession) cmdList(arg string, namesOnly bool) {
 		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
-	defer dc.Close()
+	defer func() { _ = dc.Close() }()
 
 	for _, line := range lines {
 		if _, err := io.WriteString(dc, line+"\r\n"); err != nil {
@@ -1746,7 +1751,7 @@ func (f *ftpSession) cmdRetr(arg string) {
 		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	if f.restartOffset > 0 {
 		if _, err := file.Seek(f.restartOffset, io.SeekStart); err != nil {
@@ -1765,7 +1770,7 @@ func (f *ftpSession) cmdRetr(arg string) {
 		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
-	defer dc.Close()
+	defer func() { _ = dc.Close() }()
 
 	if _, err := io.Copy(dc, file); err != nil {
 		_ = f.reply(426, ftpErrMsg(err))
@@ -1798,7 +1803,7 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
-	defer dc.Close()
+	defer func() { _ = dc.Close() }()
 
 	flags := os.O_CREATE | os.O_WRONLY
 	switch {

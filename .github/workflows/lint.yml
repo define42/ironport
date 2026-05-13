@@ -29,9 +29,9 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          # Pin to a known-good major version of golangci-lint so the lint
-          # rules don't silently change underneath us. The default linter
-          # set (errcheck, gosimple, govet, ineffassign, staticcheck, unused)
+          # Pin to a known-good release of golangci-lint so the lint rules
+          # don't silently change underneath us. The default linter set
+          # (errcheck, gosimple, govet, ineffassign, staticcheck, unused)
           # is sufficient for this codebase.
-          version: v1.64.8
+          version: v2.12.2
           args: --timeout=5m

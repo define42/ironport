@@ -144,7 +144,7 @@ func startTestServer(t *testing.T, users map[string]UserInfo, configure ...func(
 		}
 	}()
 
-	stop = func() { ln.Close() }
+	stop = func() { _ = ln.Close() }
 	return srv, addr, stop
 }
 
@@ -162,12 +162,12 @@ func dialSFTP(t *testing.T, addr, user, pass string) *sftp.Client {
 	}
 	client, err := sftp.NewClient(conn)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		t.Fatalf("sftp.NewClient: %v", err)
 	}
 	t.Cleanup(func() {
-		client.Close()
-		conn.Close()
+		_ = client.Close()
+		_ = conn.Close()
 	})
 	return client
 }
@@ -331,7 +331,7 @@ func TestSFTPServer_UploadDownload(t *testing.T) {
 	if _, err = f.Write(content); err != nil {
 		t.Fatalf("f.Write: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	// Download and compare.
 	rf, err := client.Open(remote)
@@ -339,7 +339,7 @@ func TestSFTPServer_UploadDownload(t *testing.T) {
 		t.Fatalf("client.Open: %v", err)
 	}
 	got, err := io.ReadAll(rf)
-	rf.Close()
+	_ = rf.Close()
 	if err != nil {
 		t.Fatalf("io.ReadAll: %v", err)
 	}
@@ -593,7 +593,7 @@ func TestSFTPServer_ReadOnlyUser(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	got, _ := io.ReadAll(rf)
-	rf.Close()
+	_ = rf.Close()
 	if string(got) != "read me" {
 		t.Errorf("downloaded %q; want %q", got, "read me")
 	}
@@ -626,7 +626,7 @@ func TestSFTPServer_WriteOnlyUser(t *testing.T) {
 	if _, err = f.Write([]byte("write only")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	// Read must be denied.
 	_, err = client.Open("/upload.txt")
@@ -870,7 +870,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 			go handleConn(nc, cfg, srv.CompletedUploads, srv.tempExtensions(), srv.idleTimeout(), srv.allowChown())
 		}
 	}()
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
 	content := []byte("key from file")
@@ -881,14 +881,14 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 	if _, err = f.Write(content); err != nil {
 		t.Fatalf("f.Write: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	rf, err := client.Open("/hello.txt")
 	if err != nil {
 		t.Fatalf("client.Open: %v", err)
 	}
 	got, _ := io.ReadAll(rf)
-	rf.Close()
+	_ = rf.Close()
 	if !bytes.Equal(got, content) {
 		t.Errorf("downloaded %q; want %q", got, content)
 	}
@@ -1030,7 +1030,7 @@ func TestSFTPServer_UploadFilePermissions(t *testing.T) {
 	if _, err = f.Write([]byte("sensitive")); err != nil {
 		t.Fatalf("f.Write: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	info, err := os.Stat(filepath.Join(root, "secret.txt"))
 	if err != nil {
@@ -1072,12 +1072,12 @@ func dialSFTPWithPublicKey(t *testing.T, addr, user string, signer ssh.Signer) *
 	}
 	client, err := sftp.NewClient(conn)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		t.Fatalf("sftp.NewClient: %v", err)
 	}
 	t.Cleanup(func() {
-		client.Close()
-		conn.Close()
+		_ = client.Close()
+		_ = conn.Close()
 	})
 	return client
 }
@@ -1111,7 +1111,7 @@ func TestSFTPServer_PublicKeyAuth(t *testing.T) {
 	if _, err = f.Write(content); err != nil {
 		t.Fatalf("f.Write: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	// Download and verify the content.
 	rf, err := client.Open("/pubkey.txt")
@@ -1119,7 +1119,7 @@ func TestSFTPServer_PublicKeyAuth(t *testing.T) {
 		t.Fatalf("client.Open: %v", err)
 	}
 	got, err := io.ReadAll(rf)
-	rf.Close()
+	_ = rf.Close()
 	if err != nil {
 		t.Fatalf("io.ReadAll: %v", err)
 	}
@@ -1419,7 +1419,7 @@ func TestSFTPServer_CreateFileInFolder(t *testing.T) {
 	if _, err = f.Write(content); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	// Verify by downloading.
 	rf, err := client.Open("/subdir/file.txt")
@@ -1427,7 +1427,7 @@ func TestSFTPServer_CreateFileInFolder(t *testing.T) {
 		t.Fatalf("Open(/subdir/file.txt): %v", err)
 	}
 	got, err := io.ReadAll(rf)
-	rf.Close()
+	_ = rf.Close()
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
 	}
@@ -1458,7 +1458,7 @@ func TestSFTPServer_RenameFile(t *testing.T) {
 	if _, err = f.Write(content); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	// Rename it.
 	if err := client.Rename("/original.txt", "/renamed.txt"); err != nil {
@@ -1471,7 +1471,7 @@ func TestSFTPServer_RenameFile(t *testing.T) {
 		t.Fatalf("Open(/renamed.txt): %v", err)
 	}
 	got, _ := io.ReadAll(rf)
-	rf.Close()
+	_ = rf.Close()
 	if !bytes.Equal(got, content) {
 		t.Errorf("downloaded %q; want %q", got, content)
 	}
@@ -1511,7 +1511,7 @@ func TestSFTPServer_MoveFileBetweenFolders(t *testing.T) {
 	if _, err = f.Write(content); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	// Move the file to the destination directory.
 	if err := client.Rename("/src/move.txt", "/dst/move.txt"); err != nil {
@@ -1524,7 +1524,7 @@ func TestSFTPServer_MoveFileBetweenFolders(t *testing.T) {
 		t.Fatalf("Open(/dst/move.txt): %v", err)
 	}
 	got, _ := io.ReadAll(rf)
-	rf.Close()
+	_ = rf.Close()
 	if !bytes.Equal(got, content) {
 		t.Errorf("downloaded %q; want %q", got, content)
 	}
@@ -1558,7 +1558,7 @@ func TestSFTPServer_DeleteFileInFolder(t *testing.T) {
 	if _, err = f.Write([]byte("delete me")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	// Delete the file.
 	if err := client.Remove("/folder/todelete.txt"); err != nil {
@@ -1591,7 +1591,7 @@ func TestSFTPServer_MoveFileToNonExistentFolder(t *testing.T) {
 	if _, err = f.Write([]byte("content")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	// Attempt to rename into a non-existent directory; must fail.
 	err = client.Rename("/existing.txt", "/nosuchdir/existing.txt")
@@ -1620,7 +1620,7 @@ func TestSFTPServer_Chmod(t *testing.T) {
 	if _, err = f.Write([]byte("chmod test")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	// Send a chmod request and verify it was applied on disk.
 	if err := client.Chmod("/chmod_test.txt", 0644); err != nil {
@@ -1657,7 +1657,7 @@ func TestSFTPServer_Chown(t *testing.T) {
 	if _, err = f.Write([]byte("chown test")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	// Retrieve the current owner so we can use valid uid/gid values.
 	info, err := os.Stat(filepath.Join(root, "chown_test.txt"))
@@ -1698,7 +1698,7 @@ func TestSFTPServer_Chgrp(t *testing.T) {
 	if _, err = f.Write([]byte("chgrp test")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	// Retrieve the current owner/group so we can pass valid identifiers.
 	info, err := os.Stat(filepath.Join(root, "chgrp_test.txt"))
@@ -1895,7 +1895,7 @@ func TestServer_ListenAndServe_Close(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ssh.Dial before Close: %v", err)
 	}
-	conn.Close()
+	_ = conn.Close()
 
 	// Close the server; ListenAndServe must return nil.
 	if err := srv.Close(); err != nil {
@@ -1949,7 +1949,7 @@ func TestSFTPServer_DeleteFolderWithFilesInside(t *testing.T) {
 	if _, err = f.Write([]byte("data")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	// Attempt to remove the non-empty directory; must fail.
 	if err := client.RemoveDirectory("/hasfiles"); err == nil {
@@ -2003,7 +2003,7 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 
 	go func() {
 		for {
@@ -2020,7 +2020,7 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("net.Dial: %v", err)
 	}
-	defer idle.Close()
+	defer func() { _ = idle.Close() }()
 
 	// The server sends the SSH protocol version banner on connect, so we must
 	// drain bytes until the connection is fully closed by the server-side
@@ -2300,7 +2300,7 @@ func TestFTPServer_ControlLineTooLong(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Drain the 220 greeting.
 	br := bufio.NewReader(conn)
@@ -2443,7 +2443,7 @@ func TestIdleConn_ResetsReadDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		c, err := ln.Accept()
@@ -2459,7 +2459,7 @@ func TestIdleConn_ResetsReadDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	ic := &idleConn{Conn: c}
 	ic.setTimeout(100 * time.Millisecond)
@@ -2625,7 +2625,7 @@ func TestSFTPServer_Chown_DefaultDenied(t *testing.T) {
 	if _, err := f.Write([]byte("x")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	info, err := os.Stat(filepath.Join(root, "chown_denied.txt"))
 	if err != nil {
@@ -2667,7 +2667,7 @@ func TestSFTPServer_SymlinkRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	err = client.Symlink("/target.txt", "/link.txt")
 	if err == nil {
