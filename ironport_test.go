@@ -1,4 +1,4 @@
-package sftpserver
+package ironport
 
 import (
 	"bufio"
@@ -2288,7 +2288,7 @@ func TestServer_ListenAndServe_EmptyAddr(t *testing.T) {
 			t.Errorf("addr=%q: expected error, got nil", addr)
 			continue
 		}
-		const want = "sftpserver: Addr is required"
+		const want = "ironport: Addr is required"
 		if err.Error() != want {
 			t.Errorf("addr=%q: got %q; want %q", addr, err.Error(), want)
 		}
@@ -2303,7 +2303,7 @@ func TestServer_ListenAndServe_NilSigner(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	const want = "sftpserver: Signer is required"
+	const want = "ironport: Signer is required"
 	if err.Error() != want {
 		t.Errorf("got %q; want %q", err.Error(), want)
 	}
