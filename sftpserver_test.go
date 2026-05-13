@@ -1166,6 +1166,17 @@ func dialSFTPWithPublicKey(t *testing.T, addr, user string, signer ssh.Signer) *
 	return client
 }
 
+type testConnMetadata struct {
+	user string
+}
+
+func (m testConnMetadata) User() string          { return m.user }
+func (m testConnMetadata) SessionID() []byte     { return nil }
+func (m testConnMetadata) ClientVersion() []byte { return nil }
+func (m testConnMetadata) ServerVersion() []byte { return nil }
+func (m testConnMetadata) RemoteAddr() net.Addr  { return &net.TCPAddr{} }
+func (m testConnMetadata) LocalAddr() net.Addr   { return &net.TCPAddr{} }
+
 // TestSFTPServer_PublicKeyAuth verifies that a user configured with an
 // AuthorizedKeys entry can authenticate using the matching private key and
 // perform full read/write SFTP operations.
@@ -1236,6 +1247,143 @@ func TestSFTPServer_PublicKeyAuth_InvalidKey(t *testing.T) {
 	}
 	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
 		t.Fatal("expected authentication error with wrong key, got nil")
+	}
+}
+
+func TestCanonicalJailRoot(t *testing.T) {
+	target := t.TempDir()
+	link := filepath.Join(t.TempDir(), "root-link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("os.Symlink: %v", err)
+	}
+
+	filePath := filepath.Join(t.TempDir(), "root-file")
+	if err := os.WriteFile(filePath, []byte("x"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile: %v", err)
+	}
+
+	missingPath := filepath.Join(t.TempDir(), "missing")
+
+	tests := []struct {
+		name    string
+		root    string
+		want    string
+		wantErr error
+	}{
+		{name: "empty", root: "", wantErr: os.ErrInvalid},
+		{name: "whitespace", root: " \t ", wantErr: os.ErrInvalid},
+		{name: "missing", root: missingPath, wantErr: os.ErrNotExist},
+		{name: "file", root: filePath, wantErr: syscall.ENOTDIR},
+		{name: "symlink", root: link, want: target},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := canonicalJailRoot(tc.root)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("canonicalJailRoot(%q) error = %v; want %v", tc.root, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("canonicalJailRoot(%q): %v", tc.root, err)
+			}
+			if got != tc.want {
+				t.Fatalf("canonicalJailRoot(%q) = %q; want %q", tc.root, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSFTPServer_PasswordAuth_ValidatesJailRoot(t *testing.T) {
+	target := t.TempDir()
+	filePath := filepath.Join(t.TempDir(), "root-file")
+	if err := os.WriteFile(filePath, []byte("x"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		root string
+		want string
+	}{
+		{name: "empty", root: ""},
+		{name: "whitespace", root: "  "},
+		{name: "file", root: filePath},
+		{name: "missing", root: filepath.Join(t.TempDir(), "missing")},
+		{name: "directory", root: target, want: target},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := NewServer(":0", "", "", map[string]UserInfo{
+				"alice": {Password: "alicepw", Root: tc.root, CanRead: true, CanWrite: true},
+			}, testSigner(t), defaultCompletedUploadsSize)
+			cfg := srv.sshServerConfig()
+
+			perms, err := cfg.PasswordCallback(testConnMetadata{user: "alice"}, []byte("alicepw"))
+			if tc.want == "" {
+				if err == nil {
+					t.Fatalf("PasswordCallback returned nil error with permissions %+v", perms)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("PasswordCallback: %v", err)
+			}
+			if actualJailRoot := perms.Extensions["jailRoot"]; actualJailRoot != tc.want {
+				t.Fatalf("permissions jailRoot = %q; want %q", actualJailRoot, tc.want)
+			}
+		})
+	}
+
+	link := filepath.Join(t.TempDir(), "root-link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("os.Symlink: %v", err)
+	}
+	srv := NewServer(":0", "", "", map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: link, CanRead: true, CanWrite: true},
+	}, testSigner(t), defaultCompletedUploadsSize)
+	cfg := srv.sshServerConfig()
+	perms, err := cfg.PasswordCallback(testConnMetadata{user: "alice"}, []byte("alicepw"))
+	if err != nil {
+		t.Fatalf("PasswordCallback: %v", err)
+	}
+	if actualJailRoot := perms.Extensions["jailRoot"]; actualJailRoot != target {
+		t.Fatalf("permissions jailRoot = %q; want %q", actualJailRoot, target)
+	}
+}
+
+func TestSFTPServer_PublicKeyAuth_RejectsInvalidJailRoot(t *testing.T) {
+	_, clientPubKey := testClientKey(t)
+	filePath := filepath.Join(t.TempDir(), "root-file")
+	if err := os.WriteFile(filePath, []byte("x"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		root string
+	}{
+		{name: "empty", root: ""},
+		{name: "whitespace", root: "  "},
+		{name: "file", root: filePath},
+		{name: "missing", root: filepath.Join(t.TempDir(), "missing")},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := NewServer(":0", "", "", map[string]UserInfo{
+				"alice": {AuthorizedKeys: []ssh.PublicKey{clientPubKey}, Root: tc.root, CanRead: true, CanWrite: true},
+			}, testSigner(t), defaultCompletedUploadsSize)
+			cfg := srv.sshServerConfig()
+
+			perms, err := cfg.PublicKeyCallback(testConnMetadata{user: "alice"}, clientPubKey)
+			if err == nil {
+				t.Fatalf("PublicKeyCallback returned nil error with permissions %+v", perms)
+			}
+		})
 	}
 }
 
@@ -2368,6 +2516,52 @@ func TestFTPServer_EmptySuppliedPassword_Rejected(t *testing.T) {
 	c := dialFTP(t, addr)
 	c.command(331, "USER alice")
 	c.command(530, "PASS ")
+}
+
+func TestFTPSessionAuthenticate_ValidatesJailRoot(t *testing.T) {
+	target := t.TempDir()
+	link := filepath.Join(t.TempDir(), "root-link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("os.Symlink: %v", err)
+	}
+
+	filePath := filepath.Join(t.TempDir(), "root-file")
+	if err := os.WriteFile(filePath, []byte("x"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		root string
+		want bool
+	}{
+		{name: "empty", root: "", want: false},
+		{name: "whitespace", root: "  ", want: false},
+		{name: "file", root: filePath, want: false},
+		{name: "missing", root: filepath.Join(t.TempDir(), "missing"), want: false},
+		{name: "symlink", root: link, want: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &ftpSession{
+				server: &Server{
+					Users: map[string]UserInfo{
+						"alice": {Password: "alicepw", Root: tc.root, CanRead: true, CanWrite: true},
+					},
+				},
+				username: "alice",
+			}
+
+			got := fs.authenticate("alicepw")
+			if got != tc.want {
+				t.Fatalf("authenticate() = %v; want %v", got, tc.want)
+			}
+			if tc.want && fs.user.Root != target {
+				t.Fatalf("authenticated root = %q; want %q", fs.user.Root, target)
+			}
+		})
+	}
 }
 
 // TestFTPServer_ControlLineTooLong verifies that an oversized FTP control
