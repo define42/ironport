@@ -64,6 +64,13 @@ const (
 	// defaultCompletedUploadsSize is the buffer size used for the
 	// CompletedUploads channel when Server.CompletedUploadsSize is zero.
 	defaultCompletedUploadsSize = 64
+	// authorizedKeyTimingPad is the minimum number of constant-time key
+	// comparisons performed by the public-key auth callback. Users with
+	// fewer AuthorizedKeys are padded with dummy comparisons up to this
+	// count so the response time does not leak how many keys a particular
+	// user has configured. Users with more than this many keys still take
+	// longer; tune upward if a deployment routinely exceeds it.
+	authorizedKeyTimingPad = 32
 )
 
 // errFTPLineTooLong is returned when an FTP client sends a control-channel
@@ -74,35 +81,52 @@ var errFTPLineTooLong = errors.New("ftp control line too long")
 // so internal paths and server details are not exposed.
 var errSFTPRequestFailed = errors.New("request failed")
 
-// idleConn wraps a net.Conn and resets the read deadline before each Read so
-// that a connection is closed when no data has been received within the
-// configured idle timeout. A timeout of zero disables the deadline.
+// idleConn wraps a net.Conn and resets the read and/or write deadlines
+// before each Read/Write so that a connection is closed when no data has
+// moved in the configured direction within the configured idle timeout.
+// A timeout of zero in either direction disables the corresponding
+// deadline; the two directions are independent so callers can apply an
+// idle deadline only on the side they actually use.
 type idleConn struct {
 	net.Conn
-	timeoutNs atomic.Int64
-}
-
-func (c *idleConn) setReadDeadline(t time.Time) {
-	conn := c.Conn
-	_ = conn.SetReadDeadline(t)
+	readTimeoutNs  atomic.Int64
+	writeTimeoutNs atomic.Int64
 }
 
 func (c *idleConn) Read(b []byte) (int, error) {
-	if d := time.Duration(c.timeoutNs.Load()); d > 0 {
-		c.setReadDeadline(time.Now().Add(d))
+	if d := time.Duration(c.readTimeoutNs.Load()); d > 0 {
+		_ = c.Conn.SetReadDeadline(time.Now().Add(d))
 	} else {
-		c.setReadDeadline(time.Time{})
+		_ = c.Conn.SetReadDeadline(time.Time{})
 	}
 	return c.Conn.Read(b)
 }
 
-// setTimeout configures the idle timeout. A zero or negative value disables
-// the deadline.
-func (c *idleConn) setTimeout(d time.Duration) {
+func (c *idleConn) Write(b []byte) (int, error) {
+	if d := time.Duration(c.writeTimeoutNs.Load()); d > 0 {
+		_ = c.Conn.SetWriteDeadline(time.Now().Add(d))
+	} else {
+		_ = c.Conn.SetWriteDeadline(time.Time{})
+	}
+	return c.Conn.Write(b)
+}
+
+// setReadTimeout configures the per-Read idle deadline. A zero or
+// negative value disables it.
+func (c *idleConn) setReadTimeout(d time.Duration) {
 	if d < 0 {
 		d = 0
 	}
-	c.timeoutNs.Store(int64(d))
+	c.readTimeoutNs.Store(int64(d))
+}
+
+// setWriteTimeout configures the per-Write idle deadline. A zero or
+// negative value disables it.
+func (c *idleConn) setWriteTimeout(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	c.writeTimeoutNs.Store(int64(d))
 }
 
 // ftpErrMsg maps an internal error to a generic, client-safe FTP reply
@@ -802,16 +826,15 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 			// formats all differ in length; a raw ConstantTimeCompare would
 			// short-circuit on any length mismatch, leaking type information.
 			keyHash := sha256.Sum256(keyBytes)
-			// Perform a dummy fixed-length comparison against an all-zero hash
-			// before the loop. When the user does not exist (or has no
-			// AuthorizedKeys), the loop is a no-op; without this baseline, such
-			// cases would be measurably faster than users who have keys to check.
-			// The all-zero value will never match a real key's SHA-256 hash.
+			// All comparisons are constant-time on a fixed 32-byte hash and
+			// the total iteration count is padded out to authorizedKeyTimingPad
+			// below so the response time does not leak (a) whether the user
+			// exists, (b) the position of a matching key in AuthorizedKeys, or
+			// (c) the number of keys the user has configured (up to the pad
+			// constant).
 			var zeroHash [sha256.Size]byte
-			matched := subtle.ConstantTimeCompare(keyHash[:], zeroHash[:]) == 1 // always false
-			// Do not return early on the first match: iterate to the end so
-			// that the response time does not leak the position of the matching
-			// key in the AuthorizedKeys slice.
+			matched := false
+			compares := 0
 			for _, authorizedKey := range u.AuthorizedKeys {
 				if authorizedKey == nil {
 					continue
@@ -820,6 +843,13 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 				if subtle.ConstantTimeCompare(keyHash[:], authHash[:]) == 1 {
 					matched = true
 				}
+				compares++
+			}
+			// Pad with dummy comparisons against an all-zero hash (which can
+			// never match a real key's SHA-256) so that the total number of
+			// constant-time compares is independent of len(AuthorizedKeys).
+			for ; compares < authorizedKeyTimingPad; compares++ {
+				_ = subtle.ConstantTimeCompare(keyHash[:], zeroHash[:])
 			}
 			if !ok || !matched {
 				return nil, fmt.Errorf("invalid credentials")
@@ -845,7 +875,7 @@ func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUplo
 	// handshake succeeds we switch to the per-session idle timeout so that
 	// authenticated but inactive sessions are eventually reaped.
 	ic := &idleConn{Conn: nc}
-	ic.setTimeout(sshHandshakeTimeout)
+	ic.setReadTimeout(sshHandshakeTimeout)
 	sshConn, chans, reqs, err := ssh.NewServerConn(ic, cfg)
 	if err != nil {
 		log.Println("ssh handshake:", err)
@@ -853,7 +883,7 @@ func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUplo
 	}
 	// Handshake complete – switch to the idle-session deadline. A zero value
 	// disables the deadline.
-	ic.setTimeout(idleTimeout)
+	ic.setReadTimeout(idleTimeout)
 	defer func() { _ = sshConn.Close() }()
 
 	jailRoot := sshConn.Permissions.Extensions["jailRoot"]
@@ -1180,14 +1210,26 @@ func (j jail) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 //     on jailed files is denied wholesale under the hardened policy; clients
 //     get a deterministic permission error rather than a partial success.
 //
-// Operations are applied in a deterministic order. The first error is
-// returned and remaining attributes are not applied, mirroring how OpenSSH's
-// sftp-server reports errors.
+// Policy-level rejections (Acmodtime, and UidGid when allowChown is false)
+// are evaluated before any mutating operation is performed, so a multi-flag
+// request that violates policy fails atomically rather than leaving the
+// file partially mutated. Remaining mutating operations are then applied in
+// a deterministic order; the first error is returned and subsequent
+// attributes are not applied, mirroring how OpenSSH's sftp-server reports
+// errors.
 func (j jail) applyAttrs(r *sftp.Request) error {
 	flags := r.AttrFlags()
 	attrs := r.Attributes()
 	if attrs == nil {
 		return nil
+	}
+	// Reject policy violations up front so they cannot leave the file
+	// half-mutated when combined with Size/Permissions in a single request.
+	if flags.Acmodtime {
+		return os.ErrPermission
+	}
+	if flags.UidGid && !j.allowChown {
+		return os.ErrPermission
 	}
 	if flags.Size {
 		if err := j.fs.Truncate(r.Filepath, int64(attrs.Size)); err != nil {
@@ -1200,18 +1242,9 @@ func (j jail) applyAttrs(r *sftp.Request) error {
 		}
 	}
 	if flags.UidGid {
-		if !j.allowChown {
-			return os.ErrPermission
-		}
 		if err := j.fs.Chown(r.Filepath, int(attrs.UID), int(attrs.GID)); err != nil {
 			return err
 		}
-	}
-	if flags.Acmodtime {
-		// The hardened policy refuses to mutate file timestamps; the
-		// fd-based equivalent (futimens) would succeed but the
-		// configured policy is "reject Chtimes".
-		return os.ErrPermission
 	}
 	return nil
 }
@@ -1299,8 +1332,17 @@ func (s *Server) handleFTPConn(nc net.Conn, tempExts []string) {
 		return
 	}
 
+	// Capture the configured idle timeout once at session start. Mutating
+	// Server.IdleTimeout afterwards only affects sessions accepted later,
+	// matching the SFTP per-session semantics. A zero value disables the
+	// deadline.
+	idleTimeout := s.idleTimeout()
 	for {
-		_ = nc.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		if idleTimeout > 0 {
+			_ = nc.SetReadDeadline(time.Now().Add(idleTimeout))
+		} else {
+			_ = nc.SetReadDeadline(time.Time{})
+		}
 		line, err := readFTPControlLine(sess.r, ftpMaxControlLineLen)
 		if err != nil {
 			if errors.Is(err, errFTPLineTooLong) {
@@ -1786,8 +1828,13 @@ func (f *ftpSession) cmdList(arg string, namesOnly bool) {
 	}
 	defer func() { _ = dc.Close() }()
 
+	// Apply a per-Write idle deadline so a client that opens the data
+	// connection but refuses to read does not pin this goroutine and FD
+	// indefinitely once its TCP receive buffer fills.
+	idleDC := &idleConn{Conn: dc}
+	idleDC.setWriteTimeout(ftpDataIdleTimeout)
 	for _, line := range lines {
-		if _, err := io.WriteString(dc, line+"\r\n"); err != nil {
+		if _, err := io.WriteString(idleDC, line+"\r\n"); err != nil {
 			_ = f.reply(426, ftpErrMsg(err))
 			return
 		}
@@ -1862,7 +1909,12 @@ func (f *ftpSession) cmdRetr(arg string) {
 	}
 	defer func() { _ = dc.Close() }()
 
-	if _, err := io.Copy(dc, file); err != nil {
+	// Apply a per-Write idle deadline so a client that opens the data
+	// connection but refuses to read (filling its TCP receive buffer) does
+	// not pin this goroutine and FD indefinitely.
+	idleDC := &idleConn{Conn: dc}
+	idleDC.setWriteTimeout(ftpDataIdleTimeout)
+	if _, err := io.Copy(idleDC, file); err != nil {
 		_ = f.reply(426, ftpErrMsg(err))
 		return
 	}
@@ -1930,7 +1982,7 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 	// transfers but cannot detect a client that deliberately truncates by
 	// half-closing early; that is an inherent limitation of FTP itself.
 	idleDC := &idleConn{Conn: dc}
-	idleDC.setTimeout(ftpDataIdleTimeout)
+	idleDC.setReadTimeout(ftpDataIdleTimeout)
 	_, copyErr := io.Copy(file, idleDC)
 	closeErr := file.Close()
 	if copyErr != nil {

@@ -2911,7 +2911,7 @@ func TestIdleConn_ResetsReadDeadline(t *testing.T) {
 	defer func() { _ = c.Close() }()
 
 	ic := &idleConn{Conn: c}
-	ic.setTimeout(100 * time.Millisecond)
+	ic.setReadTimeout(100 * time.Millisecond)
 	buf := make([]byte, 1)
 	start := time.Now()
 	if _, err := ic.Read(buf); err == nil {
