@@ -2723,3 +2723,150 @@ func TestSFTPServer_SymlinkRejected(t *testing.T) {
 		t.Errorf("link.txt exists on disk after rejected Symlink: err=%v", err)
 	}
 }
+
+// TestWriteLogger_TransferErrorSuppressesNotification verifies that when
+// pkg/sftp invokes TransferError on the writer before Close (i.e. the
+// in-flight upload was aborted), the subsequent Close does NOT enqueue a
+// CompletedUpload event. Without this guarantee, a truncated upload caused
+// by a client connection drop would be mis-reported as a complete upload.
+func TestWriteLogger_TransferErrorSuppressesNotification(t *testing.T) {
+	root := t.TempDir()
+	f, err := os.OpenFile(filepath.Join(root, "partial.bin"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	uploads := make(chan CompletedUpload, 1)
+	wl := &writeLogger{
+		File:         f,
+		filepath:     "/partial.bin",
+		fullFilepath: filepath.Join(root, "partial.bin"),
+		username:     "alice",
+		clientIP:     "127.0.0.1",
+		uploads:      uploads,
+	}
+	// Simulate the request server signalling that the transfer was aborted.
+	wl.TransferError(io.ErrUnexpectedEOF)
+	if err := wl.Close(); err != nil {
+		t.Fatalf("Close after TransferError: %v", err)
+	}
+	select {
+	case evt := <-uploads:
+		t.Fatalf("CompletedUploads received notification %+v for an interrupted upload; want none", evt)
+	case <-time.After(100 * time.Millisecond):
+		// expected: no notification.
+	}
+}
+
+// TestWriteLogger_CleanCloseAnnouncesUpload verifies that the happy path is
+// unchanged: a Close with no preceding TransferError still announces the
+// upload on the CompletedUploads channel.
+func TestWriteLogger_CleanCloseAnnouncesUpload(t *testing.T) {
+	root := t.TempDir()
+	f, err := os.OpenFile(filepath.Join(root, "ok.bin"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	uploads := make(chan CompletedUpload, 1)
+	wl := &writeLogger{
+		File:         f,
+		filepath:     "/ok.bin",
+		fullFilepath: filepath.Join(root, "ok.bin"),
+		username:     "alice",
+		clientIP:     "127.0.0.1",
+		uploads:      uploads,
+	}
+	if err := wl.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case evt := <-uploads:
+		if evt.FilePath != "/ok.bin" {
+			t.Errorf("FilePath = %q; want /ok.bin", evt.FilePath)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected CompletedUpload notification for clean Close")
+	}
+}
+
+// TestWriteLogger_TransferErrorNilIsNoop verifies that a TransferError(nil)
+// call is ignored, so a subsequent clean Close still announces the upload.
+func TestWriteLogger_TransferErrorNilIsNoop(t *testing.T) {
+	root := t.TempDir()
+	f, err := os.OpenFile(filepath.Join(root, "ok2.bin"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	uploads := make(chan CompletedUpload, 1)
+	wl := &writeLogger{
+		File:         f,
+		filepath:     "/ok2.bin",
+		fullFilepath: filepath.Join(root, "ok2.bin"),
+		username:     "alice",
+		uploads:      uploads,
+	}
+	wl.TransferError(nil)
+	if err := wl.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case <-uploads:
+		// expected
+	case <-time.After(time.Second):
+		t.Fatal("expected CompletedUpload notification for clean Close after TransferError(nil)")
+	}
+}
+
+// TestSFTPServer_InterruptedUploadNotAnnounced exercises the full SFTP
+// pipeline: a client opens a file, writes some bytes, then abruptly tears
+// down the underlying SSH transport without calling Close on the SFTP
+// handle. pkg/sftp's request server drains the in-flight request through
+// transferError + Close, and writeLogger must NOT announce the upload.
+func TestSFTPServer_InterruptedUploadNotAnnounced(t *testing.T) {
+	root := t.TempDir()
+
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	sshCfg := &ssh.ClientConfig{
+		User:            "testuser",
+		Auth:            []ssh.AuthMethod{ssh.Password("testpw")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	conn, err := ssh.Dial("tcp", addr, sshCfg)
+	if err != nil {
+		t.Fatalf("ssh.Dial: %v", err)
+	}
+	client, err := sftp.NewClient(conn)
+	if err != nil {
+		_ = conn.Close()
+		t.Fatalf("sftp.NewClient: %v", err)
+	}
+
+	const name = "/aborted.bin"
+	rf, err := client.Create(name)
+	if err != nil {
+		_ = client.Close()
+		_ = conn.Close()
+		t.Fatalf("client.Create: %v", err)
+	}
+	if _, err = rf.Write([]byte("partial-data")); err != nil {
+		_ = client.Close()
+		_ = conn.Close()
+		t.Fatalf("rf.Write: %v", err)
+	}
+	// Abruptly tear down the SSH transport WITHOUT closing the SFTP
+	// handle. This is what happens on a client crash / network drop:
+	// pkg/sftp's RequestServer sees EOF, calls transferError on the
+	// in-flight write request, then Close on the writer.
+	_ = conn.Close()
+
+	select {
+	case evt := <-srv.CompletedUploads:
+		t.Fatalf("CompletedUploads received notification %+v for an interrupted upload; want none", evt)
+	case <-time.After(500 * time.Millisecond):
+		// expected: no notification for a truncated upload.
+	}
+}

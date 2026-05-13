@@ -53,6 +53,12 @@ const (
 	// bytes (including the CRLF terminator). Longer commands are rejected to
 	// prevent unbounded memory growth from malicious clients.
 	ftpMaxControlLineLen = 4096
+	// ftpDataIdleTimeout bounds how long an FTP data connection may sit
+	// without transferring any bytes before being considered stalled. A
+	// stalled transfer surfaces as a read error from io.Copy, which in turn
+	// suppresses the CompletedUpload notification for a STOR/APPE that did
+	// not finish cleanly.
+	ftpDataIdleTimeout = 5 * time.Minute
 	// defaultCompletedUploadsSize is the buffer size used for the
 	// CompletedUploads channel when Server.CompletedUploadsSize is zero.
 	defaultCompletedUploadsSize = 64
@@ -940,6 +946,13 @@ func (j jail) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 // the file is considered still in progress and no notification is sent on
 // uploads; the completion notification will instead be emitted when the client
 // renames the file to its final name (see jail.Filecmd "Rename").
+//
+// When pkg/sftp's RequestServer aborts an in-flight transfer (typically
+// because the client dropped the connection mid-upload, or sent an explicit
+// error packet), it invokes TransferError(err) on the writer before calling
+// Close. writeLogger records that error in transferErr so Close knows the
+// upload is truncated and must NOT be announced on the CompletedUploads
+// channel; otherwise consumers would treat a partial file as complete.
 type writeLogger struct {
 	*os.File
 	filepath     string
@@ -948,10 +961,45 @@ type writeLogger struct {
 	clientIP     string
 	uploads      chan<- CompletedUpload
 	tempExts     []string
+	// mu guards transferErr against the race between TransferError (invoked
+	// asynchronously from the request-server's drain path when the client
+	// connection drops mid-transfer) and Close (invoked from the per-request
+	// worker goroutine that handled the SSH_FXP_WRITE packets).
+	mu sync.Mutex
+	// transferErr records the first error reported via TransferError. Only
+	// the first error is retained ("first error wins"); subsequent calls
+	// from the drain path are no-ops because the upload is already known
+	// to be poisoned and further error detail would not change the
+	// "do not announce" decision in Close.
+	transferErr error
+}
+
+// TransferError implements pkg/sftp's optional TransferError interface. It is
+// invoked by the request server when the in-flight transfer is aborted (for
+// example, the client connection dropped or the client sent an SSH_FXP_CLOSE
+// after an error packet). Recording the error marks the upload as poisoned so
+// the subsequent Close does not announce a CompletedUpload event for what is
+// in fact a truncated file.
+func (w *writeLogger) TransferError(err error) {
+	if err == nil {
+		return
+	}
+	w.mu.Lock()
+	if w.transferErr == nil {
+		w.transferErr = err
+	}
+	w.mu.Unlock()
 }
 
 func (w *writeLogger) Close() error {
 	err := w.File.Close()
+	w.mu.Lock()
+	transferErr := w.transferErr
+	w.mu.Unlock()
+	if transferErr != nil {
+		log.Printf("upload interrupted: %q: %v; not announcing on CompletedUploads", w.filepath, transferErr)
+		return err
+	}
 	if err == nil {
 		log.Printf("upload complete: %q", w.filepath)
 		if hasTempExt(w.filepath, w.tempExts) {
@@ -1876,13 +1924,29 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 	f.restartOffset = 0
 
 	log.Printf("upload protocol=ftp path=%q", ftpPath)
-	_, copyErr := io.Copy(file, dc)
+	// Wrap the data connection so that every Read enforces a fresh idle
+	// deadline. A stalled client that stops sending bytes but keeps the TCP
+	// connection open will surface as a read error from io.Copy below, which
+	// in turn skips the CompletedUploads notification — partial uploads must
+	// never be announced as complete.
+	//
+	// Note: FTP STREAM mode signals "end of file" by half-closing the data
+	// connection, so a client that uploads N bytes then half-closes is
+	// indistinguishable at the protocol level from a client that intended
+	// to upload exactly N bytes. The idle deadline therefore catches stalled
+	// transfers but cannot detect a client that deliberately truncates by
+	// half-closing early; that is an inherent limitation of FTP itself.
+	idleDC := &idleConn{Conn: dc}
+	idleDC.setTimeout(ftpDataIdleTimeout)
+	_, copyErr := io.Copy(file, idleDC)
 	closeErr := file.Close()
 	if copyErr != nil {
+		log.Printf("upload interrupted protocol=ftp path=%q: %v", ftpPath, copyErr)
 		_ = f.reply(426, ftpErrMsg(copyErr))
 		return
 	}
 	if closeErr != nil {
+		log.Printf("upload interrupted protocol=ftp path=%q close: %v", ftpPath, closeErr)
 		_ = f.reply(451, ftpErrMsg(closeErr))
 		return
 	}
