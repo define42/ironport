@@ -201,15 +201,15 @@ func testSigner(t *testing.T) ssh.Signer {
 	return signer
 }
 
-// startTestServer launches a Server on a random OS-assigned port and returns
+// startTestServer launches a server on a random OS-assigned port and returns
 // the address and a cancel function that closes the listener.
 //
 // Each optional configure callback runs against the freshly constructed
-// *Server BEFORE the accept goroutine starts, so tests can safely mutate
+// *server BEFORE the accept goroutine starts, so tests can safely mutate
 // fields like AllowChown or TempExtensions without racing the accept loop.
-// Mutating those fields on the returned *Server after this function returns
+// Mutating those fields on the returned *server after this function returns
 // is unsafe under the race detector.
-func startTestServer(t *testing.T, users map[string]UserInfo, configure ...func(*Server)) (srv *Server, addr string, stop func()) {
+func startTestServer(t *testing.T, users map[string]UserInfo, configure ...func(*server)) (srv *server, addr string, stop func()) {
 	t.Helper()
 	signer := testSigner(t)
 
@@ -266,7 +266,7 @@ func dialSFTP(t *testing.T, addr, user, pass string) *sftp.Client {
 	return client
 }
 
-func startTestFTPServer(t *testing.T, users map[string]UserInfo, ftpPassivePortRange string) (srv *Server, addr string, stop func()) {
+func startTestFTPServer(t *testing.T, users map[string]UserInfo, ftpPassivePortRange string) (srv *server, addr string, stop func()) {
 	t.Helper()
 
 	srv = NewServer("127.0.0.1:0", "127.0.0.1:0", ftpPassivePortRange, users, testSigner(t), defaultCompletedUploadsSize)
@@ -532,15 +532,15 @@ func TestCompletedUploadsSize(t *testing.T) {
 		t.Errorf("custom cap via NewServer = %d; want 256", cap(srv2.CompletedUploads()))
 	}
 
-	// Custom capacity via struct literal + CompletedUploads (bypasses NewServer).
-	custom := &Server{CompletedUploadsSize: 128}
+	// Internal direct initialization still honors CompletedUploadsSize.
+	custom := &server{CompletedUploadsSize: 128}
 	if cap(custom.CompletedUploads()) != 128 {
 		t.Errorf("custom cap = %d; want 128", cap(custom.CompletedUploads()))
 	}
 
 	// initCompletedUploads is idempotent: an already-set channel is not replaced.
 	existing := make(chan CompletedUpload, 7)
-	srv3 := &Server{completedUploads: existing, CompletedUploadsSize: 999}
+	srv3 := &server{completedUploads: existing, CompletedUploadsSize: 999}
 	srv3.initCompletedUploads()
 	if srv3.completedUploadsChan() != existing {
 		t.Error("initCompletedUploads replaced an already-set channel")
@@ -554,7 +554,7 @@ func TestFTPSessionAnnounceUploadUsesCapturedCompletedUploads(t *testing.T) {
 	serverUploads := make(chan CompletedUpload, 1)
 	sessionUploads := make(chan CompletedUpload, 1)
 	fs := &ftpSession{
-		server: &Server{
+		server: &server{
 			completedUploads: serverUploads,
 		},
 		username: "alice",
@@ -581,7 +581,7 @@ func TestFTPSessionAnnounceUploadUsesCapturedCompletedUploads(t *testing.T) {
 
 	select {
 	case got := <-serverUploads:
-		t.Fatalf("announceUpload sent to Server.CompletedUploads after session capture: %+v", got)
+		t.Fatalf("announceUpload sent to server CompletedUploads after session capture: %+v", got)
 	default:
 	}
 }
@@ -625,7 +625,7 @@ func TestParseFTPPassivePortRange(t *testing.T) {
 
 func TestServerListenFTPData(t *testing.T) {
 	t.Run("os assigned port", func(t *testing.T) {
-		srv := &Server{}
+		srv := &server{}
 		ln, err := srv.listenFTPData("127.0.0.1")
 		if err != nil {
 			t.Fatalf("listenFTPData: %v", err)
@@ -646,7 +646,7 @@ func TestServerListenFTPData(t *testing.T) {
 		t.Cleanup(func() { _ = busyLn.Close() })
 
 		port := busyLn.Addr().(*net.TCPAddr).Port
-		srv := &Server{FTPPassivePortRange: strconv.Itoa(port)}
+		srv := &server{FTPPassivePortRange: strconv.Itoa(port)}
 		if _, err := srv.listenFTPData("127.0.0.1"); err == nil {
 			t.Fatal("listenFTPData error = nil; want non-nil when configured port is already in use")
 		}
@@ -2031,7 +2031,7 @@ func TestSFTPServer_Chown(t *testing.T) {
 	users := map[string]UserInfo{
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
-	_, addr, stop := startTestServer(t, users, func(s *Server) { s.AllowChown = true })
+	_, addr, stop := startTestServer(t, users, func(s *server) { s.AllowChown = true })
 	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
@@ -2072,7 +2072,7 @@ func TestSFTPServer_Chgrp(t *testing.T) {
 	users := map[string]UserInfo{
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
-	_, addr, stop := startTestServer(t, users, func(s *Server) { s.AllowChown = true })
+	_, addr, stop := startTestServer(t, users, func(s *server) { s.AllowChown = true })
 	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
@@ -2317,7 +2317,7 @@ func TestServer_Close_BeforeListenAndServe(t *testing.T) {
 // error immediately when Addr is empty or blank without opening any listener.
 func TestServer_ListenAndServe_EmptyAddr(t *testing.T) {
 	for _, addr := range []string{"", "   ", "\t"} {
-		srv := &Server{Addr: addr, Signer: testSigner(t)}
+		srv := &server{Addr: addr, Signer: testSigner(t)}
 		err := srv.ListenAndServe()
 		if err == nil {
 			t.Errorf("addr=%q: expected error, got nil", addr)
@@ -2333,7 +2333,7 @@ func TestServer_ListenAndServe_EmptyAddr(t *testing.T) {
 // TestServer_ListenAndServe_NilSigner verifies that ListenAndServe returns an
 // error immediately when Signer is nil without opening any listener.
 func TestServer_ListenAndServe_NilSigner(t *testing.T) {
-	srv := &Server{Addr: ":0"}
+	srv := &server{Addr: ":0"}
 	err := srv.ListenAndServe()
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -2515,7 +2515,7 @@ func TestCleanSFTPClientPath(t *testing.T) {
 // TestServer_TempExtensionsNormalisation verifies that TempExtensions are
 // normalised (lower-cased, dot-prefixed, empty entries stripped) before use.
 func TestServer_TempExtensionsNormalisation(t *testing.T) {
-	srv := &Server{TempExtensions: []string{"TMP", ".Writing", "  ", ".part"}}
+	srv := &server{TempExtensions: []string{"TMP", ".Writing", "  ", ".part"}}
 	got := srv.tempExtensions()
 	want := []string{".tmp", ".writing", ".part"}
 	if len(got) != len(want) {
@@ -2536,7 +2536,7 @@ func TestSFTPServer_TempExtensions_SuppressesUploadAndAnnouncesOnRename(t *testi
 	users := map[string]UserInfo{
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
-	srv, addr, stop := startTestServer(t, users, func(s *Server) {
+	srv, addr, stop := startTestServer(t, users, func(s *server) {
 		s.TempExtensions = []string{".tmp", ".writing"}
 	})
 	t.Cleanup(stop)
@@ -2597,7 +2597,7 @@ func TestSFTPServer_TempExtensions_RenameBetweenTempNamesDoesNotAnnounce(t *test
 	users := map[string]UserInfo{
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
-	srv, addr, stop := startTestServer(t, users, func(s *Server) {
+	srv, addr, stop := startTestServer(t, users, func(s *server) {
 		s.TempExtensions = []string{".tmp", ".writing"}
 	})
 	t.Cleanup(stop)
@@ -2630,7 +2630,7 @@ func TestSFTPServer_TempExtensions_PlainUploadStillAnnounced(t *testing.T) {
 	users := map[string]UserInfo{
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
-	srv, addr, stop := startTestServer(t, users, func(s *Server) {
+	srv, addr, stop := startTestServer(t, users, func(s *server) {
 		s.TempExtensions = []string{".tmp", ".writing"}
 	})
 	t.Cleanup(stop)
@@ -2754,7 +2754,7 @@ func TestFTPSessionAuthenticate_ValidatesJailRoot(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := &ftpSession{
-				server: &Server{
+				server: &server{
 					Users: map[string]UserInfo{
 						"alice": {Password: "alicepw", Root: tc.root, CanRead: true, CanWrite: true},
 					},
@@ -2904,9 +2904,9 @@ func TestSFTPServer_Setstat_PermissionDeniedForReadOnly(t *testing.T) {
 	}
 }
 
-// TestServer_IdleTimeout verifies the resolution rules of Server.idleTimeout.
+// TestServer_IdleTimeout verifies the resolution rules of server.idleTimeout.
 func TestServer_IdleTimeout(t *testing.T) {
-	s := &Server{}
+	s := &server{}
 	if got := s.idleTimeout(); got != defaultSFTPIdleTimeout {
 		t.Errorf("default idleTimeout = %v; want %v", got, defaultSFTPIdleTimeout)
 	}
@@ -3111,7 +3111,7 @@ func TestFTPServer_CmdStorSanitizesCopyErrors(t *testing.T) {
 	dataConn := &stubConn{readErr: copyErr}
 
 	fs := &ftpSession{
-		server: &Server{
+		server: &server{
 			completedUploads: make(chan CompletedUpload, 1),
 		},
 		conn:   controlConn,
@@ -3150,7 +3150,7 @@ func TestNextAcceptBackoff(t *testing.T) {
 }
 
 // TestSFTPServer_Chown_DefaultDenied verifies that a chown request is
-// rejected with a permission error when Server.AllowChown is left at its
+// rejected with a permission error when server.AllowChown is left at its
 // default (false). This is the opt-in flag that hardens deployments where
 // the server runs with enough privilege (e.g. as root) to actually change
 // ownership: clients must not be able to chown jailed files unless the

@@ -9,19 +9,19 @@ A production-ready, embeddable SFTP server and FTP server library for Go with a 
 - **Fine-grained permissions** — independent `CanRead` / `CanWrite` flags per user
 - **Dynamic user management** — add, remove, and update users and their authorized keys at runtime without restarting the server
 - **Upload notifications** — a buffered `CompletedUploads()` stream delivers a `CompletedUpload` struct (username, full on-disk path, jail-relative path, and client IP) for every successfully closed upload
-- **Temp-file aware completion** — optionally set `Server.TempExtensions` (for example, `.tmp`, `.writing`) to suppress completion notifications for temporary upload names and emit the notification when the file is renamed to a non-temp name
+- **Temp-file aware completion** — optionally set `TempExtensions` on the server returned by `NewServer` (for example, `.tmp`, `.writing`) to suppress completion notifications for temporary upload names and emit the notification when the file is renamed to a non-temp name
 - **Graceful shutdown** — `Close()` stops the listener; in-flight sessions are not terminated
 - **Thread-safe runtime APIs** — user-management helpers and listener lifecycle methods are safe to call while the server is running
 - **Handshake timeout** — connections that do not complete the SSH handshake within 30 seconds are dropped
-- **Idle-session timeout** — configurable via `Server.IdleTimeout` (default 15 minutes); inactive authenticated SFTP sessions are reaped
+- **Idle-session timeout** — configurable via `IdleTimeout` on the server returned by `NewServer` (default 15 minutes); inactive authenticated SFTP sessions are reaped
 - **Empty-password protection** — users whose stored `Password` is empty cannot authenticate via password, and empty supplied passwords are always rejected
-- **Chown opt-in** — `Setstat`/`Fsetstat` requests that try to change file ownership (uid/gid) are rejected with a permission error unless `Server.AllowChown` is explicitly set to `true`. Symlink creation by clients is always refused, and `Setstat`/`Fsetstat` requests that try to change access/modification times (`Chtimes`) are likewise rejected.
+- **Chown opt-in** — `Setstat`/`Fsetstat` requests that try to change file ownership (uid/gid) are rejected with a permission error unless `AllowChown` is explicitly set to `true` on the server returned by `NewServer`. Symlink creation by clients is always refused, and `Setstat`/`Fsetstat` requests that try to change access/modification times (`Chtimes`) are likewise rejected.
 
 ## Platform support
 
 This package is **Linux-only**. The path-containment guarantee depends on the
 `openat2` syscall with `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS`, available
-since Linux 5.6. `Server.ListenAndServe` probes for `openat2` at startup and
+since Linux 5.6. `ListenAndServe` probes for `openat2` at startup and
 returns an error on older kernels rather than silently degrading the policy.
 
 ## Quick start
@@ -76,23 +76,8 @@ srv := ironport.NewServer(":2022", "", "", users, signer, 256)
 
 Read upload notifications from the receive-only `CompletedUploads()` stream.
 The underlying channel is internal, so callers cannot send to it, close it, or
-replace it while the server is running. To change the buffer capacity, set
-`CompletedUploadsSize` before startup or pass a different size to `NewServer`.
-
-When constructing a `Server` via a struct literal instead of `NewServer`,
-set `CompletedUploadsSize` before calling `CompletedUploads()` or
-`ListenAndServe`; either call initializes the internal channel automatically
-with that capacity:
-
-```go
-srv := &ironport.Server{
-    Addr:                 ":2022",
-    Signer:               signer,
-    Users:                users,
-    CompletedUploadsSize: 256,
-}
-log.Fatal(srv.ListenAndServe())
-```
+replace it while the server is running. To change the buffer capacity, pass a
+different size to `NewServer`.
 
 ### Deferring completion notifications until final rename
 
