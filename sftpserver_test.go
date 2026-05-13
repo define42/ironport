@@ -92,6 +92,21 @@ func TestJailResolve(t *testing.T) {
 	}
 }
 
+func TestJailResolveRejectsBrokenSymlink(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(filepath.Join(outside, "missing.txt"), link); err != nil {
+		t.Skipf("creating symlink: %v", err)
+	}
+
+	j := jail{root: root}
+	_, err := j.resolve("/link")
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("resolve(/link) error = %v; want permission denied", err)
+	}
+}
+
 func TestJailFilewriteRejectsBrokenSymlinkEscape(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()
