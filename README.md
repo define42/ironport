@@ -9,6 +9,7 @@ A production-ready, embeddable SFTP server library for Go with a security-first 
 - **Fine-grained permissions** — independent `CanRead` / `CanWrite` flags per user
 - **Dynamic user management** — add, remove, and update users and their authorized keys at runtime without restarting the server
 - **Upload notifications** — a buffered `CompletedUploads` channel delivers a `CompletedUpload` struct (username, full on-disk path, jail-relative path, and client IP) for every successfully closed upload
+- **Temp-file aware completion** — optionally set `Server.TempExtensions` (for example, `.tmp`, `.writing`) to suppress completion notifications for temporary upload names and emit the notification when the file is renamed to a non-temp name
 - **Graceful shutdown** — `Close()` stops the listener; in-flight sessions are not terminated
 - **Thread-safe** — all shared state is protected by `sync.RWMutex`
 - **Handshake timeout** — connections that do not complete the SSH handshake within 30 seconds are dropped
@@ -86,6 +87,23 @@ srv := &sftpserver.Server{
 }
 log.Fatal(srv.ListenAndServe())
 ```
+
+### Deferring completion notifications until final rename
+
+Many clients upload to a temporary filename first (for example `file.txt.tmp`)
+and rename to the final filename only after the upload is fully complete.
+Configure `TempExtensions` to emit `CompletedUploads` events at that final
+rename boundary:
+
+```go
+srv := sftpserver.NewServer(":2022", "", "", users, signer, 64)
+srv.TempExtensions = []string{".tmp", ".writing"}
+```
+
+With this setting:
+
+- uploads that close with a temp extension are not announced yet
+- renaming from a temp extension to a non-temp name emits the completion event
 
 ## FTP support (plaintext, opt-in)
 
