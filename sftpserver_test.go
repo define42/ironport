@@ -2158,6 +2158,37 @@ func TestServer_Close_BeforeListenAndServe(t *testing.T) {
 	}
 }
 
+// TestServer_ListenAndServe_EmptyAddr verifies that ListenAndServe returns an
+// error immediately when Addr is empty or blank without opening any listener.
+func TestServer_ListenAndServe_EmptyAddr(t *testing.T) {
+	for _, addr := range []string{"", "   ", "\t"} {
+		srv := &Server{Addr: addr, Signer: testSigner(t)}
+		err := srv.ListenAndServe()
+		if err == nil {
+			t.Errorf("addr=%q: expected error, got nil", addr)
+			continue
+		}
+		const want = "sftpserver: Addr is required"
+		if err.Error() != want {
+			t.Errorf("addr=%q: got %q; want %q", addr, err.Error(), want)
+		}
+	}
+}
+
+// TestServer_ListenAndServe_NilSigner verifies that ListenAndServe returns an
+// error immediately when Signer is nil without opening any listener.
+func TestServer_ListenAndServe_NilSigner(t *testing.T) {
+	srv := &Server{Addr: ":0"}
+	err := srv.ListenAndServe()
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	const want = "sftpserver: Signer is required"
+	if err.Error() != want {
+		t.Errorf("got %q; want %q", err.Error(), want)
+	}
+}
+
 // TestSFTPServer_DeleteFolderWithFilesInside verifies that removing a
 // directory that still contains files returns an error.
 func TestSFTPServer_DeleteFolderWithFilesInside(t *testing.T) {

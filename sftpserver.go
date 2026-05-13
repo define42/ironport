@@ -422,6 +422,12 @@ func (s *Server) listenFTPData(host string) (net.Listener, error) {
 // server too. It blocks until Close is called or an unexpected listener error
 // occurs. It returns nil when stopped via Close.
 func (s *Server) ListenAndServe() error {
+	if strings.TrimSpace(s.Addr) == "" {
+		return errors.New("sftpserver: Addr is required")
+	}
+	if s.Signer == nil {
+		return errors.New("sftpserver: Signer is required")
+	}
 	s.initCompletedUploads()
 	cfg := s.sshServerConfig()
 
