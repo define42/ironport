@@ -144,7 +144,7 @@ func startTestServer(t *testing.T, users map[string]UserInfo, configure ...func(
 		}
 	}()
 
-	stop = func() { ln.Close() }
+	stop = func() { _ = ln.Close() }
 	return srv, addr, stop
 }
 
@@ -162,12 +162,12 @@ func dialSFTP(t *testing.T, addr, user, pass string) *sftp.Client {
 	}
 	client, err := sftp.NewClient(conn)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		t.Fatalf("sftp.NewClient: %v", err)
 	}
 	t.Cleanup(func() {
-		client.Close()
-		conn.Close()
+		_ = client.Close()
+		_ = conn.Close()
 	})
 	return client
 }
@@ -331,7 +331,7 @@ func TestSFTPServer_UploadDownload(t *testing.T) {
 	if _, err = f.Write(content); err != nil {
 		t.Fatalf("f.Write: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	// Download and compare.
 	rf, err := client.Open(remote)
@@ -339,7 +339,7 @@ func TestSFTPServer_UploadDownload(t *testing.T) {
 		t.Fatalf("client.Open: %v", err)
 	}
 	got, err := io.ReadAll(rf)
-	rf.Close()
+	_ = rf.Close()
 	if err != nil {
 		t.Fatalf("io.ReadAll: %v", err)
 	}
@@ -593,7 +593,7 @@ func TestSFTPServer_ReadOnlyUser(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	got, _ := io.ReadAll(rf)
-	rf.Close()
+	_ = rf.Close()
 	if string(got) != "read me" {
 		t.Errorf("downloaded %q; want %q", got, "read me")
 	}
@@ -626,7 +626,7 @@ func TestSFTPServer_WriteOnlyUser(t *testing.T) {
 	if _, err = f.Write([]byte("write only")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	// Read must be denied.
 	_, err = client.Open("/upload.txt")
@@ -870,7 +870,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 			go handleConn(nc, cfg, srv.CompletedUploads, srv.tempExtensions(), srv.idleTimeout(), srv.allowChown())
 		}
 	}()
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
 	content := []byte("key from file")
@@ -881,14 +881,14 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 	if _, err = f.Write(content); err != nil {
 		t.Fatalf("f.Write: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	rf, err := client.Open("/hello.txt")
 	if err != nil {
 		t.Fatalf("client.Open: %v", err)
 	}
 	got, _ := io.ReadAll(rf)
-	rf.Close()
+	_ = rf.Close()
 	if !bytes.Equal(got, content) {
 		t.Errorf("downloaded %q; want %q", got, content)
 	}
@@ -1072,12 +1072,12 @@ func dialSFTPWithPublicKey(t *testing.T, addr, user string, signer ssh.Signer) *
 	}
 	client, err := sftp.NewClient(conn)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		t.Fatalf("sftp.NewClient: %v", err)
 	}
 	t.Cleanup(func() {
-		client.Close()
-		conn.Close()
+		_ = client.Close()
+		_ = conn.Close()
 	})
 	return client
 }
@@ -2020,7 +2020,7 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("net.Dial: %v", err)
 	}
-	defer idle.Close()
+	defer func() { _ = idle.Close() }()
 
 	// The server sends the SSH protocol version banner on connect, so we must
 	// drain bytes until the connection is fully closed by the server-side
@@ -2459,7 +2459,7 @@ func TestIdleConn_ResetsReadDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	ic := &idleConn{Conn: c}
 	ic.setTimeout(100 * time.Millisecond)
