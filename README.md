@@ -5,7 +5,7 @@ A production-ready, embeddable SFTP server library for Go with a security-first 
 ## Features
 
 - **SSH public-key and password authentication** — both methods use constant-time comparisons to prevent username enumeration via timing side-channels
-- **Per-user jail (chroot)** — each user is confined to a configurable root directory; path traversal and symlink escapes are blocked
+- **Per-user jail (chroot)** — each user is confined to a configurable root directory. Every filesystem operation is performed via Linux `openat2` with `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS`, so the kernel itself rejects path traversal and any symlink anywhere in the lookup
 - **Fine-grained permissions** — independent `CanRead` / `CanWrite` flags per user
 - **Dynamic user management** — add, remove, and update users and their authorized keys at runtime without restarting the server
 - **Upload notifications** — a buffered `CompletedUploads` channel delivers a `CompletedUpload` struct (username, full on-disk path, jail-relative path, and client IP) for every successfully closed upload
@@ -14,7 +14,14 @@ A production-ready, embeddable SFTP server library for Go with a security-first 
 - **Handshake timeout** — connections that do not complete the SSH handshake within 30 seconds are dropped
 - **Idle-session timeout** — configurable via `Server.IdleTimeout` (default 15 minutes); inactive authenticated SFTP sessions are reaped
 - **Empty-password protection** — users whose stored `Password` is empty cannot authenticate via password, and empty supplied passwords are always rejected
-- **Chown opt-in** — `Setstat`/`Fsetstat` requests that try to change file ownership (uid/gid) are rejected with a permission error unless `Server.AllowChown` is explicitly set to `true`. Symlink creation by clients is always refused so a planted link cannot be followed to escape the jail.
+- **Chown opt-in** — `Setstat`/`Fsetstat` requests that try to change file ownership (uid/gid) are rejected with a permission error unless `Server.AllowChown` is explicitly set to `true`. Symlink creation by clients is always refused, and `Setstat`/`Fsetstat` requests that try to change access/modification times (`Chtimes`) are likewise rejected.
+
+## Platform support
+
+This package is **Linux-only**. The path-containment guarantee depends on the
+`openat2` syscall with `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS`, available
+since Linux 5.6. `Server.ListenAndServe` probes for `openat2` at startup and
+returns an error on older kernels rather than silently degrading the policy.
 
 ## Quick start
 

@@ -1,3 +1,5 @@
+//go:build linux
+
 // Package sftpserver provides an embeddable, security-hardened SFTP and FTP server.
 //
 // Core features:
@@ -474,6 +476,13 @@ func (s *Server) ListenAndServe() error {
 	if s.Signer == nil {
 		return errors.New("sftpserver: Signer is required")
 	}
+	// Hard requirement: the package's containment guarantee relies on
+	// openat2(RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS), available since Linux
+	// 5.6. Fail fast at startup on older kernels rather than silently
+	// degrading the policy at first request.
+	if err := ensureOpenat2(); err != nil {
+		return fmt.Errorf("sftpserver: %w", err)
+	}
 	s.initCompletedUploads()
 	cfg := s.sshServerConfig()
 
@@ -908,13 +917,18 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, usernam
 			}
 			_ = req.Reply(true, nil)
 
-			handlers := jailedHandlers(jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts, allowChown)
+			handlers, fs, err := jailedHandlers(jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts, allowChown)
+			if err != nil {
+				log.Printf("open jail root %q: %v", jailRoot, err)
+				return
+			}
 
 			server := sftp.NewRequestServer(ch, handlers)
 			if err := server.Serve(); err != nil && !errors.Is(err, io.EOF) {
 				log.Println("sftp serve:", err)
 			}
 			_ = server.Close()
+			_ = fs.Close()
 			return
 
 		default:
@@ -924,7 +938,12 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, usernam
 }
 
 type jail struct {
-	root     string
+	// fs is the fd-relative filesystem implementation backing this jail. It
+	// is constructed once per session and shared by all handler invocations.
+	// Its lifetime is bound to the session: jailedHandlers (SFTP) or
+	// ftpSession.openJail (FTP) creates it; the corresponding teardown path
+	// calls fs.Close() exactly once.
+	fs       *jailFS
 	username string
 	clientIP string
 	canRead  bool
@@ -943,105 +962,13 @@ type jail struct {
 	allowChown bool
 }
 
-// resolve maps a client path (possibly relative) into an absolute on-disk path
-// under j.root, rejecting escapes and symlink escapes.
-func (j jail) resolve(p string) (string, error) {
-	if p == "" {
-		p = "/"
-	}
-
-	rootAbs, err := filepath.Abs(filepath.Clean(j.root))
-	if err != nil {
-		return "", err
-	}
-	rootReal, err := filepath.EvalSymlinks(rootAbs)
-	if err != nil {
-		return "", err
-	}
-	if !withinRoot(rootReal, rootReal) {
-		return "", os.ErrPermission
-	}
-
-	// Force absolute + clean: "/../../etc" => "/etc".
-	clean := path.Clean("/" + strings.TrimPrefix(filepath.ToSlash(p), "/"))
-	if clean == "/" {
-		return rootReal, nil
-	}
-
-	parts := strings.Split(strings.TrimPrefix(clean, "/"), "/")
-	cur := rootReal
-	for i, part := range parts {
-		if part == "" || part == "." {
-			continue
-		}
-
-		next := filepath.Join(cur, part)
-		real, err := filepath.EvalSymlinks(next)
-		if err == nil {
-			if !withinRoot(real, rootReal) {
-				return "", os.ErrPermission
-			}
-			cur = real
-			continue
-		}
-
-		// The first path component that does not yet exist is allowed only if
-		// all already-existing ancestors have been resolved and are still inside
-		// the jail. Return a canonical path under the resolved ancestor so that
-		// create operations cannot traverse a previously encountered symlink.
-		if os.IsNotExist(err) {
-			_, lerr := os.Lstat(next)
-			if lerr == nil {
-				// A present path that EvalSymlinks reports as missing is either
-				// a broken symlink or a racy/suspicious path; reject it.
-				return "", os.ErrPermission
-			}
-			if !os.IsNotExist(lerr) {
-				return "", lerr
-			}
-
-			rest := []string{next}
-			rest = append(rest, parts[i+1:]...)
-			candidate := filepath.Join(rest...)
-			if !withinRoot(candidate, rootReal) {
-				return "", os.ErrPermission
-			}
-			return candidate, nil
-		}
-
-		return "", err
-	}
-
-	if !withinRoot(cur, rootReal) {
-		return "", os.ErrPermission
-	}
-	return cur, nil
-}
-
-func withinRoot(path, root string) bool {
-	root = filepath.Clean(root)
-	path = filepath.Clean(path)
-
-	if path == root {
-		return true
-	}
-	if !strings.HasSuffix(root, string(os.PathSeparator)) {
-		root += string(os.PathSeparator)
-	}
-	return strings.HasPrefix(path, root)
-}
-
 // jail implements the four sftp handler interfaces for a chrooted filesystem.
 // Fileread implements sftp.FileReader.
 func (j jail) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	if !j.canRead {
 		return nil, os.ErrPermission
 	}
-	p, err := j.resolve(r.Filepath)
-	if err != nil {
-		return nil, sanitizeSFTPErr(err)
-	}
-	f, err := os.Open(p)
+	f, err := j.fs.OpenRead(r.Filepath)
 	if err != nil {
 		return nil, sanitizeSFTPErr(err)
 	}
@@ -1141,20 +1068,15 @@ func (j jail) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		return nil, os.ErrPermission
 	}
 	clientPath := cleanSFTPClientPath(r.Filepath)
-	p, err := j.resolve(r.Filepath)
-	if err != nil {
-		return nil, sanitizeSFTPErr(err)
-	}
 	log.Printf("upload: %q", clientPath)
-	// Create/overwrite
-	f, err := openFileNoFollow(p, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	f, err := j.fs.OpenWrite(r.Filepath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
 		return nil, sanitizeSFTPErr(err)
 	}
 	return &writeLogger{
 		File:         f,
 		filepath:     clientPath,
-		fullFilepath: p,
+		fullFilepath: j.fs.fullPath(cleanRelClientPath(r.Filepath)),
 		username:     j.username,
 		clientIP:     j.clientIP,
 		uploads:      j.uploads,
@@ -1169,22 +1091,10 @@ func (j jail) Filecmd(r *sftp.Request) error {
 	}
 	switch r.Method {
 	case "Setstat", "Fsetstat":
-		p, err := j.resolve(r.Filepath)
-		if err != nil {
-			return sanitizeSFTPErr(err)
-		}
-		return sanitizeSFTPErr(applyAttrs(p, r, j.allowChown))
+		return sanitizeSFTPErr(j.applyAttrs(r))
 
 	case "Rename":
-		oldP, err := j.resolve(r.Filepath)
-		if err != nil {
-			return sanitizeSFTPErr(err)
-		}
-		newP, err := j.resolve(r.Target)
-		if err != nil {
-			return sanitizeSFTPErr(err)
-		}
-		if err := os.Rename(oldP, newP); err != nil {
+		if err := j.fs.Rename(r.Filepath, r.Target); err != nil {
 			return sanitizeSFTPErr(err)
 		}
 		// If a file with a "still being written" extension is renamed to a
@@ -1196,7 +1106,7 @@ func (j jail) Filecmd(r *sftp.Request) error {
 			log.Printf("upload complete via rename: %q -> %q", oldClientPath, newClientPath)
 			evt := CompletedUpload{
 				Username:     j.username,
-				FullFilePath: newP,
+				FullFilePath: j.fs.fullPath(cleanRelClientPath(r.Target)),
 				FilePath:     newClientPath,
 				ClientIP:     j.clientIP,
 			}
@@ -1209,25 +1119,13 @@ func (j jail) Filecmd(r *sftp.Request) error {
 		return nil
 
 	case "Rmdir":
-		p, err := j.resolve(r.Filepath)
-		if err != nil {
-			return sanitizeSFTPErr(err)
-		}
-		return sanitizeSFTPErr(os.Remove(p))
+		return sanitizeSFTPErr(j.fs.Rmdir(r.Filepath))
 
 	case "Remove":
-		p, err := j.resolve(r.Filepath)
-		if err != nil {
-			return sanitizeSFTPErr(err)
-		}
-		return sanitizeSFTPErr(os.Remove(p))
+		return sanitizeSFTPErr(j.fs.Remove(r.Filepath))
 
 	case "Mkdir":
-		p, err := j.resolve(r.Filepath)
-		if err != nil {
-			return sanitizeSFTPErr(err)
-		}
-		return sanitizeSFTPErr(os.Mkdir(p, 0750))
+		return sanitizeSFTPErr(j.fs.Mkdir(r.Filepath, 0750))
 
 	case "Symlink":
 		// Symlinks are disallowed in the jail: a client-created symlink could
@@ -1245,25 +1143,18 @@ func (j jail) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	if !j.canRead {
 		return nil, os.ErrPermission
 	}
-	p, err := j.resolve(r.Filepath)
-	if err != nil {
-		return nil, sanitizeSFTPErr(err)
-	}
 	switch r.Method {
 	case "List":
-		entries, err := os.ReadDir(p)
+		infos, err := j.fs.List(r.Filepath)
 		if err != nil {
 			return nil, sanitizeSFTPErr(err)
 		}
-		return listerFromDirEntries(p, entries), nil
-	case "Stat":
-		st, err := os.Stat(p)
-		if err != nil {
-			return nil, sanitizeSFTPErr(err)
-		}
-		return listerFromFileInfo([]os.FileInfo{st}), nil
-	case "Lstat":
-		st, err := os.Lstat(p)
+		return listerFromFileInfo(infos), nil
+	case "Stat", "Lstat":
+		// Under the no-symlink policy Stat and Lstat are equivalent: the
+		// kernel rejects any symlink in the path lookup, so the entry being
+		// described is never a symlink.
+		st, err := j.fs.Stat(r.Filepath)
 		if err != nil {
 			return nil, sanitizeSFTPErr(err)
 		}
@@ -1273,56 +1164,65 @@ func (j jail) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	}
 }
 
-// applyAttrs applies SFTP Setstat/Fsetstat attributes to the file at p,
-// constrained to the operations that can run safely as the server process.
+// applyAttrs applies SFTP Setstat/Fsetstat attributes to the file referenced
+// by r.Filepath, constrained to the operations that can run safely as the
+// server process and consistent with the hardened "no symlinks anywhere"
+// policy.
 //
 // Supported flags:
-//   - Permissions       → os.Chmod
-//   - UidGid            → os.Chown (only when allowChown is true; otherwise
+//   - Permissions       → fchmod via openat2-obtained fd
+//   - UidGid            → fchownat (only when allowChown is true; otherwise
 //     the request is rejected with os.ErrPermission so an authenticated user
 //     cannot change ownership of jailed files even when the server process
 //     has the privilege to do so)
-//   - Acmodtime         → os.Chtimes
-//   - Size              → os.Truncate
+//   - Size              → ftruncate via openat2-obtained fd
+//   - Acmodtime         → REJECTED with os.ErrPermission. Setting timestamps
+//     on jailed files is denied wholesale under the hardened policy; clients
+//     get a deterministic permission error rather than a partial success.
 //
 // Operations are applied in a deterministic order. The first error is
 // returned and remaining attributes are not applied, mirroring how OpenSSH's
 // sftp-server reports errors.
-func applyAttrs(p string, r *sftp.Request, allowChown bool) error {
+func (j jail) applyAttrs(r *sftp.Request) error {
 	flags := r.AttrFlags()
 	attrs := r.Attributes()
 	if attrs == nil {
 		return nil
 	}
 	if flags.Size {
-		if err := os.Truncate(p, int64(attrs.Size)); err != nil {
+		if err := j.fs.Truncate(r.Filepath, int64(attrs.Size)); err != nil {
 			return err
 		}
 	}
 	if flags.Permissions {
-		if err := os.Chmod(p, attrs.FileMode().Perm()); err != nil {
+		if err := j.fs.Chmod(r.Filepath, attrs.FileMode().Perm()); err != nil {
 			return err
 		}
 	}
 	if flags.UidGid {
-		if !allowChown {
+		if !j.allowChown {
 			return os.ErrPermission
 		}
-		if err := os.Chown(p, int(attrs.UID), int(attrs.GID)); err != nil {
+		if err := j.fs.Chown(r.Filepath, int(attrs.UID), int(attrs.GID)); err != nil {
 			return err
 		}
 	}
 	if flags.Acmodtime {
-		if err := os.Chtimes(p, attrs.AccessTime(), attrs.ModTime()); err != nil {
-			return err
-		}
+		// The hardened policy refuses to mutate file timestamps; the
+		// fd-based equivalent (futimens) would succeed but the
+		// configured policy is "reject Chtimes".
+		return os.ErrPermission
 	}
 	return nil
 }
 
-func jailedHandlers(root, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, allowChown bool) sftp.Handlers {
+func jailedHandlers(root, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, allowChown bool) (sftp.Handlers, *jailFS, error) {
+	fs, err := openJailFS(filepath.Clean(root))
+	if err != nil {
+		return sftp.Handlers{}, nil, err
+	}
 	j := jail{
-		root:       filepath.Clean(root),
+		fs:         fs,
 		username:   username,
 		clientIP:   clientIP,
 		canRead:    canRead,
@@ -1336,7 +1236,7 @@ func jailedHandlers(root, username, clientIP string, canRead, canWrite bool, upl
 		FilePut:  j,
 		FileCmd:  j,
 		FileList: j,
-	}
+	}, fs, nil
 }
 
 type fileInfoLister struct{ infos []os.FileInfo }
@@ -1356,19 +1256,6 @@ func listerFromFileInfo(infos []os.FileInfo) sftp.ListerAt {
 	return fileInfoLister{infos: infos}
 }
 
-func listerFromDirEntries(dir string, entries []os.DirEntry) sftp.ListerAt {
-	infos := make([]os.FileInfo, 0, len(entries))
-	for _, e := range entries {
-		fi, err := e.Info()
-		if err != nil {
-			log.Printf("listerFromDirEntries: stat %s/%s: %v", dir, e.Name(), err)
-			continue
-		}
-		infos = append(infos, fi)
-	}
-	return fileInfoLister{infos: infos}
-}
-
 // FTP implementation. It is deliberately passive-mode only. Active FTP (PORT / EPRT)
 // is disabled because it is harder to firewall safely and opens client-chosen
 // outbound connections from the server.
@@ -1384,16 +1271,19 @@ type ftpSession struct {
 	cwd           string
 	dataLn        net.Listener
 	rnfrPath      string
-	rnfrFullPath  string
 	restartOffset int64
 	clientIP      string
 	tempExts      []string
+	// fs is the fd-relative filesystem backing this session's jail. It is
+	// constructed by authenticate on successful login and released when the
+	// session ends (closeJail). Until login succeeds it is nil.
+	fs *jailFS
 }
 
 func (s *Server) handleFTPConn(nc net.Conn, tempExts []string) {
 	defer func() { _ = nc.Close() }()
 
-	fs := &ftpSession{
+	sess := &ftpSession{
 		server:   s,
 		conn:     nc,
 		r:        bufio.NewReader(nc),
@@ -1402,18 +1292,19 @@ func (s *Server) handleFTPConn(nc net.Conn, tempExts []string) {
 		clientIP: remoteIP(nc.RemoteAddr()),
 		tempExts: tempExts,
 	}
-	defer fs.closeDataListener()
+	defer sess.closeDataListener()
+	defer sess.closeJail()
 
-	if err := fs.reply(220, "ready"); err != nil {
+	if err := sess.reply(220, "ready"); err != nil {
 		return
 	}
 
 	for {
 		_ = nc.SetReadDeadline(time.Now().Add(5 * time.Minute))
-		line, err := readFTPControlLine(fs.r, ftpMaxControlLineLen)
+		line, err := readFTPControlLine(sess.r, ftpMaxControlLineLen)
 		if err != nil {
 			if errors.Is(err, errFTPLineTooLong) {
-				_ = fs.reply(500, ftpErrMsg(err))
+				_ = sess.reply(500, ftpErrMsg(err))
 				log.Printf("ftp control read from=%s: line exceeded %d bytes", nc.RemoteAddr(), ftpMaxControlLineLen)
 				return
 			}
@@ -1429,7 +1320,7 @@ func (s *Server) handleFTPConn(nc net.Conn, tempExts []string) {
 			continue
 		}
 		cmd, arg := parseFTPCommand(line)
-		quit := fs.handleFTPCommand(cmd, arg)
+		quit := sess.handleFTPCommand(cmd, arg)
 		if quit {
 			return
 		}
@@ -1661,6 +1552,18 @@ func (f *ftpSession) authenticate(pass string) bool {
 	if err != nil {
 		return false
 	}
+	// Open the fd-relative jail filesystem now. If openat2 is not available
+	// on the running kernel this fails and the login is rejected, preserving
+	// the package's hardened guarantee that all subsequent FTP commands
+	// operate via openat2.
+	jfs, err := openJailFS(jailRoot)
+	if err != nil {
+		log.Printf("ftp open jail root %q for user %q: %v", jailRoot, f.username, err)
+		return false
+	}
+	// Release any previous jail from a stale session that re-used USER/PASS.
+	f.closeJail()
+	f.fs = jfs
 	f.user = UserInfo{
 		Password:       u.Password,
 		Root:           jailRoot,
@@ -1671,21 +1574,16 @@ func (f *ftpSession) authenticate(pass string) bool {
 	f.authenticated = true
 	f.cwd = "/"
 	f.rnfrPath = ""
-	f.rnfrFullPath = ""
 	f.restartOffset = 0
 	return true
 }
 
-func (f *ftpSession) jail() jail {
-	return jail{
-		root:       filepath.Clean(f.user.Root),
-		username:   f.username,
-		clientIP:   f.clientIP,
-		canRead:    f.user.CanRead,
-		canWrite:   f.user.CanWrite,
-		uploads:    f.server.CompletedUploads,
-		tempExts:   f.tempExts,
-		allowChown: f.server.allowChown(),
+// closeJail releases the session's jail filesystem fd, if any. It is safe to
+// call multiple times.
+func (f *ftpSession) closeJail() {
+	if f.fs != nil {
+		_ = f.fs.Close()
+		f.fs = nil
 	}
 }
 
@@ -1765,12 +1663,7 @@ func (f *ftpSession) cmdCWD(arg string) {
 		return
 	}
 	ftpPath := f.cleanPath(arg)
-	full, err := f.jail().resolve(ftpPath)
-	if err != nil {
-		_ = f.reply(550, ftpErrMsg(err))
-		return
-	}
-	st, err := os.Stat(full)
+	st, err := f.fs.Stat(ftpPath)
 	if err != nil {
 		_ = f.reply(550, ftpErrMsg(err))
 		return
@@ -1857,12 +1750,7 @@ func (f *ftpSession) cmdList(arg string, namesOnly bool) {
 		return
 	}
 	ftpPath := f.cleanPath(listPathArg(arg))
-	full, err := f.jail().resolve(ftpPath)
-	if err != nil {
-		_ = f.reply(550, ftpErrMsg(err))
-		return
-	}
-	st, err := os.Stat(full)
+	st, err := f.fs.Stat(ftpPath)
 	if err != nil {
 		_ = f.reply(550, ftpErrMsg(err))
 		return
@@ -1870,21 +1758,16 @@ func (f *ftpSession) cmdList(arg string, namesOnly bool) {
 
 	var lines []string
 	if st.IsDir() {
-		entries, err := os.ReadDir(full)
+		entries, err := f.fs.List(ftpPath)
 		if err != nil {
 			_ = f.reply(550, ftpErrMsg(err))
 			return
 		}
-		for _, entry := range entries {
-			info, err := entry.Info()
-			if err != nil {
-				log.Printf("ftp list: stat %s/%s: %v", full, entry.Name(), err)
-				continue
-			}
+		for _, info := range entries {
 			if namesOnly {
-				lines = append(lines, entry.Name())
+				lines = append(lines, info.Name())
 			} else {
-				lines = append(lines, ftpListLine(info, entry.Name()))
+				lines = append(lines, ftpListLine(info, info.Name()))
 			}
 		}
 	} else if namesOnly {
@@ -1952,13 +1835,7 @@ func (f *ftpSession) cmdRetr(arg string) {
 		return
 	}
 	ftpPath := f.cleanPath(arg)
-	full, err := f.jail().resolve(ftpPath)
-	if err != nil {
-		f.restartOffset = 0
-		_ = f.reply(550, ftpErrMsg(err))
-		return
-	}
-	file, err := os.Open(full)
+	file, err := f.fs.OpenRead(ftpPath)
 	if err != nil {
 		f.restartOffset = 0
 		_ = f.reply(550, ftpErrMsg(err))
@@ -1999,12 +1876,6 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 		return
 	}
 	ftpPath := f.cleanPath(arg)
-	full, err := f.jail().resolve(ftpPath)
-	if err != nil {
-		f.restartOffset = 0
-		_ = f.reply(550, ftpErrMsg(err))
-		return
-	}
 
 	if err := f.reply(150, "opening data connection"); err != nil {
 		f.restartOffset = 0
@@ -2028,7 +1899,7 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 		flags |= os.O_TRUNC
 	}
 
-	file, err := openFileNoFollow(full, flags, 0600)
+	file, err := f.fs.OpenWrite(ftpPath, flags, 0600)
 	if err != nil {
 		f.restartOffset = 0
 		_ = f.reply(550, ftpErrMsg(err))
@@ -2073,7 +1944,7 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 		return
 	}
 
-	f.announceUpload(ftpPath, full)
+	f.announceUpload(ftpPath, f.fs.fullPath(cleanRelClientPath(ftpPath)))
 	_ = f.reply(226, "transfer complete")
 }
 
@@ -2112,12 +1983,7 @@ func (f *ftpSession) cmdSize(arg string) {
 		_ = f.reply(550, "permission denied")
 		return
 	}
-	full, err := f.jail().resolve(f.cleanPath(arg))
-	if err != nil {
-		_ = f.reply(550, ftpErrMsg(err))
-		return
-	}
-	st, err := os.Stat(full)
+	st, err := f.fs.Stat(f.cleanPath(arg))
 	if err != nil {
 		_ = f.reply(550, ftpErrMsg(err))
 		return
@@ -2134,12 +2000,7 @@ func (f *ftpSession) cmdMDTM(arg string) {
 		_ = f.reply(550, "permission denied")
 		return
 	}
-	full, err := f.jail().resolve(f.cleanPath(arg))
-	if err != nil {
-		_ = f.reply(550, ftpErrMsg(err))
-		return
-	}
-	st, err := os.Stat(full)
+	st, err := f.fs.Stat(f.cleanPath(arg))
 	if err != nil {
 		_ = f.reply(550, ftpErrMsg(err))
 		return
@@ -2152,12 +2013,7 @@ func (f *ftpSession) cmdDelete(arg string) {
 		_ = f.reply(550, "permission denied")
 		return
 	}
-	full, err := f.jail().resolve(f.cleanPath(arg))
-	if err != nil {
-		_ = f.reply(550, ftpErrMsg(err))
-		return
-	}
-	if err := os.Remove(full); err != nil {
+	if err := f.fs.Remove(f.cleanPath(arg)); err != nil {
 		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
@@ -2170,12 +2026,7 @@ func (f *ftpSession) cmdMkdir(arg string) {
 		return
 	}
 	ftpPath := f.cleanPath(arg)
-	full, err := f.jail().resolve(ftpPath)
-	if err != nil {
-		_ = f.reply(550, ftpErrMsg(err))
-		return
-	}
-	if err := os.Mkdir(full, 0750); err != nil {
+	if err := f.fs.Mkdir(ftpPath, 0750); err != nil {
 		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
@@ -2187,12 +2038,7 @@ func (f *ftpSession) cmdRmdir(arg string) {
 		_ = f.reply(550, "permission denied")
 		return
 	}
-	full, err := f.jail().resolve(f.cleanPath(arg))
-	if err != nil {
-		_ = f.reply(550, ftpErrMsg(err))
-		return
-	}
-	if err := os.Remove(full); err != nil {
+	if err := f.fs.Rmdir(f.cleanPath(arg)); err != nil {
 		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
@@ -2205,47 +2051,34 @@ func (f *ftpSession) cmdRnfr(arg string) {
 		return
 	}
 	ftpPath := f.cleanPath(arg)
-	full, err := f.jail().resolve(ftpPath)
-	if err != nil {
-		_ = f.reply(550, ftpErrMsg(err))
-		return
-	}
-	if _, err := os.Stat(full); err != nil {
+	if _, err := f.fs.Stat(ftpPath); err != nil {
 		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	f.rnfrPath = ftpPath
-	f.rnfrFullPath = full
 	_ = f.reply(350, "ready for RNTO")
 }
 
 func (f *ftpSession) cmdRnto(arg string) {
 	if !f.user.CanWrite {
 		f.rnfrPath = ""
-		f.rnfrFullPath = ""
 		_ = f.reply(550, "permission denied")
 		return
 	}
-	if f.rnfrPath == "" || f.rnfrFullPath == "" {
+	if f.rnfrPath == "" {
 		_ = f.reply(503, "send RNFR first")
 		return
 	}
 	oldPath := f.rnfrPath
-	oldFull := f.rnfrFullPath
 	f.rnfrPath = ""
-	f.rnfrFullPath = ""
 
 	newPath := f.cleanPath(arg)
-	newFull, err := f.jail().resolve(newPath)
-	if err != nil {
-		_ = f.reply(550, ftpErrMsg(err))
-		return
-	}
-	if err := os.Rename(oldFull, newFull); err != nil {
+	if err := f.fs.Rename(oldPath, newPath); err != nil {
 		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	if hasTempExt(oldPath, f.tempExts) && !hasTempExt(newPath, f.tempExts) {
+		newFull := f.fs.fullPath(cleanRelClientPath(newPath))
 		log.Printf("upload complete via rename: %q -> %q", oldPath, newPath)
 		f.announceUpload(newPath, newFull)
 	}
