@@ -1,0 +1,28 @@
+version: 2
+updates:
+  # Keep Go module dependencies up to date.
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "go"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+
+  # Keep GitHub Actions versions up to date (security-sensitive: workflow
+  # actions run with repository credentials).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "ci"
+      include: "scope"

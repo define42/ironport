@@ -1,0 +1,36 @@
+name: govulncheck
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+  schedule:
+    # Weekly run on Mondays at 07:23 UTC to surface new advisories that
+    # may affect a tagged release even when no code changes land.
+    - cron: '23 7 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Run govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-file: go.mod
+          go-package: ./...
