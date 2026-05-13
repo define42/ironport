@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"flag"
 	"log"
+	"strings"
 
 	"github.com/define42/ironport"
 	"golang.org/x/crypto/ssh"
@@ -15,6 +16,10 @@ func main() {
 	sftpAddr := flag.String("sftp-addr", ":2022", "TCP address to listen on for SFTP")
 	ftpAddr := flag.String("ftp-addr", "", "TCP address to listen on for plaintext FTP (empty to disable; credentials are sent in the clear, see README)")
 	ftpPassive := flag.String("ftp-passive", "5000-5010", "FTP passive-mode data port range (used only when -ftp-addr is set)")
+	sshKex := flag.String("ssh-key-exchanges", "", "comma-separated SSH key-exchange algorithms to allow (empty uses defaults)")
+	sshCiphers := flag.String("ssh-ciphers", "", "comma-separated SSH cipher algorithms to allow (empty uses defaults)")
+	sshMACs := flag.String("ssh-macs", "", "comma-separated SSH MAC algorithms to allow (empty uses defaults)")
+	sshPublicKeyAuthAlgorithms := flag.String("ssh-public-key-auth-algorithms", "", "comma-separated public-key auth signature algorithms to allow (empty uses defaults)")
 	flag.Parse()
 
 	// Example user DB (replace with your auth source).
@@ -36,6 +41,12 @@ func main() {
 	}
 
 	srv := ironport.NewServer(*sftpAddr, *ftpAddr, *ftpPassive, users, signer, 64)
+	srv.SSHAlgorithms = ironport.SSHAlgorithms{
+		KeyExchanges:            splitCSV(*sshKex),
+		Ciphers:                 splitCSV(*sshCiphers),
+		MACs:                    splitCSV(*sshMACs),
+		PublicKeyAuthAlgorithms: splitCSV(*sshPublicKeyAuthAlgorithms),
+	}
 	// Files written with one of these extensions are considered "still being
 	// written" and won't be announced on CompletedUploads until the client
 	// renames them to a final (non-temp) name.
@@ -49,6 +60,24 @@ func main() {
 	}()
 
 	log.Fatal(srv.ListenAndServe())
+}
+
+func splitCSV(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	values := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			values = append(values, part)
+		}
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	return values
 }
 
 func mustHostKey() ssh.Signer {

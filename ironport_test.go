@@ -15,6 +15,7 @@ import (
 	"net/textproto"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"syscall"
@@ -509,6 +510,113 @@ func TestNewServer(t *testing.T) {
 	}
 	if srv.Signer != signer {
 		t.Error("Signer not set correctly")
+	}
+}
+
+func TestSSHServerConfig_AppliesAlgorithmPins(t *testing.T) {
+	users := map[string]UserInfo{
+		"alice": {Password: "pw", Root: t.TempDir(), CanRead: true, CanWrite: true},
+	}
+	srv := NewServer(":0", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+	srv.SSHAlgorithms = SSHAlgorithms{
+		KeyExchanges:            []string{ssh.KeyExchangeCurve25519},
+		Ciphers:                 []string{ssh.CipherAES256CTR},
+		MACs:                    []string{ssh.HMACSHA256},
+		PublicKeyAuthAlgorithms: []string{ssh.KeyAlgoRSASHA256},
+	}
+
+	cfg := srv.sshServerConfig()
+	if !reflect.DeepEqual(cfg.KeyExchanges, []string{ssh.KeyExchangeCurve25519}) {
+		t.Fatalf("KeyExchanges = %v; want %v", cfg.KeyExchanges, []string{ssh.KeyExchangeCurve25519})
+	}
+	if !reflect.DeepEqual(cfg.Ciphers, []string{ssh.CipherAES256CTR}) {
+		t.Fatalf("Ciphers = %v; want %v", cfg.Ciphers, []string{ssh.CipherAES256CTR})
+	}
+	if !reflect.DeepEqual(cfg.MACs, []string{ssh.HMACSHA256}) {
+		t.Fatalf("MACs = %v; want %v", cfg.MACs, []string{ssh.HMACSHA256})
+	}
+	if !reflect.DeepEqual(cfg.PublicKeyAuthAlgorithms, []string{ssh.KeyAlgoRSASHA256}) {
+		t.Fatalf("PublicKeyAuthAlgorithms = %v; want %v", cfg.PublicKeyAuthAlgorithms, []string{ssh.KeyAlgoRSASHA256})
+	}
+
+	srv.SSHAlgorithms.Ciphers[0] = ssh.CipherAES128CTR
+	if got := cfg.Ciphers[0]; got != ssh.CipherAES256CTR {
+		t.Fatalf("sshServerConfig aliased server SSHAlgorithms; Ciphers[0] = %q", got)
+	}
+}
+
+func TestSFTPServer_SSHAlgorithmPinning(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users, func(s *server) {
+		s.SSHAlgorithms = SSHAlgorithms{
+			KeyExchanges: []string{ssh.KeyExchangeCurve25519},
+			Ciphers:      []string{ssh.CipherAES256CTR},
+			MACs:         []string{ssh.HMACSHA256},
+		}
+	})
+	t.Cleanup(stop)
+
+	sshCfg := &ssh.ClientConfig{
+		Config: ssh.Config{
+			KeyExchanges: []string{ssh.KeyExchangeCurve25519},
+			Ciphers:      []string{ssh.CipherAES256CTR},
+			MACs:         []string{ssh.HMACSHA256},
+		},
+		User:            "alice",
+		Auth:            []ssh.AuthMethod{ssh.Password("alicepw")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	conn, err := ssh.Dial("tcp", addr, sshCfg)
+	if err != nil {
+		t.Fatalf("ssh.Dial with matching pinned algorithms: %v", err)
+	}
+	_ = conn.Close()
+
+	sshCfg.Ciphers = []string{ssh.CipherAES128CTR}
+	if conn, err = ssh.Dial("tcp", addr, sshCfg); err == nil {
+		_ = conn.Close()
+		t.Fatal("expected cipher negotiation failure, got nil")
+	}
+}
+
+func TestSFTPServer_PublicKeyAuthAlgorithmPinning(t *testing.T) {
+	root := t.TempDir()
+	clientSigner, clientPubKey := testClientKey(t)
+	users := map[string]UserInfo{
+		"alice": {AuthorizedKeys: []ssh.PublicKey{clientPubKey}, Root: root, CanRead: true, CanWrite: true},
+	}
+
+	_, addr, stop := startTestServer(t, users, func(s *server) {
+		s.SSHAlgorithms = SSHAlgorithms{
+			PublicKeyAuthAlgorithms: []string{ssh.KeyAlgoRSASHA256},
+		}
+	})
+	t.Cleanup(stop)
+
+	sshCfg := &ssh.ClientConfig{
+		User:            "alice",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(clientSigner)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	conn, err := ssh.Dial("tcp", addr, sshCfg)
+	if err != nil {
+		t.Fatalf("ssh.Dial with matching public-key auth algorithm: %v", err)
+	}
+	_ = conn.Close()
+
+	_, rejectAddr, rejectStop := startTestServer(t, users, func(s *server) {
+		s.SSHAlgorithms = SSHAlgorithms{
+			PublicKeyAuthAlgorithms: []string{ssh.KeyAlgoED25519},
+		}
+	})
+	t.Cleanup(rejectStop)
+
+	if conn, err = ssh.Dial("tcp", rejectAddr, sshCfg); err == nil {
+		_ = conn.Close()
+		t.Fatal("expected public-key auth algorithm rejection, got nil")
 	}
 }
 

@@ -13,6 +13,7 @@ A production-ready, embeddable SFTP server and FTP server library for Go with a 
 - **Graceful shutdown** — `Close()` stops the listener; in-flight sessions are not terminated
 - **Thread-safe runtime APIs** — user-management helpers and listener lifecycle methods are safe to call while the server is running
 - **Handshake timeout** — connections that do not complete the SSH handshake within 30 seconds are dropped
+- **SSH algorithm pinning** — optionally constrain SSH key exchange, ciphers, MACs, and public-key auth signature algorithms
 - **Idle-session timeout** — configurable via `IdleTimeout` on the server returned by `NewServer` (default 15 minutes); inactive authenticated SFTP sessions are reaped
 - **Empty-password protection** — users whose stored `Password` is empty cannot authenticate via password, and empty supplied passwords are always rejected
 - **Chown opt-in** — `Setstat`/`Fsetstat` requests that try to change file ownership (uid/gid) are rejected with a permission error unless `AllowChown` is explicitly set to `true` on the server returned by `NewServer`. Symlink creation by clients is always refused, and `Setstat`/`Fsetstat` requests that try to change access/modification times (`Chtimes`) are likewise rejected.
@@ -96,6 +97,28 @@ With this setting:
 - uploads that close with a temp extension are not announced yet
 - renaming from a temp extension to a non-temp name emits the completion event
 
+### Pinning SSH algorithms
+
+Set `SSHAlgorithms` before starting the server to restrict SSH negotiation.
+Nil fields keep the defaults from `golang.org/x/crypto/ssh`; non-nil fields
+are used as allow-lists in the order supplied:
+
+```go
+srv := ironport.NewServer(":2022", "", "", users, signer, 64)
+srv.SSHAlgorithms = ironport.SSHAlgorithms{
+    KeyExchanges: []string{ssh.KeyExchangeCurve25519},
+    Ciphers:      []string{ssh.CipherAES256CTR},
+    MACs:         []string{ssh.HMACSHA256},
+    PublicKeyAuthAlgorithms: []string{
+        ssh.KeyAlgoED25519,
+        ssh.KeyAlgoRSASHA256,
+    },
+}
+```
+
+For RSA host-key signature pinning, pass a signer already restricted with
+`ssh.NewSignerWithAlgorithms`.
+
 ## FTP support (plaintext, opt-in)
 
 This package also exposes a passive-mode FTP listener that shares the SFTP
@@ -163,6 +186,8 @@ go run ./cmd/ironport -host-key /path/to/host_key
 ```
 
 If `-host-key` is omitted a fresh RSA-3072 key is generated on every start (not suitable for production, as clients will see a different host key each time).
+The example binary also accepts comma-separated `-ssh-key-exchanges`,
+`-ssh-ciphers`, `-ssh-macs`, and `-ssh-public-key-auth-algorithms` flags.
 
 ## License
 

@@ -8,6 +8,7 @@
 //   - Password and SSH public-key authentication with constant-time comparisons.
 //   - Fine-grained CanRead / CanWrite per-user permission flags.
 //   - Runtime user management (AddUser, RemoveUser, RemoveAllUsers, AddUserKey, RemoveUserKey).
+//   - Optional SSH algorithm pinning for key exchange, ciphers, MACs, and public-key auth signatures.
 //   - Graceful shutdown via Close; upload-completion notifications via CompletedUploads.
 //   - Optional passive-mode FTP listener sharing the same users, jails, permissions,
 //     temp-extension handling, and CompletedUploads stream as SFTP.
@@ -205,11 +206,42 @@ type UserInfo struct {
 	CanWrite       bool            // allow write/upload/delete/rename operations
 }
 
+// SSHAlgorithms contains optional SSH algorithm allow-lists.
+//
+// A nil field uses golang.org/x/crypto/ssh defaults. A non-nil field pins that
+// algorithm class to the listed values, in order. KeyExchanges, Ciphers, and
+// MACs correspond to ssh.Config fields; PublicKeyAuthAlgorithms controls the
+// client public-key signature algorithms accepted by ssh.ServerConfig.
+type SSHAlgorithms struct {
+	KeyExchanges            []string
+	Ciphers                 []string
+	MACs                    []string
+	PublicKeyAuthAlgorithms []string
+}
+
 func cloneUserInfo(u UserInfo) UserInfo {
 	if u.AuthorizedKeys != nil {
 		u.AuthorizedKeys = append([]ssh.PublicKey(nil), u.AuthorizedKeys...)
 	}
 	return u
+}
+
+func cloneStringSlice(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
+}
+
+func cloneSSHAlgorithms(a SSHAlgorithms) SSHAlgorithms {
+	return SSHAlgorithms{
+		KeyExchanges:            cloneStringSlice(a.KeyExchanges),
+		Ciphers:                 cloneStringSlice(a.Ciphers),
+		MACs:                    cloneStringSlice(a.MACs),
+		PublicKeyAuthAlgorithms: cloneStringSlice(a.PublicKeyAuthAlgorithms),
+	}
 }
 
 func cloneUsers(users map[string]UserInfo) map[string]UserInfo {
@@ -262,6 +294,11 @@ type server struct {
 	ftpLn net.Listener
 	// Signer is the host key used for the SSH handshake.
 	Signer ssh.Signer
+	// SSHAlgorithms optionally pins SSH negotiation and public-key auth
+	// signature algorithms. Leave fields nil to use golang.org/x/crypto/ssh
+	// defaults. Set before ListenAndServe; changes after startup do not affect
+	// the already-created SSH server configuration.
+	SSHAlgorithms SSHAlgorithms
 	// completedUploads receives upload notifications. Use CompletedUploads to
 	// access it as a receive-only stream.
 	completedUploads chan CompletedUpload
@@ -791,7 +828,14 @@ func canonicalJailRoot(root string) (string, error) {
 // in the user's AuthorizedKeys slice (constant-time comparison of wire-format
 // bytes).
 func (s *server) sshServerConfig() *ssh.ServerConfig {
+	algorithms := cloneSSHAlgorithms(s.SSHAlgorithms)
 	cfg := &ssh.ServerConfig{
+		Config: ssh.Config{
+			KeyExchanges: algorithms.KeyExchanges,
+			Ciphers:      algorithms.Ciphers,
+			MACs:         algorithms.MACs,
+		},
+		PublicKeyAuthAlgorithms: algorithms.PublicKeyAuthAlgorithms,
 		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
 			s.mu.RLock()
 			u, ok := s.Users[c.User()]
