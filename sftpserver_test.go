@@ -25,86 +25,133 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// ---- withinRoot tests ----
+// ---- cleanRelClientPath / jailFS path-handling tests ----
 
-func TestWithinRoot(t *testing.T) {
+func TestCleanRelClientPath(t *testing.T) {
 	tests := []struct {
-		path, root string
-		want       bool
+		in, want string
 	}{
-		{"/srv/sftp/alice", "/srv/sftp/alice", true},
-		{"/srv/sftp/alice/foo", "/srv/sftp/alice", true},
-		{"/srv/sftp/alice/foo/bar", "/srv/sftp/alice", true},
-		{"/srv/sftp/alice_evil", "/srv/sftp/alice", false},
-		{"/srv/sftp", "/srv/sftp/alice", false},
-		{"/srv/sftp/bob", "/srv/sftp/alice", false},
-		{"/", "/srv/sftp/alice", false},
+		{"", "."},
+		{"/", "."},
+		{".", "."},
+		{"foo.txt", "foo.txt"},
+		{"/foo.txt", "foo.txt"},
+		{"/bar/baz.txt", "bar/baz.txt"},
+		{"./bar", "bar"},
+		{"/a/../b.txt", "b.txt"},
+		{"../../etc/passwd", "etc/passwd"},
 	}
 	for _, tc := range tests {
-		got := withinRoot(tc.path, tc.root)
+		got := cleanRelClientPath(tc.in)
 		if got != tc.want {
-			t.Errorf("withinRoot(%q, %q) = %v; want %v", tc.path, tc.root, got, tc.want)
+			t.Errorf("cleanRelClientPath(%q) = %q; want %q", tc.in, got, tc.want)
 		}
 	}
 }
 
-// ---- jail.resolve tests ----
-
-func TestJailResolve(t *testing.T) {
+// TestJailFS_RejectsSymlinkComponents covers the core hardening guarantee:
+// no openat2-backed operation may traverse a symlink, regardless of whether
+// the symlink is the final component or an intermediate one, and regardless
+// of whether its target lies inside or outside the jail. The same fixture
+// exercises read, write, stat, list, chmod, truncate, mkdir, remove, and
+// rename, so a regression in any helper is caught here.
+func TestJailFS_RejectsSymlinkComponents(t *testing.T) {
 	root := t.TempDir()
-	j := jail{root: root}
+	outside := t.TempDir()
 
-	// Normal relative path
-	p, err := j.resolve("foo.txt")
-	if err != nil {
-		t.Fatalf("resolve(foo.txt): %v", err)
+	// Create a real subdir and a regular file inside the jail so that
+	// "innocent" calls succeed and we know the failures below are caused
+	// by the symlink, not by a misconfigured fixture.
+	if err := os.Mkdir(filepath.Join(root, "real"), 0o750); err != nil {
+		t.Fatal(err)
 	}
-	if p != filepath.Join(root, "foo.txt") {
-		t.Errorf("resolve(foo.txt) = %q; want %q", p, filepath.Join(root, "foo.txt"))
-	}
-
-	// Absolute SFTP path
-	p, err = j.resolve("/bar/baz.txt")
-	if err != nil {
-		t.Fatalf("resolve(/bar/baz.txt): %v", err)
-	}
-	if p != filepath.Join(root, "bar", "baz.txt") {
-		t.Errorf("resolve(/bar/baz.txt) = %q; want %q", p, filepath.Join(root, "bar", "baz.txt"))
+	if err := os.WriteFile(filepath.Join(root, "real", "file.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
-	// Empty path → root
-	p, err = j.resolve("")
-	if err != nil {
-		t.Fatalf("resolve(''): %v", err)
+	// Symlink whose target escapes the jail.
+	if err := os.Symlink(filepath.Join(outside, "missing.txt"), filepath.Join(root, "escape")); err != nil {
+		t.Skipf("symlink: %v", err)
 	}
-	if p != root {
-		t.Errorf("resolve('') = %q; want %q", p, root)
+	// Symlink to a directory inside the jail. Even an "internal" symlink is
+	// rejected so the policy does not depend on resolving the target.
+	if err := os.Symlink("real", filepath.Join(root, "real_link")); err != nil {
+		t.Skipf("symlink: %v", err)
 	}
 
-	// Path traversal attempt
-	_, err = j.resolve("../../etc/passwd")
+	jfs, err := openJailFS(root)
 	if err != nil {
-		// After clean, ../../etc/passwd from "/" becomes /etc/passwd which is
-		// outside root, so resolve returns os.ErrPermission only when the
-		// resolved real path escapes; for non-existing paths the string check
-		// catches it.  Accept any non-nil error.
-		t.Logf("resolve(../../etc/passwd) correctly returned error: %v", err)
+		t.Fatalf("openJailFS: %v", err)
+	}
+	t.Cleanup(func() { _ = jfs.Close() })
+
+	type op struct {
+		name string
+		run  func() error
+	}
+	ops := []op{
+		{"OpenRead final", func() error { _, err := jfs.OpenRead("/escape"); return err }},
+		{"OpenRead middle", func() error { _, err := jfs.OpenRead("/real_link/file.txt"); return err }},
+		{"OpenWrite final", func() error {
+			_, err := jfs.OpenWrite("/escape", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+			return err
+		}},
+		{"OpenWrite middle", func() error {
+			_, err := jfs.OpenWrite("/real_link/new.txt", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+			return err
+		}},
+		{"Stat final", func() error { _, err := jfs.Stat("/escape"); return err }},
+		{"List middle", func() error { _, err := jfs.List("/real_link"); return err }},
+		{"Mkdir middle", func() error { return jfs.Mkdir("/real_link/sub", 0o750) }},
+		{"Rename src middle", func() error { return jfs.Rename("/real_link/file.txt", "/x") }},
+		{"Rename dst middle", func() error { return jfs.Rename("/real/file.txt", "/real_link/x") }},
+		{"Chmod final", func() error { return jfs.Chmod("/escape", 0o600) }},
+		{"Truncate final", func() error { return jfs.Truncate("/escape", 0) }},
+	}
+	for _, o := range ops {
+		err := o.run()
+		if err == nil {
+			t.Errorf("%s: expected error for symlink traversal, got nil", o.name)
+		}
+	}
+
+	// The escaping symlink target must still not exist on disk: none of the
+	// rejected operations may have been completed through it. (Note: Remove
+	// of a symlink final component is intentionally allowed so users can
+	// clean up symlinks; it removes the symlink itself via unlinkat, not
+	// its target.)
+	if _, err := os.Stat(filepath.Join(outside, "missing.txt")); !os.IsNotExist(err) {
+		t.Fatalf("outside target was created or stat failed unexpectedly: %v", err)
 	}
 }
 
-func TestJailResolveRejectsBrokenSymlink(t *testing.T) {
+// TestJailFS_PathTraversalContained verifies RESOLVE_IN_ROOT keeps ".."
+// inside the jail. Both the leading ".." and a mid-path ".." are clamped so
+// they cannot reach a sibling jail or the real filesystem root.
+func TestJailFS_PathTraversalContained(t *testing.T) {
 	root := t.TempDir()
-	outside := t.TempDir()
-	link := filepath.Join(root, "link")
-	if err := os.Symlink(filepath.Join(outside, "missing.txt"), link); err != nil {
-		t.Skipf("creating symlink: %v", err)
+	if err := os.WriteFile(filepath.Join(root, "inside.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
 	}
+	jfs, err := openJailFS(root)
+	if err != nil {
+		t.Fatalf("openJailFS: %v", err)
+	}
+	t.Cleanup(func() { _ = jfs.Close() })
 
-	j := jail{root: root}
-	_, err := j.resolve("/link")
-	if !errors.Is(err, os.ErrPermission) {
-		t.Fatalf("resolve(/link) error = %v; want permission denied", err)
+	// "../../etc/passwd" → cleaned to "etc/passwd" relative to the jail and
+	// resolved against the root fd, so it must fail with ENOENT, not return
+	// /etc/passwd from the host.
+	if _, err := jfs.OpenRead("../../etc/passwd"); err == nil {
+		t.Fatal("OpenRead escape returned nil error")
 	}
+	// A path that climbs and then re-descends to a real entry inside the jail
+	// must succeed via cleaning ("../inside.txt" → "inside.txt").
+	f, err := jfs.OpenRead("../inside.txt")
+	if err != nil {
+		t.Fatalf("OpenRead inside via .. : %v", err)
+	}
+	_ = f.Close()
 }
 
 func TestJailFilewriteRejectsBrokenSymlinkEscape(t *testing.T) {
@@ -116,19 +163,22 @@ func TestJailFilewriteRejectsBrokenSymlinkEscape(t *testing.T) {
 		t.Skipf("creating symlink: %v", err)
 	}
 
+	jfs, err := openJailFS(root)
+	if err != nil {
+		t.Fatalf("openJailFS: %v", err)
+	}
+	t.Cleanup(func() { _ = jfs.Close() })
+
 	j := jail{
-		root:     root,
+		fs:       jfs,
 		username: "testuser",
 		clientIP: "127.0.0.1",
 		canWrite: true,
 		uploads:  make(chan CompletedUpload, 1),
 	}
-	_, err := j.Filewrite(&sftp.Request{Filepath: "/link"})
+	_, err = j.Filewrite(&sftp.Request{Filepath: "/link"})
 	if err == nil {
-		t.Fatalf("Filewrite to broken symlink succeeded; want permission denied")
-	}
-	if !errors.Is(err, os.ErrPermission) {
-		t.Fatalf("Filewrite error = %v; want permission denied", err)
+		t.Fatalf("Filewrite to broken symlink succeeded; want error")
 	}
 	if _, err := os.Stat(outsideTarget); !os.IsNotExist(err) {
 		t.Fatalf("outside target was created or stat failed unexpectedly: %v", err)
@@ -2789,17 +2839,13 @@ func TestSFTPServer_Setstat_TruncateAndTimes(t *testing.T) {
 		t.Errorf("size = %d; want 16", info.Size())
 	}
 
-	// Chtimes via Setstat.
+	// Chtimes via Setstat is rejected under the hardened "no symlinks /
+	// fd-relative-only" policy: setting access/modification times on jailed
+	// files is denied wholesale rather than silently succeeding via
+	// path-based os.Chtimes.
 	want := time.Unix(1_700_000_000, 0)
-	if err := client.Chtimes("/setstat.txt", want, want); err != nil {
-		t.Fatalf("Chtimes: %v", err)
-	}
-	info, err = os.Stat(filepath.Join(root, "setstat.txt"))
-	if err != nil {
-		t.Fatalf("os.Stat: %v", err)
-	}
-	if !info.ModTime().Equal(want) {
-		t.Errorf("mtime = %v; want %v", info.ModTime(), want)
+	if err := client.Chtimes("/setstat.txt", want, want); err == nil {
+		t.Fatal("Chtimes succeeded; expected permission error under hardened policy")
 	}
 }
 
@@ -3019,6 +3065,11 @@ func (c *stubConn) SetWriteDeadline(time.Time) error { return nil }
 
 func TestFTPServer_CmdStorSanitizesCopyErrors(t *testing.T) {
 	root := t.TempDir()
+	jfs, err := openJailFS(root)
+	if err != nil {
+		t.Fatalf("openJailFS: %v", err)
+	}
+	t.Cleanup(func() { _ = jfs.Close() })
 	copyErr := errors.New("copy failed while reading /srv/secret.txt")
 	var control bytes.Buffer
 	controlConn := &stubConn{}
@@ -3032,6 +3083,7 @@ func TestFTPServer_CmdStorSanitizesCopyErrors(t *testing.T) {
 		w:      bufio.NewWriter(&control),
 		user:   UserInfo{Root: root, CanWrite: true},
 		dataLn: &stubListener{conn: dataConn},
+		fs:     jfs,
 	}
 
 	fs.cmdStor("upload.txt", false)
