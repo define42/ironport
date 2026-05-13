@@ -1,6 +1,6 @@
 # ironport
 
-A production-ready, embeddable SFTP server library for Go with a security-first design.
+A production-ready, embeddable SFTP server and FTP server library for Go with a security-first design.
 
 ## Features
 
