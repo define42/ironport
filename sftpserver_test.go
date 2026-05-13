@@ -433,7 +433,7 @@ func TestCompletedUploadsSize(t *testing.T) {
 		t.Errorf("default cap = %d; want %d", cap(srv.CompletedUploads), defaultCompletedUploadsSize)
 	}
 
-	// Custom capacity via NewServer variadic argument.
+	// Custom capacity via NewServer required parameter.
 	srv2 := NewServer(":0", "", "", users, signer, 256)
 	if cap(srv2.CompletedUploads) != 256 {
 		t.Errorf("custom cap via NewServer = %d; want 256", cap(srv2.CompletedUploads))
