@@ -18,6 +18,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -2667,6 +2668,107 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 	var netErr net.Error
 	if errors.As(lastErr, &netErr) && netErr.Timeout() {
 		t.Error("server did not close the idle connection before the 35 s outer deadline; handshake timeout may not be working")
+	}
+}
+
+type panicReadChannel struct {
+	closeOnce sync.Once
+	closed    chan struct{}
+	stderr    bytes.Buffer
+}
+
+func (c *panicReadChannel) Read([]byte) (int, error) {
+	panic("synthetic channel read panic")
+}
+
+func (c *panicReadChannel) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+
+func (c *panicReadChannel) Close() error {
+	c.closeOnce.Do(func() {
+		if c.closed != nil {
+			close(c.closed)
+		}
+	})
+	return nil
+}
+
+func (c *panicReadChannel) CloseWrite() error {
+	return nil
+}
+
+func (c *panicReadChannel) SendRequest(string, bool, []byte) (bool, error) {
+	return false, nil
+}
+
+func (c *panicReadChannel) Stderr() io.ReadWriter {
+	return &c.stderr
+}
+
+func TestHandleSession_RecoversFromPanic(t *testing.T) {
+	ch := &panicReadChannel{closed: make(chan struct{})}
+	inReqs := make(chan *ssh.Request, 1)
+	inReqs <- &ssh.Request{
+		Type:    "subsystem",
+		Payload: append([]byte{0, 0, 0, 4}, []byte("sftp")...),
+	}
+	close(inReqs)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handleSession(ch, inReqs, t.TempDir(), "testuser", "127.0.0.1", true, true, make(chan CompletedUpload, 1), nil, false)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleSession did not return after recovered panic")
+	}
+
+	select {
+	case <-ch.closed:
+	default:
+		t.Fatal("handleSession did not close the channel after recovered panic")
+	}
+}
+
+func TestJailHandlersRecoverFromPanic(t *testing.T) {
+	j := jail{
+		username: "testuser",
+		clientIP: "127.0.0.1",
+		canRead:  true,
+		canWrite: true,
+		uploads:  make(chan CompletedUpload, 1),
+	}
+
+	if _, err := j.Fileread(sftp.NewRequest("Get", "/panic.txt")); !errors.Is(err, errSFTPRequestFailed) {
+		t.Fatalf("Fileread panic recovery err = %v; want %v", err, errSFTPRequestFailed)
+	}
+	if _, err := j.Filelist(sftp.NewRequest("List", "/panic")); !errors.Is(err, errSFTPRequestFailed) {
+		t.Fatalf("Filelist panic recovery err = %v; want %v", err, errSFTPRequestFailed)
+	}
+	if err := j.Filecmd(sftp.NewRequest("Mkdir", "/panic")); !errors.Is(err, errSFTPRequestFailed) {
+		t.Fatalf("Filecmd panic recovery err = %v; want %v", err, errSFTPRequestFailed)
+	}
+}
+
+func TestSFTPReturnedObjectsRecoverFromPanic(t *testing.T) {
+	w := &writeLogger{
+		filepath: "/panic.txt",
+		username: "testuser",
+		clientIP: "127.0.0.1",
+	}
+
+	if _, err := w.WriteAt([]byte("x"), 0); err == nil {
+		t.Fatal("WriteAt with nil file returned nil error")
+	}
+	if err := w.Close(); err == nil {
+		t.Fatal("Close with nil file returned nil error")
+	}
+	if _, err := (fileInfoLister{}).ListAt(make([]os.FileInfo, 1), -1); !errors.Is(err, os.ErrInvalid) {
+		t.Fatalf("ListAt negative offset err = %v; want %v", err, os.ErrInvalid)
 	}
 }
 
