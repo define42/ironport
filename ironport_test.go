@@ -3,6 +3,7 @@ package ironport
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -2520,6 +2521,171 @@ func TestServer_Close_BeforeListenAndServe(t *testing.T) {
 	srv := NewServer(":0", "", "", map[string]UserInfo{}, testSigner(t), defaultCompletedUploadsSize)
 	if err := srv.Close(); err != nil {
 		t.Errorf("Close before ListenAndServe returned %v; want nil", err)
+	}
+}
+
+// startListenAndServe boots a server via ListenAndServe on
+// 127.0.0.1:0 and returns it once it is accepting. The caller must drain
+// errCh and call Shutdown/Close to stop the server.
+func startListenAndServe(t *testing.T, users map[string]UserInfo) (srv *server, addr string, errCh chan error) {
+	t.Helper()
+	srv = NewServer("127.0.0.1:0", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+	errCh = make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe() }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if a := srv.ListeningAddr(); a != nil {
+			return srv, a.String(), errCh
+		}
+		select {
+		case err := <-errCh:
+			t.Fatalf("ListenAndServe returned early: %v", err)
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_ = srv.Close()
+	t.Fatal("server did not start in time")
+	return nil, "", nil
+}
+
+// TestServer_Shutdown_DrainsInFlight verifies that Shutdown waits for an
+// authenticated client session to finish before returning.
+func TestServer_Shutdown_DrainsInFlight(t *testing.T) {
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: t.TempDir(), CanRead: true, CanWrite: true},
+	}
+	srv, addr, errCh := startListenAndServe(t, users)
+
+	sshCfg := &ssh.ClientConfig{
+		User:            "alice",
+		Auth:            []ssh.AuthMethod{ssh.Password("alicepw")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	conn, err := ssh.Dial("tcp", addr, sshCfg)
+	if err != nil {
+		t.Fatalf("ssh.Dial: %v", err)
+	}
+	client, err := sftp.NewClient(conn)
+	if err != nil {
+		_ = conn.Close()
+		t.Fatalf("sftp.NewClient: %v", err)
+	}
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		shutdownDone <- srv.Shutdown(ctx)
+	}()
+
+	// Shutdown must not return while the client is still connected.
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("Shutdown returned before client closed: err=%v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// New dials must be refused even though Shutdown is still draining.
+	if _, dialErr := ssh.Dial("tcp", addr, sshCfg); dialErr == nil {
+		t.Error("expected dial to fail after Shutdown closed the listener")
+	}
+
+	// Close the active client; Shutdown should finish soon after.
+	_ = client.Close()
+	_ = conn.Close()
+
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("Shutdown returned %v; want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown did not return after client closed")
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("ListenAndServe returned %v; want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ListenAndServe did not return after Shutdown")
+	}
+}
+
+// TestServer_Shutdown_ForceClosesOnContextDeadline verifies that when the
+// supplied context expires before in-flight handlers finish, Shutdown
+// force-closes the lingering connections and returns ctx.Err().
+func TestServer_Shutdown_ForceClosesOnContextDeadline(t *testing.T) {
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: t.TempDir(), CanRead: true, CanWrite: true},
+	}
+	srv, addr, errCh := startListenAndServe(t, users)
+
+	sshCfg := &ssh.ClientConfig{
+		User:            "alice",
+		Auth:            []ssh.AuthMethod{ssh.Password("alicepw")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	conn, err := ssh.Dial("tcp", addr, sshCfg)
+	if err != nil {
+		t.Fatalf("ssh.Dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = srv.Shutdown(ctx)
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown err = %v; want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("Shutdown took %v; expected to return promptly after force-close", elapsed)
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("ListenAndServe returned %v; want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ListenAndServe did not return after Shutdown deadline")
+	}
+
+	// The forcibly-closed SSH connection's session loop should observe the
+	// read error and finish; a subsequent read on the client side fails.
+	if _, _, err := conn.SendRequest("noop", true, nil); err == nil {
+		t.Error("expected error sending request on force-closed conn, got nil")
+	}
+}
+
+// TestServer_Shutdown_BeforeListenAndServe is a no-op and must not block.
+func TestServer_Shutdown_BeforeListenAndServe(t *testing.T) {
+	srv := NewServer(":0", "", "", map[string]UserInfo{}, testSigner(t), defaultCompletedUploadsSize)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Errorf("Shutdown before ListenAndServe returned %v; want nil", err)
+	}
+}
+
+// TestServer_ListenAndServe_AfterShutdown verifies that once a server has been
+// shut down it cannot be restarted; ListenAndServe returns a sentinel error
+// instead of silently spinning a refusing accept loop.
+func TestServer_ListenAndServe_AfterShutdown(t *testing.T) {
+	srv := NewServer("127.0.0.1:0", "", "", map[string]UserInfo{}, testSigner(t), defaultCompletedUploadsSize)
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	err := srv.ListenAndServe()
+	if err == nil {
+		t.Fatal("expected ListenAndServe to fail after Shutdown")
+	}
+	if want := "ironport: server has been shut down"; err.Error() != want {
+		t.Errorf("got %q; want %q", err.Error(), want)
 	}
 }
 

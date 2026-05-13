@@ -10,7 +10,7 @@ A production-ready, embeddable SFTP server and FTP server library for Go with a 
 - **Dynamic user management** — add, remove, and update users and their authorized keys at runtime without restarting the server
 - **Upload notifications** — a buffered `CompletedUploads()` stream delivers a `CompletedUpload` struct (username, full on-disk path, jail-relative path, and client IP) for every successfully closed upload
 - **Temp-file aware completion** — optionally set `TempExtensions` on the server returned by `NewServer` (for example, `.tmp`, `.writing`) to suppress completion notifications for temporary upload names and emit the notification when the file is renamed to a non-temp name
-- **Graceful shutdown** — `Close()` stops the listener; in-flight sessions are not terminated
+- **Graceful shutdown** — `Close()` stops the listener immediately and lets in-flight sessions finish on their own. `Shutdown(ctx)` stops the listener AND waits for in-flight sessions to finish, force-closing any that remain when `ctx` expires
 - **Thread-safe runtime APIs** — user-management helpers and listener lifecycle methods are safe to call while the server is running
 - **Handshake timeout** — connections that do not complete the SSH handshake within 30 seconds are dropped
 - **SSH algorithm pinning** — optionally constrain SSH key exchange, ciphers, MACs, and public-key auth signature algorithms
@@ -170,6 +170,25 @@ srv.RemoveUser("carol")
 // Remove all users without deleting any on-disk user data.
 srv.RemoveAllUsers()
 ```
+
+## Graceful shutdown
+
+`Shutdown(ctx)` stops the listeners so no new connections are accepted, then
+waits for every in-flight handler to return. If `ctx` expires first, the
+remaining tracked connections are force-closed and `ctx.Err()` is returned.
+After `Shutdown` returns, `ListenAndServe` will have returned `nil`; the
+server cannot be restarted (construct a new one instead).
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+if err := srv.Shutdown(ctx); err != nil {
+    log.Printf("shutdown: %v", err)
+}
+```
+
+Use `Close()` when you want the legacy behavior of closing the listener
+without waiting for sessions to drain.
 
 ## Host key
 

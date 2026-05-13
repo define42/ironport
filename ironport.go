@@ -21,6 +21,7 @@ package ironport
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/binary"
@@ -365,6 +366,22 @@ type server struct {
 	// Setting this field after the server has started has effect only on
 	// connections accepted afterwards.
 	AllowChown bool
+	// connWG tracks in-flight per-connection handler goroutines so that
+	// Shutdown can wait for them to finish. Each accepted connection adds
+	// one before its goroutine starts and decrements on goroutine exit.
+	// connWG.Add is always called under mu so it is serialised with
+	// shuttingDown reads/writes; this keeps the Add/Wait pair race-free
+	// per the sync.WaitGroup contract.
+	connWG sync.WaitGroup
+	// activeConns holds every accepted connection that has not yet returned
+	// from its handler. It is consulted by Shutdown to force-close
+	// stragglers when the caller's context deadline fires.
+	activeConns map[net.Conn]struct{}
+	// shuttingDown is set by Shutdown so subsequent trackConn calls refuse
+	// new work instead of starting handlers we would have to drain. It is
+	// guarded by mu so it serialises with connWG.Add inside trackConn.
+	// Shutdown is one-shot: once set, ListenAndServe cannot start again.
+	shuttingDown bool
 }
 
 // AddUser adds or replaces a user entry in the server's user map.
@@ -468,8 +485,54 @@ func NewServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserI
 		users:               cloneUsers(users),
 		signer:              signer,
 		completedUploads:    newCompletedUploadsChannel(completedUploadsSize),
+		activeConns:         make(map[net.Conn]struct{}),
 	}
 	return s
+}
+
+// trackConn records nc as an in-flight handler-owned connection. It returns
+// false when the server has already begun shutting down, in which case the
+// caller must not spawn a handler for nc and is responsible for closing it.
+// On success the caller must call untrackConn(nc) and connWG.Done() exactly
+// once before its handler goroutine returns.
+func (s *server) trackConn(nc net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.shuttingDown {
+		return false
+	}
+	if s.activeConns == nil {
+		s.activeConns = make(map[net.Conn]struct{})
+	}
+	s.activeConns[nc] = struct{}{}
+	s.connWG.Add(1)
+	return true
+}
+
+// untrackConn removes nc from the in-flight set. The corresponding
+// connWG.Done() call is the caller's responsibility so that ordering between
+// "stop tracking" and "decrement waitgroup" is explicit at each call site.
+func (s *server) untrackConn(nc net.Conn) {
+	s.mu.Lock()
+	delete(s.activeConns, nc)
+	s.mu.Unlock()
+}
+
+// forceCloseActiveConns closes every connection still in the active set.
+// Returns the number of connections it closed. Used by Shutdown to evict
+// stragglers when the caller's context deadline fires before handlers have
+// finished on their own.
+func (s *server) forceCloseActiveConns() int {
+	s.mu.Lock()
+	conns := make([]net.Conn, 0, len(s.activeConns))
+	for c := range s.activeConns {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
+	return len(conns)
 }
 
 func newCompletedUploadsChannel(size int) chan CompletedUpload {
@@ -551,14 +614,23 @@ func (s *server) listenFTPData(host string) (net.Listener, error) {
 }
 
 // ListenAndServe starts the SFTP server and, when FTPAddr is non-empty, the FTP
-// server too. It blocks until Close is called or an unexpected listener error
-// occurs. It returns nil when stopped via Close.
+// server too. It blocks until Close or Shutdown is called or an unexpected
+// listener error occurs. It returns nil when stopped via Close or Shutdown.
+//
+// A server that has been Shutdown cannot be reused; ListenAndServe returns
+// an error in that case. Construct a fresh server instead.
 func (s *server) ListenAndServe() error {
 	if strings.TrimSpace(s.Addr) == "" {
 		return errors.New("ironport: Addr is required")
 	}
 	if s.signer == nil {
 		return errors.New("ironport: signer is required")
+	}
+	s.mu.RLock()
+	closed := s.shuttingDown
+	s.mu.RUnlock()
+	if closed {
+		return errors.New("ironport: server has been shut down")
 	}
 	// Hard requirement: the package's containment guarantee relies on
 	// openat2(RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS), available since Linux
@@ -634,7 +706,15 @@ func (s *server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig, uploads chan<
 			continue
 		}
 		backoff = 0
+		if !s.trackConn(nc) {
+			// Shutdown began between Accept returning and tracking; refuse
+			// the connection rather than spawning an untrackable handler.
+			_ = nc.Close()
+			continue
+		}
 		go func() {
+			defer s.connWG.Done()
+			defer s.untrackConn(nc)
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("sftp handler panic from=%s: %v\n%s", nc.RemoteAddr(), r, debug.Stack())
@@ -660,7 +740,13 @@ func (s *server) serveFTP(ln net.Listener, uploads chan<- CompletedUpload) error
 			continue
 		}
 		backoff = 0
+		if !s.trackConn(nc) {
+			_ = nc.Close()
+			continue
+		}
 		go func() {
+			defer s.connWG.Done()
+			defer s.untrackConn(nc)
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("ftp handler panic from=%s: %v\n%s", nc.RemoteAddr(), r, debug.Stack())
@@ -790,6 +876,53 @@ func hasTempExt(name string, tempExts []string) bool {
 // has already returned, is a no-op.
 func (s *server) Close() error {
 	return s.closeListeners()
+}
+
+// Shutdown gracefully stops the server. It closes the listeners so no new
+// connections are accepted, then waits for every in-flight handler goroutine
+// to return.
+//
+// If ctx is canceled or its deadline passes before all handlers finish,
+// Shutdown forcibly closes every remaining tracked connection (which causes
+// each handler's network I/O to fail and the handler to return), waits for
+// those handlers to exit, and returns ctx.Err(). Passing context.Background()
+// blocks until all handlers exit.
+//
+// Shutdown is safe to call concurrently with Close and with itself. After
+// Shutdown returns, ListenAndServe (if it was running) will have returned
+// nil. Calling Shutdown before ListenAndServe has been started, or after it
+// has already returned and all handlers have exited, returns immediately
+// with nil.
+func (s *server) Shutdown(ctx context.Context) error {
+	// Mark the server as shutting down so any accept that races with the
+	// listener close refuses the connection rather than starting a handler
+	// we would then have to drain. Setting this under mu serialises with
+	// trackConn's connWG.Add so the WaitGroup Add/Wait pair is race-free.
+	s.mu.Lock()
+	s.shuttingDown = true
+	s.mu.Unlock()
+	listenerErr := s.closeListeners()
+
+	done := make(chan struct{})
+	go func() {
+		s.connWG.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return listenerErr
+	case <-ctx.Done():
+		n := s.forceCloseActiveConns()
+		if n > 0 {
+			log.Printf("Shutdown: forcing close of %d in-flight connection(s) after deadline", n)
+		}
+		// Wait for handlers to actually return so the WaitGroup is settled
+		// and there are no live goroutines touching server state after
+		// Shutdown returns.
+		<-done
+		return ctx.Err()
+	}
 }
 
 func (s *server) closeListeners() error {
