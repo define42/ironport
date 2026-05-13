@@ -191,6 +191,9 @@ func (j *jailFS) OpenRead(clientPath string) (*os.File, error) {
 // the kernel rejects symlink traversal at all components.
 func (j *jailFS) OpenWrite(clientPath string, flags int, perm os.FileMode) (*os.File, error) {
 	rel := cleanRelClientPath(clientPath)
+	if flags&os.O_CREATE == 0 {
+		perm = 0
+	}
 	fd, err := j.openat(rel, flags, perm)
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: clientPath, Err: err}

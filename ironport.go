@@ -1111,6 +1111,7 @@ type writeLogger struct {
 	clientIP     string
 	uploads      chan<- CompletedUpload
 	tempExts     []string
+	appendMode   bool
 	// mu guards transferErr against the race between TransferError (invoked
 	// asynchronously from the request-server's drain path when the client
 	// connection drops mid-transfer) and Close (invoked from the per-request
@@ -1122,6 +1123,13 @@ type writeLogger struct {
 	// to be poisoned and further error detail would not change the
 	// "do not announce" decision in Close.
 	transferErr error
+}
+
+func (w *writeLogger) WriteAt(p []byte, off int64) (int, error) {
+	if w.appendMode {
+		return w.File.Write(p)
+	}
+	return w.File.WriteAt(p, off)
 }
 
 // TransferError implements pkg/sftp's optional TransferError interface. It is
@@ -1185,7 +1193,11 @@ func (j jail) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	}
 	clientPath := cleanSFTPClientPath(r.Filepath)
 	log.Printf("upload: %q", clientPath)
-	f, err := j.fs.OpenWrite(r.Filepath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	openFlags, appendMode, err := sftpWriteOpenFlags(r)
+	if err != nil {
+		return nil, err
+	}
+	f, err := j.fs.OpenWrite(r.Filepath, openFlags, 0600)
 	if err != nil {
 		return nil, sanitizeSFTPErr(err)
 	}
@@ -1197,7 +1209,30 @@ func (j jail) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		clientIP:     j.clientIP,
 		uploads:      j.uploads,
 		tempExts:     j.tempExts,
+		appendMode:   appendMode,
 	}, nil
+}
+
+func sftpWriteOpenFlags(r *sftp.Request) (int, bool, error) {
+	pflags := r.Pflags()
+	if !pflags.Write && !pflags.Append {
+		return 0, false, os.ErrInvalid
+	}
+
+	openFlags := os.O_WRONLY
+	if pflags.Append {
+		openFlags |= os.O_APPEND
+	}
+	if pflags.Creat {
+		openFlags |= os.O_CREATE
+	}
+	if pflags.Trunc {
+		openFlags |= os.O_TRUNC
+	}
+	if pflags.Excl {
+		openFlags |= os.O_EXCL
+	}
+	return openFlags, pflags.Append, nil
 }
 
 // Filecmd implements sftp.FileCmder.

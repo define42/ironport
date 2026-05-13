@@ -1334,6 +1334,122 @@ func TestSFTPServer_UploadFilePermissions(t *testing.T) {
 	}
 }
 
+func TestSFTPServer_OpenFileAppendHonorsAppendFlag(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "append.txt"), []byte("first"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	f, err := client.OpenFile("/append.txt", os.O_WRONLY|os.O_APPEND)
+	if err != nil {
+		t.Fatalf("OpenFile(O_APPEND): %v", err)
+	}
+	if _, err := f.Write([]byte(" second")); err != nil {
+		_ = f.Close()
+		t.Fatalf("Write append: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close append: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(root, "append.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "first second" {
+		t.Fatalf("append.txt = %q; want %q", got, "first second")
+	}
+}
+
+func TestSFTPServer_OpenFileWriteOnlyDoesNotTruncate(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "plain.txt"), []byte("original"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	f, err := client.OpenFile("/plain.txt", os.O_WRONLY)
+	if err != nil {
+		t.Fatalf("OpenFile(O_WRONLY): %v", err)
+	}
+	if _, err := f.Write([]byte("XY")); err != nil {
+		_ = f.Close()
+		t.Fatalf("Write plain: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close plain: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(root, "plain.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "XYiginal" {
+		t.Fatalf("plain.txt = %q; want %q", got, "XYiginal")
+	}
+}
+
+func TestSFTPServer_OpenFileExclusiveCreateHonorsExcl(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "exists.txt"), []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	if f, err := client.OpenFile("/exists.txt", os.O_WRONLY|os.O_CREATE|os.O_EXCL); err == nil {
+		_ = f.Close()
+		t.Fatal("OpenFile(O_CREATE|O_EXCL) on existing file succeeded; want error")
+	}
+	got, err := os.ReadFile(filepath.Join(root, "exists.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "keep" {
+		t.Fatalf("exists.txt = %q; want %q", got, "keep")
+	}
+
+	f, err := client.OpenFile("/new.txt", os.O_WRONLY|os.O_CREATE|os.O_EXCL)
+	if err != nil {
+		t.Fatalf("OpenFile(O_CREATE|O_EXCL) on missing file: %v", err)
+	}
+	if _, err := f.Write([]byte("new")); err != nil {
+		_ = f.Close()
+		t.Fatalf("Write new: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close new: %v", err)
+	}
+	got, err = os.ReadFile(filepath.Join(root, "new.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "new" {
+		t.Fatalf("new.txt = %q; want %q", got, "new")
+	}
+}
+
 // testClientKey generates a throwaway RSA key pair for use as a client
 // authentication key in tests.  It returns both the signer (private key) and
 // the corresponding public key.
