@@ -504,8 +504,8 @@ func TestNewServer(t *testing.T) {
 	if srv.FTPPassivePortRange != "5000-5010" {
 		t.Errorf("FTPPassivePortRange = %q; want 5000-5010", srv.FTPPassivePortRange)
 	}
-	if len(srv.Users) != 1 {
-		t.Errorf("Users len = %d; want 1", len(srv.Users))
+	if len(srv.users) != 1 {
+		t.Errorf("users len = %d; want 1", len(srv.users))
 	}
 	if srv.Signer != signer {
 		t.Error("Signer not set correctly")
@@ -980,7 +980,7 @@ func TestServer_AddUser_ClonesAuthorizedKeys(t *testing.T) {
 	keys[:2][1] = pubKey2
 
 	srv.mu.RLock()
-	got := srv.Users["alice"]
+	got := srv.users["alice"]
 	srv.mu.RUnlock()
 
 	if len(got.AuthorizedKeys) != 1 {
@@ -1018,7 +1018,7 @@ func TestServer_RemoveAllUsers(t *testing.T) {
 	srv.RemoveAllUsers()
 
 	srv.mu.RLock()
-	n := len(srv.Users)
+	n := len(srv.users)
 	srv.mu.RUnlock()
 	if n != 0 {
 		t.Fatalf("expected no users after RemoveAllUsers, got %d", n)
@@ -1618,7 +1618,7 @@ func TestNewServer_ClonesUsersMapAndAuthorizedKeys(t *testing.T) {
 	keys[:2][1] = pubKey2
 
 	srv.mu.RLock()
-	got, ok := srv.Users["alice"]
+	got, ok := srv.users["alice"]
 	srv.mu.RUnlock()
 
 	if !ok {
@@ -1723,7 +1723,7 @@ func TestServer_AddUserKey_NoDuplicate(t *testing.T) {
 	srv.AddUserKey("carol", pubKey)
 
 	srv.mu.RLock()
-	n := len(srv.Users["carol"].AuthorizedKeys)
+	n := len(srv.users["carol"].AuthorizedKeys)
 	srv.mu.RUnlock()
 
 	if n != 1 {
@@ -1742,7 +1742,7 @@ func TestServer_AddRemoveUserKey_NonExistentUser(t *testing.T) {
 	srv.RemoveUserKey("ghost", pub)
 
 	srv.mu.RLock()
-	_, exists := srv.Users["ghost"]
+	_, exists := srv.users["ghost"]
 	srv.mu.RUnlock()
 
 	if exists {
@@ -1787,7 +1787,7 @@ func TestServer_AddUserKey_NilKey(t *testing.T) {
 	srv.AddUserKey("eve", nil) // must not panic
 
 	srv.mu.RLock()
-	n := len(srv.Users["eve"].AuthorizedKeys)
+	n := len(srv.users["eve"].AuthorizedKeys)
 	srv.mu.RUnlock()
 
 	if n != 1 {
@@ -1812,7 +1812,7 @@ func TestServer_RemoveUserKey_NilEntry(t *testing.T) {
 	srv.RemoveUserKey("frank", pub) // must not panic
 
 	srv.mu.RLock()
-	keys := srv.Users["frank"].AuthorizedKeys
+	keys := srv.users["frank"].AuthorizedKeys
 	srv.mu.RUnlock()
 
 	for _, k := range keys {
@@ -1835,7 +1835,7 @@ func TestServer_RemoveUserKey_NilKey(t *testing.T) {
 	srv.RemoveUserKey("grace", nil) // must not panic
 
 	srv.mu.RLock()
-	n := len(srv.Users["grace"].AuthorizedKeys)
+	n := len(srv.users["grace"].AuthorizedKeys)
 	srv.mu.RUnlock()
 
 	if n != 1 {
@@ -2847,7 +2847,7 @@ func TestFTPSessionAuthenticate_ValidatesJailRoot(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := &ftpSession{
 				server: &server{
-					Users: map[string]UserInfo{
+					users: map[string]UserInfo{
 						"alice": {Password: "alicepw", Root: tc.root, CanRead: true, CanWrite: true},
 					},
 				},

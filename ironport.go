@@ -284,9 +284,9 @@ type server struct {
 	// to a single port or inclusive range such as "5000-5010". Leave it empty
 	// to let the OS choose any available port.
 	FTPPassivePortRange string
-	// Users maps usernames to their credentials and jail roots.
-	Users map[string]UserInfo
-	// mu protects Users, completedUploads, and listeners for concurrent reads and writes.
+	// users maps usernames to their credentials and jail roots.
+	users map[string]UserInfo
+	// mu protects users, completedUploads, and listeners for concurrent reads and writes.
 	mu sync.RWMutex
 	// ln is the active SFTP listener; set by ListenAndServe and closed by Close.
 	ln net.Listener
@@ -339,10 +339,10 @@ type server struct {
 func (s *server) AddUser(username string, info UserInfo) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.Users == nil {
-		s.Users = make(map[string]UserInfo)
+	if s.users == nil {
+		s.users = make(map[string]UserInfo)
 	}
-	s.Users[username] = cloneUserInfo(info)
+	s.users[username] = cloneUserInfo(info)
 }
 
 // RemoveUser removes a user entry from the server's user map.
@@ -351,7 +351,7 @@ func (s *server) AddUser(username string, info UserInfo) {
 func (s *server) RemoveUser(username string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.Users, username)
+	delete(s.users, username)
 }
 
 // RemoveAllUsers removes every user entry from the server's user map.
@@ -360,7 +360,7 @@ func (s *server) RemoveUser(username string) {
 func (s *server) RemoveAllUsers() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	clear(s.Users)
+	clear(s.users)
 }
 
 // AddUserKey appends key to the AuthorizedKeys of an existing user.
@@ -373,7 +373,7 @@ func (s *server) AddUserKey(username string, key ssh.PublicKey) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	u, ok := s.Users[username]
+	u, ok := s.users[username]
 	if !ok {
 		return
 	}
@@ -387,7 +387,7 @@ func (s *server) AddUserKey(username string, key ssh.PublicKey) {
 		}
 	}
 	u.AuthorizedKeys = append(u.AuthorizedKeys, key)
-	s.Users[username] = u
+	s.users[username] = u
 }
 
 // RemoveUserKey removes key from the AuthorizedKeys of an existing user.
@@ -399,7 +399,7 @@ func (s *server) RemoveUserKey(username string, key ssh.PublicKey) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	u, ok := s.Users[username]
+	u, ok := s.users[username]
 	if !ok {
 		return
 	}
@@ -414,7 +414,7 @@ func (s *server) RemoveUserKey(username string, key ssh.PublicKey) {
 		}
 	}
 	u.AuthorizedKeys = filtered
-	s.Users[username] = u
+	s.users[username] = u
 }
 
 // NewServer creates a new server with the given SFTP address, FTP address,
@@ -432,7 +432,7 @@ func NewServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserI
 		Addr:                addr,
 		FTPAddr:             ftpAddr,
 		FTPPassivePortRange: ftpPassivePortRange,
-		Users:               cloneUsers(users),
+		users:               cloneUsers(users),
 		Signer:              signer,
 		completedUploads:    newCompletedUploadsChannel(completedUploadsSize),
 	}
@@ -819,7 +819,7 @@ func (s *server) sshServerConfig() *ssh.ServerConfig {
 		PublicKeyAuthAlgorithms: algorithms.PublicKeyAuthAlgorithms,
 		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
 			s.mu.RLock()
-			u, ok := s.Users[c.User()]
+			u, ok := s.users[c.User()]
 			s.mu.RUnlock()
 			// Compare SHA-256 hashes of both passwords so that the comparison
 			// always operates on the same 32-byte length regardless of whether
@@ -851,7 +851,7 @@ func (s *server) sshServerConfig() *ssh.ServerConfig {
 		},
 		PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			s.mu.RLock()
-			u, ok := s.Users[c.User()]
+			u, ok := s.users[c.User()]
 			s.mu.RUnlock()
 			keyBytes := key.Marshal()
 			// Hash the presented key's wire-format bytes to a fixed 32-byte
@@ -1610,7 +1610,7 @@ func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
 
 func (f *ftpSession) authenticate(pass string) bool {
 	f.server.mu.RLock()
-	u, ok := f.server.Users[f.username]
+	u, ok := f.server.users[f.username]
 	f.server.mu.RUnlock()
 
 	var storedPw string
