@@ -2334,6 +2334,29 @@ func TestHasTempExt(t *testing.T) {
 	}
 }
 
+func TestCleanSFTPClientPath(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"/upload.txt", "/upload.txt"},
+		{"upload.txt", "/upload.txt"},
+		{"foo.txt", "/foo.txt"},
+		{"/a/../b.txt", "/b.txt"},
+		{"../../etc/passwd", "/etc/passwd"},
+		{"/a/b/../c", "/a/c"},
+		{"", "/"},
+		{".", "/"},
+		{"/", "/"},
+		{"//double//slash", "/double/slash"},
+	}
+	for _, c := range cases {
+		if got := cleanSFTPClientPath(c.in); got != c.want {
+			t.Errorf("cleanSFTPClientPath(%q) = %q; want %q", c.in, got, c.want)
+		}
+	}
+}
+
 // TestServer_TempExtensionsNormalisation verifies that TempExtensions are
 // normalised (lower-cased, dot-prefixed, empty entries stripped) before use.
 func TestServer_TempExtensionsNormalisation(t *testing.T) {

@@ -578,6 +578,16 @@ func (s *Server) allowChown() bool {
 	return s.AllowChown
 }
 
+// cleanSFTPClientPath normalises a raw SFTP client path into an absolute,
+// slash-separated, clean path that starts with "/". This mirrors the
+// normalisation that FTP sessions apply via cleanPath so that event consumers
+// always receive a consistent FilePath value regardless of how the client
+// formatted the request (e.g. "foo.txt", "../../etc/passwd", "/a/../b.txt").
+func cleanSFTPClientPath(p string) string {
+	p = filepath.ToSlash(p)
+	return path.Clean("/" + strings.TrimPrefix(p, "/"))
+}
+
 // hasTempExt reports whether name ends with one of the given (already
 // normalised, lower-case, dot-prefixed) extensions. Matching is
 // case-insensitive on the filename.
@@ -1080,11 +1090,12 @@ func (j jail) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	if !j.canWrite {
 		return nil, os.ErrPermission
 	}
+	clientPath := cleanSFTPClientPath(r.Filepath)
 	p, err := j.resolve(r.Filepath)
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("upload: %q", r.Filepath)
+	log.Printf("upload: %q", clientPath)
 	// Create/overwrite
 	f, err := openFileNoFollow(p, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
@@ -1092,7 +1103,7 @@ func (j jail) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	}
 	return &writeLogger{
 		File:         f,
-		filepath:     r.Filepath,
+		filepath:     clientPath,
 		fullFilepath: p,
 		username:     j.username,
 		clientIP:     j.clientIP,
@@ -1129,18 +1140,20 @@ func (j jail) Filecmd(r *sftp.Request) error {
 		// If a file with a "still being written" extension is renamed to a
 		// final (non-temp) name, treat the rename as the moment the upload
 		// completes and announce the new SFTP path on uploads.
-		if hasTempExt(r.Filepath, j.tempExts) && !hasTempExt(r.Target, j.tempExts) {
-			log.Printf("upload complete via rename: %q -> %q", r.Filepath, r.Target)
+		oldClientPath := cleanSFTPClientPath(r.Filepath)
+		newClientPath := cleanSFTPClientPath(r.Target)
+		if hasTempExt(oldClientPath, j.tempExts) && !hasTempExt(newClientPath, j.tempExts) {
+			log.Printf("upload complete via rename: %q -> %q", oldClientPath, newClientPath)
 			evt := CompletedUpload{
 				Username:     j.username,
 				FullFilePath: newP,
-				FilePath:     r.Target,
+				FilePath:     newClientPath,
 				ClientIP:     j.clientIP,
 			}
 			select {
 			case j.uploads <- evt:
 			default:
-				log.Printf("upload complete: CompletedUploads queue full, notification for %q dropped", r.Target)
+				log.Printf("upload complete: CompletedUploads queue full, notification for %q dropped", newClientPath)
 			}
 		}
 		return nil
