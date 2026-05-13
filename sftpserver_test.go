@@ -798,7 +798,10 @@ func TestServer_AddUser_ClonesAuthorizedKeys(t *testing.T) {
 	})
 
 	keys[0] = pubKey2
-	keys[:2][1] = pubKey2
+	keys = append(keys, pubKey2)
+	if len(keys) != 2 {
+		t.Fatalf("keys length = %d; want 2", len(keys))
+	}
 
 	srv.mu.RLock()
 	got := srv.Users["alice"]
@@ -1437,7 +1440,10 @@ func TestNewServer_ClonesUsersMapAndAuthorizedKeys(t *testing.T) {
 	users["alice"] = UserInfo{Password: "pw2", Root: root}
 	delete(users, "alice")
 	keys[0] = pubKey2
-	keys[:2][1] = pubKey2
+	keys = append(keys, pubKey2)
+	if len(keys) != 2 {
+		t.Fatalf("keys length = %d; want 2", len(keys))
+	}
 
 	srv.mu.RLock()
 	got, ok := srv.Users["alice"]
