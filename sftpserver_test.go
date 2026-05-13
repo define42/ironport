@@ -782,6 +782,36 @@ func TestServer_AddUser_Replace(t *testing.T) {
 	_ = dialSFTP(t, addr, "user1", "newpw")
 }
 
+func TestServer_AddUser_ClonesAuthorizedKeys(t *testing.T) {
+	root := t.TempDir()
+	_, pubKey1 := testClientKey(t)
+	_, pubKey2 := testClientKey(t)
+	keys := make([]ssh.PublicKey, 1, 2)
+	keys[0] = pubKey1
+
+	srv := NewServer(":0", "", "", map[string]UserInfo{}, testSigner(t), defaultCompletedUploadsSize)
+	srv.AddUser("alice", UserInfo{
+		Password:       "pw",
+		AuthorizedKeys: keys,
+		Root:           root,
+		CanRead:        true,
+	})
+
+	keys[0] = pubKey2
+	keys = append(keys, pubKey2)
+
+	srv.mu.RLock()
+	got := srv.Users["alice"]
+	srv.mu.RUnlock()
+
+	if len(got.AuthorizedKeys) != 1 {
+		t.Fatalf("AuthorizedKeys length = %d; want 1", len(got.AuthorizedKeys))
+	}
+	if !bytes.Equal(got.AuthorizedKeys[0].Marshal(), pubKey1.Marshal()) {
+		t.Fatal("server stored AuthorizedKeys slice aliases caller-owned storage")
+	}
+}
+
 // TestServer_RemoveAllUsers verifies that RemoveAllUsers blocks future logins
 // without deleting any on-disk data in the users' roots.
 func TestServer_RemoveAllUsers(t *testing.T) {
@@ -1384,6 +1414,46 @@ func TestSFTPServer_PublicKeyAuth_RejectsInvalidJailRoot(t *testing.T) {
 				t.Fatalf("PublicKeyCallback returned nil error with permissions %+v", perms)
 			}
 		})
+	}
+}
+
+func TestNewServer_ClonesUsersMapAndAuthorizedKeys(t *testing.T) {
+	root := t.TempDir()
+	_, pubKey1 := testClientKey(t)
+	_, pubKey2 := testClientKey(t)
+	keys := make([]ssh.PublicKey, 1, 2)
+	keys[0] = pubKey1
+	users := map[string]UserInfo{
+		"alice": {
+			Password:       "pw1",
+			AuthorizedKeys: keys,
+			Root:           root,
+			CanRead:        true,
+		},
+	}
+
+	srv := NewServer(":0", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+
+	users["alice"] = UserInfo{Password: "pw2", Root: root}
+	delete(users, "alice")
+	keys[0] = pubKey2
+	keys = append(keys, pubKey2)
+
+	srv.mu.RLock()
+	got, ok := srv.Users["alice"]
+	srv.mu.RUnlock()
+
+	if !ok {
+		t.Fatal("server user map aliases caller-owned map")
+	}
+	if got.Password != "pw1" {
+		t.Fatalf("stored password = %q; want %q", got.Password, "pw1")
+	}
+	if len(got.AuthorizedKeys) != 1 {
+		t.Fatalf("AuthorizedKeys length = %d; want 1", len(got.AuthorizedKeys))
+	}
+	if !bytes.Equal(got.AuthorizedKeys[0].Marshal(), pubKey1.Marshal()) {
+		t.Fatal("server AuthorizedKeys slice aliases caller-owned storage")
 	}
 }
 

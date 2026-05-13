@@ -151,6 +151,24 @@ type UserInfo struct {
 	CanWrite       bool            // allow write/upload/delete/rename operations
 }
 
+func cloneUserInfo(u UserInfo) UserInfo {
+	if u.AuthorizedKeys != nil {
+		u.AuthorizedKeys = append([]ssh.PublicKey(nil), u.AuthorizedKeys...)
+	}
+	return u
+}
+
+func cloneUsers(users map[string]UserInfo) map[string]UserInfo {
+	if users == nil {
+		return nil
+	}
+	cloned := make(map[string]UserInfo, len(users))
+	for username, info := range users {
+		cloned[username] = cloneUserInfo(info)
+	}
+	return cloned
+}
+
 // CompletedUpload describes a file upload that has finished successfully.
 // It is the payload delivered on Server.CompletedUploads.
 type CompletedUpload struct {
@@ -251,7 +269,7 @@ func (s *Server) AddUser(username string, info UserInfo) {
 	if s.Users == nil {
 		s.Users = make(map[string]UserInfo)
 	}
-	s.Users[username] = info
+	s.Users[username] = cloneUserInfo(info)
 }
 
 // RemoveUser removes a user entry from the server's user map.
@@ -341,7 +359,7 @@ func NewServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserI
 		Addr:                 addr,
 		FTPAddr:              ftpAddr,
 		FTPPassivePortRange:  ftpPassivePortRange,
-		Users:                users,
+		Users:                cloneUsers(users),
 		Signer:               signer,
 		CompletedUploadsSize: completedUploadsSize,
 	}
