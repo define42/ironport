@@ -2931,6 +2931,66 @@ func TestFTPErrMsg(t *testing.T) {
 	}
 }
 
+func TestSanitizeSFTPErr(t *testing.T) {
+	cases := []struct {
+		name    string
+		err     error
+		wantIs  error
+		wantMsg string
+	}{
+		{
+			name:    "not exist path error",
+			err:     &os.PathError{Op: "open", Path: "/srv/sftp/alice/missing.txt", Err: os.ErrNotExist},
+			wantIs:  os.ErrNotExist,
+			wantMsg: "file does not exist",
+		},
+		{
+			name:    "permission path error",
+			err:     &os.PathError{Op: "stat", Path: "/srv/sftp/alice/secret.txt", Err: os.ErrPermission},
+			wantIs:  os.ErrPermission,
+			wantMsg: "permission denied",
+		},
+		{
+			name:    "not a directory",
+			err:     &os.PathError{Op: "opendir", Path: "/srv/sftp/alice/file", Err: syscall.ENOTDIR},
+			wantIs:  syscall.ENOTDIR,
+			wantMsg: "not a directory",
+		},
+		{
+			name:    "is a directory",
+			err:     &os.PathError{Op: "open", Path: "/srv/sftp/alice/dir", Err: syscall.EISDIR},
+			wantIs:  syscall.EISDIR,
+			wantMsg: "is a directory",
+		},
+		{
+			name:    "directory not empty",
+			err:     &os.PathError{Op: "remove", Path: "/srv/sftp/alice/dir", Err: syscall.ENOTEMPTY},
+			wantIs:  syscall.ENOTEMPTY,
+			wantMsg: "directory not empty",
+		},
+		{
+			name:    "unknown path error",
+			err:     &os.PathError{Op: "open", Path: "/srv/sftp/alice/secret.txt", Err: syscall.EIO},
+			wantIs:  errSFTPRequestFailed,
+			wantMsg: "request failed",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeSFTPErr(tc.err)
+			if !errors.Is(got, tc.wantIs) {
+				t.Fatalf("sanitizeSFTPErr(%v) = %v; want errors.Is(..., %v)", tc.err, got, tc.wantIs)
+			}
+			if got.Error() != tc.wantMsg {
+				t.Fatalf("sanitizeSFTPErr(%v) message = %q; want %q", tc.err, got.Error(), tc.wantMsg)
+			}
+			if strings.Contains(got.Error(), "/srv/sftp/alice") {
+				t.Fatalf("sanitizeSFTPErr(%v) leaked path in message %q", tc.err, got.Error())
+			}
+		})
+	}
+}
+
 type stubListener struct {
 	conn net.Conn
 }
