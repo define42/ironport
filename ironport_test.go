@@ -226,7 +226,6 @@ func startTestServer(t *testing.T, users map[string]UserInfo, configure ...func(
 			fn(srv)
 		}
 	}
-	srv.initCompletedUploads()
 	cfg := srv.sshServerConfig()
 
 	go func() {
@@ -620,16 +619,16 @@ func TestSFTPServer_PublicKeyAuthAlgorithmPinning(t *testing.T) {
 	}
 }
 
-// TestCompletedUploadsSize verifies that CompletedUploadsSize controls the
-// buffer capacity of the CompletedUploads channel.
-func TestCompletedUploadsSize(t *testing.T) {
+// TestCompletedUploadsBufferSize verifies that NewServer controls the buffer
+// capacity of the CompletedUploads channel.
+func TestCompletedUploadsBufferSize(t *testing.T) {
 	signer := testSigner(t)
 	users := map[string]UserInfo{
 		"u": {Password: "pw", Root: t.TempDir(), CanWrite: true},
 	}
 
-	// Default capacity: zero CompletedUploadsSize selects defaultCompletedUploadsSize.
-	srv := NewServer(":0", "", "", users, signer, defaultCompletedUploadsSize)
+	// Default capacity: a non-positive constructor value selects defaultCompletedUploadsSize.
+	srv := NewServer(":0", "", "", users, signer, 0)
 	if cap(srv.CompletedUploads()) != defaultCompletedUploadsSize {
 		t.Errorf("default cap = %d; want %d", cap(srv.CompletedUploads()), defaultCompletedUploadsSize)
 	}
@@ -640,21 +639,8 @@ func TestCompletedUploadsSize(t *testing.T) {
 		t.Errorf("custom cap via NewServer = %d; want 256", cap(srv2.CompletedUploads()))
 	}
 
-	// Internal direct initialization still honors CompletedUploadsSize.
-	custom := &server{CompletedUploadsSize: 128}
-	if cap(custom.CompletedUploads()) != 128 {
-		t.Errorf("custom cap = %d; want 128", cap(custom.CompletedUploads()))
-	}
-
-	// initCompletedUploads is idempotent: an already-set channel is not replaced.
-	existing := make(chan CompletedUpload, 7)
-	srv3 := &server{completedUploads: existing, CompletedUploadsSize: 999}
-	srv3.initCompletedUploads()
-	if srv3.completedUploadsChan() != existing {
-		t.Error("initCompletedUploads replaced an already-set channel")
-	}
-	if cap(srv3.CompletedUploads()) != 7 {
-		t.Errorf("cap after idempotent init = %d; want 7", cap(srv3.CompletedUploads()))
+	if srv2.completedUploadsChan() != srv2.completedUploads {
+		t.Error("completedUploadsChan did not return the server upload channel")
 	}
 }
 
@@ -1165,7 +1151,6 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 	addr := ln.Addr().String()
 
 	srv := NewServer(addr, "", "", users, signer, defaultCompletedUploadsSize)
-	srv.initCompletedUploads()
 	cfg := srv.sshServerConfig()
 
 	go func() {
@@ -2523,7 +2508,6 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 	}
 	signer := testSigner(t)
 	srv := NewServer("127.0.0.1:0", "", "", users, signer, defaultCompletedUploadsSize)
-	srv.initCompletedUploads()
 	cfg := srv.sshServerConfig()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

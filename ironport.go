@@ -62,8 +62,8 @@ const (
 	// suppresses the CompletedUpload notification for a STOR/APPE that did
 	// not finish cleanly.
 	ftpDataIdleTimeout = 5 * time.Minute
-	// defaultCompletedUploadsSize is the buffer size used for the
-	// CompletedUploads channel when server.CompletedUploadsSize is zero.
+	// defaultCompletedUploadsSize is the fallback buffer size used for the
+	// CompletedUploads channel.
 	defaultCompletedUploadsSize = 64
 	// authorizedKeyTimingPad is the minimum number of constant-time key
 	// comparisons performed by the public-key auth callback. Users with
@@ -302,12 +302,6 @@ type server struct {
 	// completedUploads receives upload notifications. Use CompletedUploads to
 	// access it as a receive-only stream.
 	completedUploads chan CompletedUpload
-	// CompletedUploadsSize controls the buffer capacity of the
-	// CompletedUploads channel. It is set automatically by the
-	// completedUploadsSize argument of NewServer. ListenAndServe will
-	// initialize the channel with this capacity when needed. A value of zero
-	// selects the package default (64); negative values are treated as zero.
-	CompletedUploadsSize int
 	// TempExtensions is an optional list of file extensions (each beginning
 	// with a leading dot, e.g. ".tmp", ".writing") that mark files as still
 	// being written and therefore not yet "complete".
@@ -435,32 +429,21 @@ func (s *server) RemoveUserKey(username string, key ssh.PublicKey) {
 //	srv := ironport.NewServer(":2022", "", "", users, signer, 256)
 func NewServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserInfo, signer ssh.Signer, completedUploadsSize int) *server {
 	s := &server{
-		Addr:                 addr,
-		FTPAddr:              ftpAddr,
-		FTPPassivePortRange:  ftpPassivePortRange,
-		Users:                cloneUsers(users),
-		Signer:               signer,
-		CompletedUploadsSize: completedUploadsSize,
+		Addr:                addr,
+		FTPAddr:             ftpAddr,
+		FTPPassivePortRange: ftpPassivePortRange,
+		Users:               cloneUsers(users),
+		Signer:              signer,
+		completedUploads:    newCompletedUploadsChannel(completedUploadsSize),
 	}
-	s.initCompletedUploads()
 	return s
 }
 
-// initCompletedUploads creates the CompletedUploads channel when it has not
-// already been set by the caller. The buffer capacity is taken from
-// CompletedUploadsSize; a zero or negative value falls back to
-// defaultCompletedUploadsSize.
-func (s *server) initCompletedUploads() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.completedUploads != nil {
-		return
-	}
-	size := s.CompletedUploadsSize
+func newCompletedUploadsChannel(size int) chan CompletedUpload {
 	if size <= 0 {
 		size = defaultCompletedUploadsSize
 	}
-	s.completedUploads = make(chan CompletedUpload, size)
+	return make(chan CompletedUpload, size)
 }
 
 func (s *server) completedUploadsChan() chan CompletedUpload {
@@ -477,7 +460,6 @@ func (s *server) completedUploadsChan() chan CompletedUpload {
 // The buffer capacity is set by the completedUploadsSize argument of
 // NewServer. A non-positive value falls back to the package default (64).
 func (s *server) CompletedUploads() <-chan CompletedUpload {
-	s.initCompletedUploads()
 	return s.completedUploadsChan()
 }
 
@@ -552,7 +534,6 @@ func (s *server) ListenAndServe() error {
 	if err := ensureOpenat2(); err != nil {
 		return fmt.Errorf("ironport: %w", err)
 	}
-	s.initCompletedUploads()
 	uploads := s.completedUploadsChan()
 	cfg := s.sshServerConfig()
 
