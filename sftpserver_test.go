@@ -92,6 +92,49 @@ func TestJailResolve(t *testing.T) {
 	}
 }
 
+func TestJailResolveRejectsBrokenSymlink(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(filepath.Join(outside, "missing.txt"), link); err != nil {
+		t.Skipf("creating symlink: %v", err)
+	}
+
+	j := jail{root: root}
+	_, err := j.resolve("/link")
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("resolve(/link) error = %v; want permission denied", err)
+	}
+}
+
+func TestJailFilewriteRejectsBrokenSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	outsideTarget := filepath.Join(outside, "newfile.txt")
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(outsideTarget, link); err != nil {
+		t.Skipf("creating symlink: %v", err)
+	}
+
+	j := jail{
+		root:     root,
+		username: "testuser",
+		clientIP: "127.0.0.1",
+		canWrite: true,
+		uploads:  make(chan CompletedUpload, 1),
+	}
+	_, err := j.Filewrite(&sftp.Request{Filepath: "/link"})
+	if err == nil {
+		t.Fatalf("Filewrite to broken symlink succeeded; want permission denied")
+	}
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("Filewrite error = %v; want permission denied", err)
+	}
+	if _, err := os.Stat(outsideTarget); !os.IsNotExist(err) {
+		t.Fatalf("outside target was created or stat failed unexpectedly: %v", err)
+	}
+}
+
 // ---- integration test: full SFTP upload / download / list ----
 
 // testSigner creates a throwaway RSA host key for tests.
