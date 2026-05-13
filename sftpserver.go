@@ -67,11 +67,16 @@ type idleConn struct {
 	timeoutNs atomic.Int64
 }
 
+func (c *idleConn) setReadDeadline(t time.Time) {
+	conn := c.Conn
+	_ = conn.SetReadDeadline(t)
+}
+
 func (c *idleConn) Read(b []byte) (int, error) {
 	if d := time.Duration(c.timeoutNs.Load()); d > 0 {
-		_ = c.SetReadDeadline(time.Now().Add(d))
+		c.setReadDeadline(time.Now().Add(d))
 	} else {
-		_ = c.SetReadDeadline(time.Time{})
+		c.setReadDeadline(time.Time{})
 	}
 	return c.Conn.Read(b)
 }
