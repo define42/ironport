@@ -132,6 +132,7 @@ func startTestServer(t *testing.T, users map[string]UserInfo, configure ...func(
 			fn(srv)
 		}
 	}
+	srv.initCompletedUploads()
 	cfg := srv.sshServerConfig()
 
 	go func() {
@@ -415,6 +416,39 @@ func TestNewServer(t *testing.T) {
 	}
 	if srv.Signer != signer {
 		t.Error("Signer not set correctly")
+	}
+}
+
+// TestCompletedUploadsSize verifies that CompletedUploadsSize controls the
+// buffer capacity of the CompletedUploads channel.
+func TestCompletedUploadsSize(t *testing.T) {
+	signer := testSigner(t)
+	users := map[string]UserInfo{
+		"u": {Password: "pw", Root: t.TempDir(), CanWrite: true},
+	}
+
+	// Default capacity: zero CompletedUploadsSize selects defaultCompletedUploadsSize.
+	srv := NewServer(":0", "", "", users, signer)
+	if cap(srv.CompletedUploads) != defaultCompletedUploadsSize {
+		t.Errorf("default cap = %d; want %d", cap(srv.CompletedUploads), defaultCompletedUploadsSize)
+	}
+
+	// Custom capacity via struct literal + initCompletedUploads (bypasses NewServer).
+	custom := &Server{CompletedUploadsSize: 128}
+	custom.initCompletedUploads()
+	if cap(custom.CompletedUploads) != 128 {
+		t.Errorf("custom cap = %d; want 128", cap(custom.CompletedUploads))
+	}
+
+	// initCompletedUploads is idempotent: an already-set channel is not replaced.
+	existing := make(chan CompletedUpload, 7)
+	srv2 := &Server{CompletedUploads: existing, CompletedUploadsSize: 999}
+	srv2.initCompletedUploads()
+	if srv2.CompletedUploads != existing {
+		t.Error("initCompletedUploads replaced an already-set channel")
+	}
+	if cap(srv2.CompletedUploads) != 7 {
+		t.Errorf("cap after idempotent init = %d; want 7", cap(srv2.CompletedUploads))
 	}
 }
 
@@ -859,6 +893,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 	addr := ln.Addr().String()
 
 	srv := NewServer(addr, "", "", users, signer)
+	srv.initCompletedUploads()
 	cfg := srv.sshServerConfig()
 
 	go func() {
@@ -1997,6 +2032,7 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 	}
 	signer := testSigner(t)
 	srv := NewServer("127.0.0.1:0", "", "", users, signer)
+	srv.initCompletedUploads()
 	cfg := srv.sshServerConfig()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

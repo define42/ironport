@@ -53,6 +53,9 @@ const (
 	// bytes (including the CRLF terminator). Longer commands are rejected to
 	// prevent unbounded memory growth from malicious clients.
 	ftpMaxControlLineLen = 4096
+	// defaultCompletedUploadsSize is the buffer size used for the
+	// CompletedUploads channel when Server.CompletedUploadsSize is zero.
+	defaultCompletedUploadsSize = 64
 )
 
 // errFTPLineTooLong is returned when an FTP client sends a control-channel
@@ -185,7 +188,27 @@ type Server struct {
 	// without error). The channel is buffered; sends are non-blocking so a
 	// slow consumer never stalls an upload. Callers should drain the
 	// channel continuously.
+	//
+	// NewServer always initialises this field. The default buffer size is 64;
+	// to use a different capacity, replace this field with a channel of the
+	// desired size before starting a consumer goroutine or calling
+	// ListenAndServe.
+	//
+	// When a Server is constructed via a struct literal rather than NewServer,
+	// set CompletedUploadsSize and leave this field nil — ListenAndServe will
+	// initialise it automatically using that size.
 	CompletedUploads chan CompletedUpload
+	// CompletedUploadsSize controls the buffer capacity of the
+	// CompletedUploads channel. It is only consulted when ListenAndServe (or
+	// initCompletedUploads) initialises the channel because CompletedUploads
+	// is nil at that point. A value of zero selects the package default (64);
+	// negative values are treated as zero.
+	//
+	// When using NewServer, the channel is created during construction with
+	// the default capacity. To change the capacity, replace the
+	// CompletedUploads field with a channel of the desired size before calling
+	// ListenAndServe.
+	CompletedUploadsSize int
 	// TempExtensions is an optional list of file extensions (each beginning
 	// with a leading dot, e.g. ".tmp", ".writing") that mark files as still
 	// being written and therefore not yet "complete".
@@ -305,15 +328,36 @@ func (s *Server) RemoveUserKey(username string, key ssh.PublicKey) {
 // optional FTP passive data port range, user map, and host key. Pass ftpAddr as
 // "" to disable FTP. Leave ftpPassivePortRange empty to use OS-assigned passive
 // data ports.
+//
+// NewServer initialises CompletedUploads with a buffer of defaultCompletedUploadsSize
+// (64). To use a different buffer capacity, replace the CompletedUploads field
+// with a channel of the desired size before starting a consumer goroutine or
+// calling ListenAndServe.
 func NewServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserInfo, signer ssh.Signer) *Server {
-	return &Server{
+	s := &Server{
 		Addr:                addr,
 		FTPAddr:             ftpAddr,
 		FTPPassivePortRange: ftpPassivePortRange,
 		Users:               users,
 		Signer:              signer,
-		CompletedUploads:    make(chan CompletedUpload, 64),
 	}
+	s.initCompletedUploads()
+	return s
+}
+
+// initCompletedUploads creates the CompletedUploads channel when it has not
+// already been set by the caller. The buffer capacity is taken from
+// CompletedUploadsSize; a zero or negative value falls back to
+// defaultCompletedUploadsSize.
+func (s *Server) initCompletedUploads() {
+	if s.CompletedUploads != nil {
+		return
+	}
+	size := s.CompletedUploadsSize
+	if size <= 0 {
+		size = defaultCompletedUploadsSize
+	}
+	s.CompletedUploads = make(chan CompletedUpload, size)
 }
 
 func parseFTPPassivePortRange(portRange string) (start, end int, err error) {
@@ -374,6 +418,7 @@ func (s *Server) listenFTPData(host string) (net.Listener, error) {
 // server too. It blocks until Close is called or an unexpected listener error
 // occurs. It returns nil when stopped via Close.
 func (s *Server) ListenAndServe() error {
+	s.initCompletedUploads()
 	cfg := s.sshServerConfig()
 
 	sftpLn, err := net.Listen("tcp", s.Addr)

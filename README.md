@@ -58,6 +58,39 @@ func main() {
 }
 ```
 
+### Configuring the upload-notification buffer size
+
+`NewServer` creates `CompletedUploads` with a buffer of 64. To use a different
+capacity, replace the field with a channel of the desired size **before**
+starting the consumer goroutine:
+
+```go
+srv := sftpserver.NewServer(":2022", "", "", users, signer)
+srv.CompletedUploads = make(chan sftpserver.CompletedUpload, 256)
+
+go func() {
+    for ev := range srv.CompletedUploads {
+        // handle ev
+    }
+}()
+
+log.Fatal(srv.ListenAndServe())
+```
+
+When constructing a `Server` via a struct literal instead of `NewServer`,
+set `CompletedUploadsSize` and leave `CompletedUploads` nil — `ListenAndServe`
+will initialise the channel automatically with that capacity:
+
+```go
+srv := &sftpserver.Server{
+    Addr:                 ":2022",
+    Signer:               signer,
+    Users:                users,
+    CompletedUploadsSize: 256,
+}
+log.Fatal(srv.ListenAndServe())
+```
+
 ## FTP support (plaintext, opt-in)
 
 This package also exposes a passive-mode FTP listener that shares the SFTP
