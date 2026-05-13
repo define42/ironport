@@ -27,7 +27,7 @@ jobs:
           check-latest: true
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
         with:
           # Pin to a known-good major version of golangci-lint so the lint
           # rules don't silently change underneath us. The default linter
