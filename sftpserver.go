@@ -888,6 +888,17 @@ func (j jail) resolve(p string) (string, error) {
 		// the jail. Return a canonical path under the resolved ancestor so that
 		// create operations cannot traverse a previously encountered symlink.
 		if os.IsNotExist(err) {
+			st, lerr := os.Lstat(next)
+			if lerr == nil {
+				if st.Mode()&os.ModeSymlink != 0 {
+					return "", os.ErrPermission
+				}
+				return "", err
+			}
+			if !os.IsNotExist(lerr) {
+				return "", lerr
+			}
+
 			rest := []string{next}
 			rest = append(rest, parts[i+1:]...)
 			candidate := filepath.Join(rest...)
@@ -988,7 +999,7 @@ func (j jail) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	}
 	log.Printf("upload: %q", r.Filepath)
 	// Create/overwrite
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	f, err := openFileNoFollow(p, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -1858,7 +1869,7 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 		flags |= os.O_TRUNC
 	}
 
-	file, err := os.OpenFile(full, flags, 0600)
+	file, err := openFileNoFollow(full, flags, 0600)
 	if err != nil {
 		f.restartOffset = 0
 		_ = f.reply(550, ftpErrMsg(err))
