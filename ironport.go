@@ -292,8 +292,8 @@ type server struct {
 	ln net.Listener
 	// ftpLn is the active FTP listener; set by ListenAndServe and closed by Close.
 	ftpLn net.Listener
-	// Signer is the host key used for the SSH handshake.
-	Signer ssh.Signer
+	// signer is the host key used for the SSH handshake.
+	signer ssh.Signer
 	// SSHAlgorithms optionally pins SSH negotiation and public-key auth
 	// signature algorithms. Leave fields nil to use golang.org/x/crypto/ssh
 	// defaults. Set before ListenAndServe; changes after startup do not affect
@@ -433,7 +433,7 @@ func NewServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserI
 		FTPAddr:             ftpAddr,
 		FTPPassivePortRange: ftpPassivePortRange,
 		users:               cloneUsers(users),
-		Signer:              signer,
+		signer:              signer,
 		completedUploads:    newCompletedUploadsChannel(completedUploadsSize),
 	}
 	return s
@@ -524,8 +524,8 @@ func (s *server) ListenAndServe() error {
 	if strings.TrimSpace(s.Addr) == "" {
 		return errors.New("ironport: Addr is required")
 	}
-	if s.Signer == nil {
-		return errors.New("ironport: Signer is required")
+	if s.signer == nil {
+		return errors.New("ironport: signer is required")
 	}
 	// Hard requirement: the package's containment guarantee relies on
 	// openat2(RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS), available since Linux
@@ -895,7 +895,7 @@ func (s *server) sshServerConfig() *ssh.ServerConfig {
 			return permissionsFor(u, c.User(), jailRoot), nil
 		},
 	}
-	cfg.AddHostKey(s.Signer)
+	cfg.AddHostKey(s.signer)
 	return cfg
 }
 

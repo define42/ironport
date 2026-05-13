@@ -507,8 +507,8 @@ func TestNewServer(t *testing.T) {
 	if len(srv.users) != 1 {
 		t.Errorf("users len = %d; want 1", len(srv.users))
 	}
-	if srv.Signer != signer {
-		t.Error("Signer not set correctly")
+	if srv.signer != signer {
+		t.Error("signer not set correctly")
 	}
 }
 
@@ -2410,7 +2410,7 @@ func TestServer_Close_BeforeListenAndServe(t *testing.T) {
 // error immediately when Addr is empty or blank without opening any listener.
 func TestServer_ListenAndServe_EmptyAddr(t *testing.T) {
 	for _, addr := range []string{"", "   ", "\t"} {
-		srv := &server{Addr: addr, Signer: testSigner(t)}
+		srv := &server{Addr: addr, signer: testSigner(t)}
 		err := srv.ListenAndServe()
 		if err == nil {
 			t.Errorf("addr=%q: expected error, got nil", addr)
@@ -2424,14 +2424,14 @@ func TestServer_ListenAndServe_EmptyAddr(t *testing.T) {
 }
 
 // TestServer_ListenAndServe_NilSigner verifies that ListenAndServe returns an
-// error immediately when Signer is nil without opening any listener.
+// error immediately when signer is nil without opening any listener.
 func TestServer_ListenAndServe_NilSigner(t *testing.T) {
 	srv := &server{Addr: ":0"}
 	err := srv.ListenAndServe()
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	const want = "ironport: Signer is required"
+	const want = "ironport: signer is required"
 	if err.Error() != want {
 		t.Errorf("got %q; want %q", err.Error(), want)
 	}
