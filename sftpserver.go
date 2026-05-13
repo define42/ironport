@@ -68,6 +68,10 @@ const (
 // command that exceeds ftpMaxControlLineLen bytes.
 var errFTPLineTooLong = errors.New("ftp control line too long")
 
+// errSFTPRequestFailed is returned to SFTP clients for unknown backend errors
+// so internal paths and server details are not exposed.
+var errSFTPRequestFailed = errors.New("request failed")
+
 // idleConn wraps a net.Conn and resets the read deadline before each Read so
 // that a connection is closed when no data has been received within the
 // configured idle timeout. A timeout of zero disables the deadline.
@@ -125,6 +129,30 @@ func ftpErrMsg(err error) string {
 		return "file exists"
 	}
 	return "request failed"
+}
+
+// sanitizeSFTPErr maps backend filesystem errors to safe, path-free sentinel
+// errors before they are returned to SFTP clients.
+func sanitizeSFTPErr(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, syscall.ENOTEMPTY):
+		return syscall.ENOTEMPTY
+	case errors.Is(err, syscall.EISDIR):
+		return syscall.EISDIR
+	case errors.Is(err, syscall.ENOTDIR):
+		return syscall.ENOTDIR
+	case errors.Is(err, syscall.EINVAL):
+		return syscall.EINVAL
+	case errors.Is(err, os.ErrNotExist):
+		return os.ErrNotExist
+	case errors.Is(err, os.ErrPermission):
+		return os.ErrPermission
+	case errors.Is(err, os.ErrExist):
+		return os.ErrExist
+	}
+	return errSFTPRequestFailed
 }
 
 // NewSignerFromFile reads a PEM-encoded private key from the given file path
@@ -1011,9 +1039,13 @@ func (j jail) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	}
 	p, err := j.resolve(r.Filepath)
 	if err != nil {
-		return nil, err
+		return nil, sanitizeSFTPErr(err)
 	}
-	return os.Open(p)
+	f, err := os.Open(p)
+	if err != nil {
+		return nil, sanitizeSFTPErr(err)
+	}
+	return f, nil
 }
 
 // writeLogger wraps an *os.File and logs the filename when the file is closed,
@@ -1111,13 +1143,13 @@ func (j jail) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	clientPath := cleanSFTPClientPath(r.Filepath)
 	p, err := j.resolve(r.Filepath)
 	if err != nil {
-		return nil, err
+		return nil, sanitizeSFTPErr(err)
 	}
 	log.Printf("upload: %q", clientPath)
 	// Create/overwrite
 	f, err := openFileNoFollow(p, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
-		return nil, err
+		return nil, sanitizeSFTPErr(err)
 	}
 	return &writeLogger{
 		File:         f,
@@ -1139,21 +1171,21 @@ func (j jail) Filecmd(r *sftp.Request) error {
 	case "Setstat", "Fsetstat":
 		p, err := j.resolve(r.Filepath)
 		if err != nil {
-			return err
+			return sanitizeSFTPErr(err)
 		}
-		return applyAttrs(p, r, j.allowChown)
+		return sanitizeSFTPErr(applyAttrs(p, r, j.allowChown))
 
 	case "Rename":
 		oldP, err := j.resolve(r.Filepath)
 		if err != nil {
-			return err
+			return sanitizeSFTPErr(err)
 		}
 		newP, err := j.resolve(r.Target)
 		if err != nil {
-			return err
+			return sanitizeSFTPErr(err)
 		}
 		if err := os.Rename(oldP, newP); err != nil {
-			return err
+			return sanitizeSFTPErr(err)
 		}
 		// If a file with a "still being written" extension is renamed to a
 		// final (non-temp) name, treat the rename as the moment the upload
@@ -1179,23 +1211,23 @@ func (j jail) Filecmd(r *sftp.Request) error {
 	case "Rmdir":
 		p, err := j.resolve(r.Filepath)
 		if err != nil {
-			return err
+			return sanitizeSFTPErr(err)
 		}
-		return os.Remove(p)
+		return sanitizeSFTPErr(os.Remove(p))
 
 	case "Remove":
 		p, err := j.resolve(r.Filepath)
 		if err != nil {
-			return err
+			return sanitizeSFTPErr(err)
 		}
-		return os.Remove(p)
+		return sanitizeSFTPErr(os.Remove(p))
 
 	case "Mkdir":
 		p, err := j.resolve(r.Filepath)
 		if err != nil {
-			return err
+			return sanitizeSFTPErr(err)
 		}
-		return os.Mkdir(p, 0750)
+		return sanitizeSFTPErr(os.Mkdir(p, 0750))
 
 	case "Symlink":
 		// Symlinks are disallowed in the jail: a client-created symlink could
@@ -1215,25 +1247,25 @@ func (j jail) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	}
 	p, err := j.resolve(r.Filepath)
 	if err != nil {
-		return nil, err
+		return nil, sanitizeSFTPErr(err)
 	}
 	switch r.Method {
 	case "List":
 		entries, err := os.ReadDir(p)
 		if err != nil {
-			return nil, err
+			return nil, sanitizeSFTPErr(err)
 		}
 		return listerFromDirEntries(p, entries), nil
 	case "Stat":
 		st, err := os.Stat(p)
 		if err != nil {
-			return nil, err
+			return nil, sanitizeSFTPErr(err)
 		}
 		return listerFromFileInfo([]os.FileInfo{st}), nil
 	case "Lstat":
 		st, err := os.Lstat(p)
 		if err != nil {
-			return nil, err
+			return nil, sanitizeSFTPErr(err)
 		}
 		return listerFromFileInfo([]os.FileInfo{st}), nil
 	default:
