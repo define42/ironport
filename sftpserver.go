@@ -1076,7 +1076,7 @@ func (j jail) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	return &writeLogger{
 		File:         f,
 		filepath:     clientPath,
-		fullFilepath: j.fs.fullPath(cleanRelClientPath(r.Filepath)),
+		fullFilepath: j.fs.fullPath(r.Filepath),
 		username:     j.username,
 		clientIP:     j.clientIP,
 		uploads:      j.uploads,
@@ -1106,7 +1106,7 @@ func (j jail) Filecmd(r *sftp.Request) error {
 			log.Printf("upload complete via rename: %q -> %q", oldClientPath, newClientPath)
 			evt := CompletedUpload{
 				Username:     j.username,
-				FullFilePath: j.fs.fullPath(cleanRelClientPath(r.Target)),
+				FullFilePath: j.fs.fullPath(r.Target),
 				FilePath:     newClientPath,
 				ClientIP:     j.clientIP,
 			}
@@ -1944,7 +1944,7 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 		return
 	}
 
-	f.announceUpload(ftpPath, f.fs.fullPath(cleanRelClientPath(ftpPath)))
+	f.announceUpload(ftpPath, f.fs.fullPath(ftpPath))
 	_ = f.reply(226, "transfer complete")
 }
 
@@ -2078,7 +2078,7 @@ func (f *ftpSession) cmdRnto(arg string) {
 		return
 	}
 	if hasTempExt(oldPath, f.tempExts) && !hasTempExt(newPath, f.tempExts) {
-		newFull := f.fs.fullPath(cleanRelClientPath(newPath))
+		newFull := f.fs.fullPath(newPath)
 		log.Printf("upload complete via rename: %q -> %q", oldPath, newPath)
 		f.announceUpload(newPath, newFull)
 	}

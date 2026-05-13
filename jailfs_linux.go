@@ -159,11 +159,15 @@ func (j *jailFS) openat(rel string, flags int, perm os.FileMode) (int, error) {
 	return fd, nil
 }
 
-// fullPath returns the on-disk path that corresponds to a cleaned jail-relative
-// path. Because openat2 with RESOLVE_NO_SYMLINKS guarantees that no symlink is
-// traversed, simple string concatenation here yields the actual on-disk path.
-// This is used purely for reporting (e.g. CompletedUpload.FullFilePath).
-func (j *jailFS) fullPath(rel string) string {
+// fullPath returns the on-disk path that corresponds to a client-supplied
+// path. The argument is cleaned and confined to the jail relative form
+// before being joined to the textual root, so callers may pass raw client
+// input. Because openat2 with RESOLVE_NO_SYMLINKS guarantees that no
+// symlink is traversed when this path is actually used, simple string
+// concatenation here yields the actual on-disk path. This is used purely
+// for reporting (e.g. CompletedUpload.FullFilePath).
+func (j *jailFS) fullPath(clientPath string) string {
+	rel := cleanRelClientPath(clientPath)
 	if rel == "." || rel == "" {
 		return filepath.Clean(j.root)
 	}
@@ -238,7 +242,7 @@ func (j *jailFS) List(clientPath string) ([]os.FileInfo, error) {
 	out := make([]os.FileInfo, 0, len(names))
 	for _, name := range names {
 		var st unix.Stat_t
-		if err := unix.Fstatat(int(f.Fd()), name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if err := unix.Fstatat(fd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 			// Entry vanished between readdir and fstatat (race with a
 			// concurrent unlink). Skip it rather than failing the listing.
 			continue
