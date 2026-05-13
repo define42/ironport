@@ -640,15 +640,41 @@ func (s *Server) FTPListeningAddr() net.Addr {
 // permissionsFor builds the ssh.Permissions for an authenticated user,
 // embedding the jail root and access flags as extensions so that the
 // connection handler can retrieve them after the handshake.
-func permissionsFor(u UserInfo, username string) *ssh.Permissions {
+func permissionsFor(u UserInfo, username, jailRoot string) *ssh.Permissions {
 	return &ssh.Permissions{
 		Extensions: map[string]string{
-			"jailRoot": u.Root,
+			"jailRoot": jailRoot,
 			"user":     username,
 			"canRead":  fmt.Sprintf("%v", u.CanRead),
 			"canWrite": fmt.Sprintf("%v", u.CanWrite),
 		},
 	}
+}
+
+func canonicalJailRoot(root string) (string, error) {
+	if strings.TrimSpace(root) == "" {
+		return "", os.ErrInvalid
+	}
+
+	abs, err := filepath.Abs(filepath.Clean(root))
+	if err != nil {
+		return "", err
+	}
+
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", err
+	}
+
+	st, err := os.Stat(real)
+	if err != nil {
+		return "", err
+	}
+	if !st.IsDir() {
+		return "", syscall.ENOTDIR
+	}
+
+	return real, nil
 }
 
 // sshServerConfig builds the SSH server configuration with both password-based
@@ -688,7 +714,11 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 			if !ok || !match || len(pass) == 0 || len(storedPw) == 0 {
 				return nil, fmt.Errorf("invalid credentials")
 			}
-			return permissionsFor(u, c.User()), nil
+			jailRoot, err := canonicalJailRoot(u.Root)
+			if err != nil {
+				return nil, fmt.Errorf("invalid credentials")
+			}
+			return permissionsFor(u, c.User(), jailRoot), nil
 		},
 		PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			s.mu.RLock()
@@ -723,7 +753,11 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 			if !ok || !matched {
 				return nil, fmt.Errorf("invalid credentials")
 			}
-			return permissionsFor(u, c.User()), nil
+			jailRoot, err := canonicalJailRoot(u.Root)
+			if err != nil {
+				return nil, fmt.Errorf("invalid credentials")
+			}
+			return permissionsFor(u, c.User(), jailRoot), nil
 		},
 	}
 	cfg.AddHostKey(s.Signer)
@@ -1544,6 +1578,11 @@ func (f *ftpSession) authenticate(pass string) bool {
 	if !ok || !match || len(pass) == 0 || len(storedPw) == 0 {
 		return false
 	}
+	jailRoot, err := canonicalJailRoot(u.Root)
+	if err != nil {
+		return false
+	}
+	u.Root = jailRoot
 
 	f.user = u
 	f.authenticated = true
