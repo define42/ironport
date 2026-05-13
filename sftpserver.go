@@ -332,11 +332,11 @@ func (s *Server) RemoveUserKey(username string, key ssh.PublicKey) {
 //	srv := sftpserver.NewServer(":2022", "", "", users, signer, 256)
 func NewServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserInfo, signer ssh.Signer, completedUploadsSize int) *Server {
 	s := &Server{
-		Addr:                addr,
-		FTPAddr:             ftpAddr,
-		FTPPassivePortRange: ftpPassivePortRange,
-		Users:               users,
-		Signer:              signer,
+		Addr:                 addr,
+		FTPAddr:              ftpAddr,
+		FTPPassivePortRange:  ftpPassivePortRange,
+		Users:                users,
+		Signer:               signer,
 		CompletedUploadsSize: completedUploadsSize,
 	}
 	s.initCompletedUploads()
