@@ -126,7 +126,7 @@ func startTestServer(t *testing.T, users map[string]UserInfo, configure ...func(
 	}
 	addr = ln.Addr().String()
 
-	srv = NewServer(addr, "", "", users, signer)
+	srv = NewServer(addr, "", "", users, signer, defaultCompletedUploadsSize)
 	for _, fn := range configure {
 		if fn != nil {
 			fn(srv)
@@ -176,7 +176,7 @@ func dialSFTP(t *testing.T, addr, user, pass string) *sftp.Client {
 func startTestFTPServer(t *testing.T, users map[string]UserInfo, ftpPassivePortRange string) (srv *Server, addr string, stop func()) {
 	t.Helper()
 
-	srv = NewServer("127.0.0.1:0", "127.0.0.1:0", ftpPassivePortRange, users, testSigner(t))
+	srv = NewServer("127.0.0.1:0", "127.0.0.1:0", ftpPassivePortRange, users, testSigner(t), defaultCompletedUploadsSize)
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- srv.ListenAndServe()
@@ -401,7 +401,7 @@ func TestNewServer(t *testing.T) {
 		"alice": {Password: "pw", Root: "/tmp/alice", CanRead: true, CanWrite: true},
 	}
 	signer := testSigner(t)
-	srv := NewServer(":0", ":0", "5000-5010", users, signer)
+	srv := NewServer(":0", ":0", "5000-5010", users, signer, defaultCompletedUploadsSize)
 	if srv.Addr != ":0" {
 		t.Errorf("Addr = %q; want :0", srv.Addr)
 	}
@@ -428,7 +428,7 @@ func TestCompletedUploadsSize(t *testing.T) {
 	}
 
 	// Default capacity: zero CompletedUploadsSize selects defaultCompletedUploadsSize.
-	srv := NewServer(":0", "", "", users, signer)
+	srv := NewServer(":0", "", "", users, signer, defaultCompletedUploadsSize)
 	if cap(srv.CompletedUploads) != defaultCompletedUploadsSize {
 		t.Errorf("default cap = %d; want %d", cap(srv.CompletedUploads), defaultCompletedUploadsSize)
 	}
@@ -898,7 +898,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 	}
 	addr := ln.Addr().String()
 
-	srv := NewServer(addr, "", "", users, signer)
+	srv := NewServer(addr, "", "", users, signer, defaultCompletedUploadsSize)
 	srv.initCompletedUploads()
 	cfg := srv.sshServerConfig()
 
@@ -1277,7 +1277,7 @@ func TestServer_AddUserKey_NoDuplicate(t *testing.T) {
 
 	srv := NewServer(":0", "", "", map[string]UserInfo{
 		"carol": {Root: root, CanRead: true},
-	}, testSigner(t))
+	}, testSigner(t), defaultCompletedUploadsSize)
 
 	srv.AddUserKey("carol", pubKey)
 	srv.AddUserKey("carol", pubKey)
@@ -1295,7 +1295,7 @@ func TestServer_AddUserKey_NoDuplicate(t *testing.T) {
 // TestServer_AddRemoveUserKey_NonExistentUser verifies that calling AddUserKey
 // or RemoveUserKey for a user that does not exist is a safe no-op.
 func TestServer_AddRemoveUserKey_NonExistentUser(t *testing.T) {
-	srv := NewServer(":0", "", "", map[string]UserInfo{}, testSigner(t))
+	srv := NewServer(":0", "", "", map[string]UserInfo{}, testSigner(t), defaultCompletedUploadsSize)
 	_, pub := testClientKey(t)
 
 	// Neither call should panic or create phantom entries.
@@ -1343,7 +1343,7 @@ func TestServer_AddUserKey_NilKey(t *testing.T) {
 	_, pub := testClientKey(t)
 	srv := NewServer(":0", "", "", map[string]UserInfo{
 		"eve": {AuthorizedKeys: []ssh.PublicKey{pub}, Root: root, CanRead: true},
-	}, testSigner(t))
+	}, testSigner(t), defaultCompletedUploadsSize)
 
 	srv.AddUserKey("eve", nil) // must not panic
 
@@ -1368,7 +1368,7 @@ func TestServer_RemoveUserKey_NilEntry(t *testing.T) {
 			Root:           root,
 			CanRead:        true,
 		},
-	}, testSigner(t))
+	}, testSigner(t), defaultCompletedUploadsSize)
 
 	srv.RemoveUserKey("frank", pub) // must not panic
 
@@ -1391,7 +1391,7 @@ func TestServer_RemoveUserKey_NilKey(t *testing.T) {
 	_, pub := testClientKey(t)
 	srv := NewServer(":0", "", "", map[string]UserInfo{
 		"grace": {AuthorizedKeys: []ssh.PublicKey{pub}, Root: root, CanRead: true},
-	}, testSigner(t))
+	}, testSigner(t), defaultCompletedUploadsSize)
 
 	srv.RemoveUserKey("grace", nil) // must not panic
 
@@ -1906,7 +1906,7 @@ func TestServer_ListenAndServe_Close(t *testing.T) {
 	}
 	signer := testSigner(t)
 
-	srv := NewServer("127.0.0.1:0", "", "", users, signer)
+	srv := NewServer("127.0.0.1:0", "", "", users, signer, defaultCompletedUploadsSize)
 
 	errc := make(chan error, 1)
 	go func() {
@@ -1961,7 +1961,7 @@ func TestServer_ListenAndServe_Close(t *testing.T) {
 // TestServer_Close_BeforeListenAndServe verifies that calling Close before
 // ListenAndServe is a safe no-op and does not panic or return an error.
 func TestServer_Close_BeforeListenAndServe(t *testing.T) {
-	srv := NewServer(":0", "", "", map[string]UserInfo{}, testSigner(t))
+	srv := NewServer(":0", "", "", map[string]UserInfo{}, testSigner(t), defaultCompletedUploadsSize)
 	if err := srv.Close(); err != nil {
 		t.Errorf("Close before ListenAndServe returned %v; want nil", err)
 	}
@@ -2037,7 +2037,7 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
 	signer := testSigner(t)
-	srv := NewServer("127.0.0.1:0", "", "", users, signer)
+	srv := NewServer("127.0.0.1:0", "", "", users, signer, defaultCompletedUploadsSize)
 	srv.initCompletedUploads()
 	cfg := srv.sshServerConfig()
 

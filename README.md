@@ -44,7 +44,7 @@ func main() {
     }
 
     // ftpAddr is "" to disable the (plaintext) FTP listener.
-    srv := sftpserver.NewServer(":2022", "", "", users, signer)
+    srv := sftpserver.NewServer(":2022", "", "", users, signer, 64)
 
     // Drain upload notifications in the background.
     go func() {
@@ -60,7 +60,7 @@ func main() {
 
 ### Configuring the upload-notification buffer size
 
-`NewServer` accepts an optional buffer-size argument (default 64):
+`NewServer` requires an explicit buffer-size argument:
 
 ```go
 srv := sftpserver.NewServer(":2022", "", "", users, signer, 256)
@@ -89,7 +89,7 @@ disabled by default; enable it only on a trusted network segment where you
 control all clients and intermediate hops:
 
 ```go
-srv := sftpserver.NewServer(":2022", ":2121", "5000-5010", users, signer)
+srv := sftpserver.NewServer(":2022", ":2121", "5000-5010", users, signer, 64)
 ```
 
 When FTP is enabled, only passive mode (`PASV` / `EPSV`) is supported; active

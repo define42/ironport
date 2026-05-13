@@ -12,7 +12,7 @@
 //
 // Typical usage:
 //
-//	srv := sftpserver.NewServer(":2022", ":2121", "5000-5010", users, signer)
+//	srv := sftpserver.NewServer(":2022", ":2121", "5000-5010", users, signer, 64)
 //	log.Fatal(srv.ListenAndServe())
 package sftpserver
 
@@ -190,8 +190,9 @@ type Server struct {
 	// channel continuously.
 	//
 	// The buffer capacity is set by the completedUploadsSize argument of
-	// NewServer (default 64 when omitted or zero). It can also be overridden
-	// by assigning a new channel to this field before calling ListenAndServe.
+	// NewServer. A non-positive value falls back to the package default (64).
+	// It can also be overridden by assigning a new channel to this field
+	// before calling ListenAndServe.
 	//
 	// When a Server is constructed via a struct literal rather than NewServer,
 	// set CompletedUploadsSize and leave this field nil — ListenAndServe will
@@ -324,21 +325,19 @@ func (s *Server) RemoveUserKey(username string, key ssh.PublicKey) {
 // "" to disable FTP. Leave ftpPassivePortRange empty to use OS-assigned passive
 // data ports.
 //
-// The optional completedUploadsSize argument sets the buffer capacity of the
-// CompletedUploads channel. When omitted or zero, the default capacity of 64 is
-// used. Pass a positive integer to override:
+// completedUploadsSize sets the buffer capacity of the CompletedUploads
+// channel. Pass a positive integer to set an explicit capacity; non-positive
+// values fall back to the default capacity of 64:
 //
 //	srv := sftpserver.NewServer(":2022", "", "", users, signer, 256)
-func NewServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserInfo, signer ssh.Signer, completedUploadsSize ...int) *Server {
+func NewServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserInfo, signer ssh.Signer, completedUploadsSize int) *Server {
 	s := &Server{
 		Addr:                addr,
 		FTPAddr:             ftpAddr,
 		FTPPassivePortRange: ftpPassivePortRange,
 		Users:               users,
 		Signer:              signer,
-	}
-	if len(completedUploadsSize) > 0 {
-		s.CompletedUploadsSize = completedUploadsSize[0]
+		CompletedUploadsSize: completedUploadsSize,
 	}
 	s.initCompletedUploads()
 	return s
