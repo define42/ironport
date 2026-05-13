@@ -1263,11 +1263,13 @@ func TestSSHServerConfig_PasswordAuth_ValidatesJailRoot(t *testing.T) {
 	tests := []struct {
 		name string
 		root string
+		want string
 	}{
 		{name: "empty", root: ""},
 		{name: "whitespace", root: "  "},
 		{name: "file", root: filePath},
 		{name: "missing", root: filepath.Join(t.TempDir(), "missing")},
+		{name: "directory", root: target, want: target},
 	}
 
 	for _, tc := range tests {
@@ -1278,8 +1280,17 @@ func TestSSHServerConfig_PasswordAuth_ValidatesJailRoot(t *testing.T) {
 			cfg := srv.sshServerConfig()
 
 			perms, err := cfg.PasswordCallback(testConnMetadata{user: "alice"}, []byte("alicepw"))
-			if err == nil {
-				t.Fatalf("PasswordCallback returned nil error with permissions %+v", perms)
+			if tc.want == "" {
+				if err == nil {
+					t.Fatalf("PasswordCallback returned nil error with permissions %+v", perms)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("PasswordCallback: %v", err)
+			}
+			if actualJailRoot := perms.Extensions["jailRoot"]; actualJailRoot != tc.want {
+				t.Fatalf("permissions jailRoot = %q; want %q", actualJailRoot, tc.want)
 			}
 		})
 	}
@@ -1288,18 +1299,16 @@ func TestSSHServerConfig_PasswordAuth_ValidatesJailRoot(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatalf("os.Symlink: %v", err)
 	}
-
 	srv := NewServer(":0", "", "", map[string]UserInfo{
 		"alice": {Password: "alicepw", Root: link, CanRead: true, CanWrite: true},
 	}, testSigner(t), defaultCompletedUploadsSize)
 	cfg := srv.sshServerConfig()
-
 	perms, err := cfg.PasswordCallback(testConnMetadata{user: "alice"}, []byte("alicepw"))
 	if err != nil {
 		t.Fatalf("PasswordCallback: %v", err)
 	}
-	if got := perms.Extensions["jailRoot"]; got != target {
-		t.Fatalf("permissions jailRoot = %q; want %q", got, target)
+	if actualJailRoot := perms.Extensions["jailRoot"]; actualJailRoot != target {
+		t.Fatalf("permissions jailRoot = %q; want %q", actualJailRoot, target)
 	}
 }
 
