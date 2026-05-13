@@ -893,7 +893,7 @@ func (j jail) resolve(p string) (string, error) {
 				if st.Mode()&os.ModeSymlink != 0 {
 					return "", os.ErrPermission
 				}
-				return "", err
+				return "", os.ErrPermission
 			}
 			if !os.IsNotExist(lerr) {
 				return "", lerr
