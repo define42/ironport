@@ -189,18 +189,18 @@ type Server struct {
 	// slow consumer never stalls an upload. Callers should drain the
 	// channel continuously.
 	//
-	// NewServer always initialises this field. The default buffer size is 64;
+	// NewServer always initializes this field. The default buffer size is 64;
 	// to use a different capacity, replace this field with a channel of the
 	// desired size before starting a consumer goroutine or calling
 	// ListenAndServe.
 	//
 	// When a Server is constructed via a struct literal rather than NewServer,
 	// set CompletedUploadsSize and leave this field nil — ListenAndServe will
-	// initialise it automatically using that size.
+	// initialize it automatically using that size.
 	CompletedUploads chan CompletedUpload
 	// CompletedUploadsSize controls the buffer capacity of the
 	// CompletedUploads channel. It is only consulted when ListenAndServe (or
-	// initCompletedUploads) initialises the channel because CompletedUploads
+	// initCompletedUploads) initializes the channel because CompletedUploads
 	// is nil at that point. A value of zero selects the package default (64);
 	// negative values are treated as zero.
 	//
@@ -329,7 +329,7 @@ func (s *Server) RemoveUserKey(username string, key ssh.PublicKey) {
 // "" to disable FTP. Leave ftpPassivePortRange empty to use OS-assigned passive
 // data ports.
 //
-// NewServer initialises CompletedUploads with a buffer of defaultCompletedUploadsSize
+// NewServer initializes CompletedUploads with a buffer of defaultCompletedUploadsSize
 // (64). To use a different buffer capacity, replace the CompletedUploads field
 // with a channel of the desired size before starting a consumer goroutine or
 // calling ListenAndServe.

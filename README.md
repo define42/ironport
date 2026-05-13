@@ -79,7 +79,7 @@ log.Fatal(srv.ListenAndServe())
 
 When constructing a `Server` via a struct literal instead of `NewServer`,
 set `CompletedUploadsSize` and leave `CompletedUploads` nil — `ListenAndServe`
-will initialise the channel automatically with that capacity:
+will initialize the channel automatically with that capacity:
 
 ```go
 srv := &sftpserver.Server{
