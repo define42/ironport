@@ -6,19 +6,62 @@ on:
   pull_request:
     branches: [ "**" ]
 
+permissions:
+  contents: read
+
 jobs:
   test:
+    name: Test (Go ${{ matrix.go-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # "" means use go-version-file (the version declared in go.mod);
+        # "stable" exercises the latest released toolchain so we catch
+        # regressions introduced by newer Go versions early.
+        go-version: [ "", "stable" ]
     permissions:
       contents: read
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Go
+      - name: Set up Go (from go.mod)
+        if: matrix.go-version == ''
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          check-latest: true
+
+      - name: Set up Go (${{ matrix.go-version }})
+        if: matrix.go-version != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          check-latest: true
+
+      - name: Verify module is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Check formatting (gofmt -d)
+        run: |
+          out=$(gofmt -d -s .)
+          if [ -n "$out" ]; then
+            echo "$out"
+            echo "::error::gofmt found unformatted files. Run 'gofmt -s -w .'"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
 
       - name: Run unit tests
         run: go test ./...
+
+      - name: Run unit tests with race detector
+        run: go test -race ./...

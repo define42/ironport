@@ -110,7 +110,13 @@ func testSigner(t *testing.T) ssh.Signer {
 
 // startTestServer launches a Server on a random OS-assigned port and returns
 // the address and a cancel function that closes the listener.
-func startTestServer(t *testing.T, users map[string]UserInfo) (srv *Server, addr string, stop func()) {
+//
+// Each optional configure callback runs against the freshly constructed
+// *Server BEFORE the accept goroutine starts, so tests can safely mutate
+// fields like AllowChown or TempExtensions without racing the accept loop.
+// Mutating those fields on the returned *Server after this function returns
+// is unsafe under the race detector.
+func startTestServer(t *testing.T, users map[string]UserInfo, configure ...func(*Server)) (srv *Server, addr string, stop func()) {
 	t.Helper()
 	signer := testSigner(t)
 
@@ -121,6 +127,11 @@ func startTestServer(t *testing.T, users map[string]UserInfo) (srv *Server, addr
 	addr = ln.Addr().String()
 
 	srv = NewServer(addr, "", "", users, signer)
+	for _, fn := range configure {
+		if fn != nil {
+			fn(srv)
+		}
+	}
 	cfg := srv.sshServerConfig()
 
 	go func() {
@@ -1633,8 +1644,7 @@ func TestSFTPServer_Chown(t *testing.T) {
 	users := map[string]UserInfo{
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
-	srv, addr, stop := startTestServer(t, users)
-	srv.AllowChown = true
+	_, addr, stop := startTestServer(t, users, func(s *Server) { s.AllowChown = true })
 	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
@@ -1675,8 +1685,7 @@ func TestSFTPServer_Chgrp(t *testing.T) {
 	users := map[string]UserInfo{
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
-	srv, addr, stop := startTestServer(t, users)
-	srv.AllowChown = true
+	_, addr, stop := startTestServer(t, users, func(s *Server) { s.AllowChown = true })
 	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
@@ -2085,8 +2094,9 @@ func TestSFTPServer_TempExtensions_SuppressesUploadAndAnnouncesOnRename(t *testi
 	users := map[string]UserInfo{
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
-	srv, addr, stop := startTestServer(t, users)
-	srv.TempExtensions = []string{".tmp", ".writing"}
+	srv, addr, stop := startTestServer(t, users, func(s *Server) {
+		s.TempExtensions = []string{".tmp", ".writing"}
+	})
 	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
@@ -2145,8 +2155,9 @@ func TestSFTPServer_TempExtensions_RenameBetweenTempNamesDoesNotAnnounce(t *test
 	users := map[string]UserInfo{
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
-	srv, addr, stop := startTestServer(t, users)
-	srv.TempExtensions = []string{".tmp", ".writing"}
+	srv, addr, stop := startTestServer(t, users, func(s *Server) {
+		s.TempExtensions = []string{".tmp", ".writing"}
+	})
 	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
@@ -2177,8 +2188,9 @@ func TestSFTPServer_TempExtensions_PlainUploadStillAnnounced(t *testing.T) {
 	users := map[string]UserInfo{
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
-	srv, addr, stop := startTestServer(t, users)
-	srv.TempExtensions = []string{".tmp", ".writing"}
+	srv, addr, stop := startTestServer(t, users, func(s *Server) {
+		s.TempExtensions = []string{".tmp", ".writing"}
+	})
 	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
