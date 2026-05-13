@@ -60,21 +60,10 @@ func main() {
 
 ### Configuring the upload-notification buffer size
 
-`NewServer` creates `CompletedUploads` with a buffer of 64. To use a different
-capacity, replace the field with a channel of the desired size **before**
-starting the consumer goroutine:
+`NewServer` accepts an optional buffer-size argument (default 64):
 
 ```go
-srv := sftpserver.NewServer(":2022", "", "", users, signer)
-srv.CompletedUploads = make(chan sftpserver.CompletedUpload, 256)
-
-go func() {
-    for ev := range srv.CompletedUploads {
-        // handle ev
-    }
-}()
-
-log.Fatal(srv.ListenAndServe())
+srv := sftpserver.NewServer(":2022", "", "", users, signer, 256)
 ```
 
 When constructing a `Server` via a struct literal instead of `NewServer`,

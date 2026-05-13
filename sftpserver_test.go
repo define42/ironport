@@ -433,6 +433,12 @@ func TestCompletedUploadsSize(t *testing.T) {
 		t.Errorf("default cap = %d; want %d", cap(srv.CompletedUploads), defaultCompletedUploadsSize)
 	}
 
+	// Custom capacity via NewServer variadic argument.
+	srv2 := NewServer(":0", "", "", users, signer, 256)
+	if cap(srv2.CompletedUploads) != 256 {
+		t.Errorf("custom cap via NewServer = %d; want 256", cap(srv2.CompletedUploads))
+	}
+
 	// Custom capacity via struct literal + initCompletedUploads (bypasses NewServer).
 	custom := &Server{CompletedUploadsSize: 128}
 	custom.initCompletedUploads()
@@ -442,13 +448,13 @@ func TestCompletedUploadsSize(t *testing.T) {
 
 	// initCompletedUploads is idempotent: an already-set channel is not replaced.
 	existing := make(chan CompletedUpload, 7)
-	srv2 := &Server{CompletedUploads: existing, CompletedUploadsSize: 999}
-	srv2.initCompletedUploads()
-	if srv2.CompletedUploads != existing {
+	srv3 := &Server{CompletedUploads: existing, CompletedUploadsSize: 999}
+	srv3.initCompletedUploads()
+	if srv3.CompletedUploads != existing {
 		t.Error("initCompletedUploads replaced an already-set channel")
 	}
-	if cap(srv2.CompletedUploads) != 7 {
-		t.Errorf("cap after idempotent init = %d; want 7", cap(srv2.CompletedUploads))
+	if cap(srv3.CompletedUploads) != 7 {
+		t.Errorf("cap after idempotent init = %d; want 7", cap(srv3.CompletedUploads))
 	}
 }
 

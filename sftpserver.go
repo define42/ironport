@@ -189,25 +189,20 @@ type Server struct {
 	// slow consumer never stalls an upload. Callers should drain the
 	// channel continuously.
 	//
-	// NewServer always initializes this field. The default buffer size is 64;
-	// to use a different capacity, replace this field with a channel of the
-	// desired size before starting a consumer goroutine or calling
-	// ListenAndServe.
+	// The buffer capacity is set by the completedUploadsSize argument of
+	// NewServer (default 64 when omitted or zero). It can also be overridden
+	// by assigning a new channel to this field before calling ListenAndServe.
 	//
 	// When a Server is constructed via a struct literal rather than NewServer,
 	// set CompletedUploadsSize and leave this field nil — ListenAndServe will
 	// initialize it automatically using that size.
 	CompletedUploads chan CompletedUpload
 	// CompletedUploadsSize controls the buffer capacity of the
-	// CompletedUploads channel. It is only consulted when ListenAndServe (or
-	// initCompletedUploads) initializes the channel because CompletedUploads
-	// is nil at that point. A value of zero selects the package default (64);
-	// negative values are treated as zero.
-	//
-	// When using NewServer, the channel is created during construction with
-	// the default capacity. To change the capacity, replace the
-	// CompletedUploads field with a channel of the desired size before calling
-	// ListenAndServe.
+	// CompletedUploads channel. It is set automatically by the
+	// completedUploadsSize argument of NewServer. When constructing a Server
+	// via a struct literal, set this field directly; ListenAndServe will
+	// initialize the channel with this capacity. A value of zero selects the
+	// package default (64); negative values are treated as zero.
 	CompletedUploadsSize int
 	// TempExtensions is an optional list of file extensions (each beginning
 	// with a leading dot, e.g. ".tmp", ".writing") that mark files as still
@@ -329,17 +324,21 @@ func (s *Server) RemoveUserKey(username string, key ssh.PublicKey) {
 // "" to disable FTP. Leave ftpPassivePortRange empty to use OS-assigned passive
 // data ports.
 //
-// NewServer initializes CompletedUploads with a buffer of defaultCompletedUploadsSize
-// (64). To use a different buffer capacity, replace the CompletedUploads field
-// with a channel of the desired size before starting a consumer goroutine or
-// calling ListenAndServe.
-func NewServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserInfo, signer ssh.Signer) *Server {
+// The optional completedUploadsSize argument sets the buffer capacity of the
+// CompletedUploads channel. When omitted or zero, the default capacity of 64 is
+// used. Pass a positive integer to override:
+//
+//	srv := sftpserver.NewServer(":2022", "", "", users, signer, 256)
+func NewServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserInfo, signer ssh.Signer, completedUploadsSize ...int) *Server {
 	s := &Server{
 		Addr:                addr,
 		FTPAddr:             ftpAddr,
 		FTPPassivePortRange: ftpPassivePortRange,
 		Users:               users,
 		Signer:              signer,
+	}
+	if len(completedUploadsSize) > 0 {
+		s.CompletedUploadsSize = completedUploadsSize[0]
 	}
 	s.initCompletedUploads()
 	return s
