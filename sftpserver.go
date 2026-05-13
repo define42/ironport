@@ -585,11 +585,7 @@ func (s *Server) allowChown() bool {
 // formatted the request (e.g. "foo.txt", "../../etc/passwd", "/a/../b.txt").
 func cleanSFTPClientPath(p string) string {
 	p = filepath.ToSlash(p)
-	p = path.Clean("/" + strings.TrimPrefix(p, "/"))
-	if p == "." {
-		return "/"
-	}
-	return p
+	return path.Clean("/" + strings.TrimPrefix(p, "/"))
 }
 
 // hasTempExt reports whether name ends with one of the given (already
