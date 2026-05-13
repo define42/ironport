@@ -95,18 +95,18 @@ type idleConn struct {
 
 func (c *idleConn) Read(b []byte) (int, error) {
 	if d := time.Duration(c.readTimeoutNs.Load()); d > 0 {
-		_ = c.Conn.SetReadDeadline(time.Now().Add(d))
+		_ = c.SetReadDeadline(time.Now().Add(d))
 	} else {
-		_ = c.Conn.SetReadDeadline(time.Time{})
+		_ = c.SetReadDeadline(time.Time{})
 	}
 	return c.Conn.Read(b)
 }
 
 func (c *idleConn) Write(b []byte) (int, error) {
 	if d := time.Duration(c.writeTimeoutNs.Load()); d > 0 {
-		_ = c.Conn.SetWriteDeadline(time.Now().Add(d))
+		_ = c.SetWriteDeadline(time.Now().Add(d))
 	} else {
-		_ = c.Conn.SetWriteDeadline(time.Time{})
+		_ = c.SetWriteDeadline(time.Time{})
 	}
 	return c.Conn.Write(b)
 }
