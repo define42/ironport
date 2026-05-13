@@ -888,11 +888,10 @@ func (j jail) resolve(p string) (string, error) {
 		// the jail. Return a canonical path under the resolved ancestor so that
 		// create operations cannot traverse a previously encountered symlink.
 		if os.IsNotExist(err) {
-			st, lerr := os.Lstat(next)
+			_, lerr := os.Lstat(next)
 			if lerr == nil {
-				if st.Mode()&os.ModeSymlink != 0 {
-					return "", os.ErrPermission
-				}
+				// A present path that EvalSymlinks reports as missing is either
+				// a broken symlink or a racy/suspicious path; reject it.
 				return "", os.ErrPermission
 			}
 			if !os.IsNotExist(lerr) {
