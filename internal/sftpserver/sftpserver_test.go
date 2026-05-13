@@ -2875,3 +2875,223 @@ func TestServer_ShutdownContext_Cancelled(t *testing.T) {
 		t.Errorf("ShutdownContext().Err() after shutdown = %v; want ErrServerClosed", err)
 	}
 }
+
+// TestFTPServer_AbortedSTOR_CleansUp verifies that when an FTP STOR data
+// connection is reset mid-transfer, the server removes the partial file and
+// does NOT announce it on CompletedUploads.
+func TestFTPServer_AbortedSTOR_CleansUp(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"alice": {Password: "secret", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestFTPServer(t, users, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("alice", "secret")
+
+	dc, _ := client.passiveConn()
+	client.send("STOR aborted.bin")
+	client.read(150)
+
+	// Write a few bytes then RST the data connection (SetLinger(0) +
+	// Close). The server's io.Copy will return a non-EOF error and the
+	// STOR handler must unlink the partial file.
+	if tcp, ok := dc.(*net.TCPConn); ok {
+		_ = tcp.SetLinger(0)
+	}
+	if _, err := dc.Write([]byte("partial data")); err != nil {
+		t.Fatalf("data Write: %v", err)
+	}
+	_ = dc.Close()
+
+	// Server replies 426 (or similar 4xx) on transfer abort.
+	_, _, err := client.tp.ReadResponse(4)
+	if err != nil {
+		t.Fatalf("ReadResponse for aborted STOR: %v", err)
+	}
+
+	// Allow a moment for the handler to finish cleanup.
+	partial := filepath.Join(root, "aborted.bin")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(partial); os.IsNotExist(err) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(partial); !os.IsNotExist(err) {
+		t.Errorf("partial FTP file %q still exists after RST: err=%v", partial, err)
+	}
+
+	select {
+	case got := <-srv.CompletedUploads:
+		t.Fatalf("CompletedUploads received %+v for aborted FTP STOR; want no event", got)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// TestFTPServer_AbortedAPPE_PreservesExisting verifies that when an FTP
+// APPE upload is aborted mid-transfer, the previously-existing file content
+// is NOT removed (only newly-created STOR uploads get unlinked on abort).
+func TestFTPServer_AbortedAPPE_PreservesExisting(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"alice": {Password: "secret", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestFTPServer(t, users, "")
+	t.Cleanup(stop)
+
+	// Pre-populate the file.
+	target := filepath.Join(root, "kept.bin")
+	original := []byte("ORIGINAL")
+	if err := os.WriteFile(target, original, 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	client := dialFTP(t, addr)
+	client.login("alice", "secret")
+
+	dc, _ := client.passiveConn()
+	client.send("APPE kept.bin")
+	client.read(150)
+
+	if tcp, ok := dc.(*net.TCPConn); ok {
+		_ = tcp.SetLinger(0)
+	}
+	if _, err := dc.Write([]byte("xxx")); err != nil {
+		t.Fatalf("data Write: %v", err)
+	}
+	_ = dc.Close()
+
+	_, _, err := client.tp.ReadResponse(4)
+	if err != nil {
+		t.Fatalf("ReadResponse for aborted APPE: %v", err)
+	}
+
+	// File must still exist and contain at least the original bytes.
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("ReadFile after aborted APPE: %v", err)
+	}
+	if !bytes.HasPrefix(data, original) {
+		t.Errorf("APPE abort lost original bytes: got %q; want prefix %q", data, original)
+	}
+
+	select {
+	case got := <-srv.CompletedUploads:
+		t.Fatalf("CompletedUploads received %+v for aborted APPE; want no event", got)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+// disconnects abruptly (without closing the open file handle), the server
+// removes the partial file and does NOT announce it on CompletedUploads.
+// Verifies the TransferError + writeLogger cleanup path.
+func TestSFTPServer_AbortedUpload_CleansUp(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	sshCfg := &ssh.ClientConfig{
+		User:            "testuser",
+		Auth:            []ssh.AuthMethod{ssh.Password("testpw")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	conn, err := ssh.Dial("tcp", addr, sshCfg)
+	if err != nil {
+		t.Fatalf("ssh.Dial: %v", err)
+	}
+	client, err := sftp.NewClient(conn)
+	if err != nil {
+		conn.Close()
+		t.Fatalf("sftp.NewClient: %v", err)
+	}
+
+	const name = "/aborted.txt"
+	f, err := client.Create(name)
+	if err != nil {
+		client.Close()
+		conn.Close()
+		t.Fatalf("client.Create: %v", err)
+	}
+	if _, err = f.Write([]byte("partial data")); err != nil {
+		client.Close()
+		conn.Close()
+		t.Fatalf("f.Write: %v", err)
+	}
+
+	// Drop the TCP connection without sending SFTP CLOSE for the handle.
+	// The request server should invoke TransferError(err) followed by
+	// Close() on the writeLogger, which must unlink the partial file and
+	// suppress the CompletedUploads announcement.
+	conn.Close()
+
+	// Allow the server time to process the abort.
+	deadline := time.Now().Add(3 * time.Second)
+	partial := filepath.Join(root, "aborted.txt")
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(partial); os.IsNotExist(err) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(partial); !os.IsNotExist(err) {
+		t.Errorf("partial file %q still exists after client disconnect: err=%v", partial, err)
+	}
+
+	// No CompletedUploads event should be emitted for an aborted upload.
+	select {
+	case got := <-srv.CompletedUploads:
+		t.Fatalf("CompletedUploads received %+v for aborted upload; want no event", got)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// TestSFTPServer_FsyncBeforeAnnounce verifies that the CompletedUploads event
+// is only emitted after the file is durably written: by the time the consumer
+// receives the event, the file is present on disk with the expected contents
+// and has been fsynced (we can't directly observe fsync, but we can verify
+// the visible-content ordering: content must be visible before the event).
+func TestSFTPServer_FsyncBeforeAnnounce(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	const name = "/durable.txt"
+	const payload = "must be durable"
+
+	f, err := client.Create(name)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err = f.Write([]byte(payload)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err = f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	select {
+	case got := <-srv.CompletedUploads:
+		if got.FilePath != name {
+			t.Errorf("CompletedUploads FilePath = %q; want %q", got.FilePath, name)
+		}
+		data, err := os.ReadFile(filepath.Join(root, "durable.txt"))
+		if err != nil {
+			t.Fatalf("read after CompletedUploads: %v", err)
+		}
+		if string(data) != payload {
+			t.Errorf("on-disk content = %q; want %q", string(data), payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for CompletedUploads")
+	}
+}

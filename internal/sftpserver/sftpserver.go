@@ -1149,6 +1149,19 @@ func (j jail) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 // signalling that the upload is complete. The sftp request server calls Close()
 // on the returned io.WriterAt when it detects an io.Closer.
 //
+// Durability: Close calls fsync (*os.File.Sync) on the underlying file before
+// closing it; the CompletedUpload event is only emitted after a successful
+// fsync+close, so a crash between the consumer receiving the event and the
+// kernel flushing the data cannot occur. If fsync or close fails, the error
+// is returned to the SFTP client and no completion event is emitted.
+//
+// Mid-transfer disconnect: writeLogger implements pkg/sftp.TransferError.
+// The request server invokes TransferError before Close when the SSH
+// connection drops or the request is abandoned (see request.go: open
+// requests are drained in RequestServer.Serve on EOF). When marked aborted,
+// Close skips fsync, closes the file, unlinks the partial file at
+// fullFilepath, and does NOT emit a completion event.
+//
 // If the uploaded filename ends with one of tempExts (e.g. ".tmp", ".writing"),
 // the file is considered still in progress and no notification is sent on
 // uploads; the completion notification will instead be emitted when the client
@@ -1161,33 +1174,85 @@ type writeLogger struct {
 	clientIP     string
 	uploads      chan<- CompletedUpload
 	tempExts     []string
+
+	mu      sync.Mutex
+	aborted bool
+}
+
+// TransferError implements pkg/sftp's TransferError interface. It is invoked
+// by the request-server when an in-flight transfer is aborted by client
+// disconnect or unexpected server-side error, before Close is called on the
+// writer. Recording the abort lets Close skip the success path (no fsync,
+// no announcement) and unlink the partial file.
+func (w *writeLogger) TransferError(err error) {
+	w.mu.Lock()
+	w.aborted = true
+	w.mu.Unlock()
+	if err != nil {
+		log.Printf("upload aborted: %q: %v", w.filepath, err)
+	} else {
+		log.Printf("upload aborted: %q", w.filepath)
+	}
 }
 
 func (w *writeLogger) Close() error {
-	err := w.File.Close()
-	if err == nil {
-		log.Printf("upload complete: %q", w.filepath)
-		if hasTempExt(w.filepath, w.tempExts) {
-			// File is still considered "in progress"; defer notification
-			// until the client renames it to its final (non-temp) name.
-			log.Printf("upload complete: %q has temp extension, deferring CompletedUploads notification", w.filepath)
-			return nil
+	w.mu.Lock()
+	aborted := w.aborted
+	w.mu.Unlock()
+
+	if aborted {
+		// Mid-transfer disconnect: discard any buffered data, close the
+		// file, and unlink the partial file so we don't leak half-written
+		// uploads on disk. The original transfer error has already been
+		// logged in TransferError; we return its underlying Close error
+		// for observability but do not announce on CompletedUploads.
+		closeErr := w.File.Close()
+		if rmErr := os.Remove(w.fullFilepath); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("partial-upload cleanup: remove %q: %v", w.fullFilepath, rmErr)
+		} else {
+			log.Printf("partial-upload cleanup: removed %q", w.fullFilepath)
 		}
-		// Announce the completed upload on the queue; non-blocking so a slow
-		// consumer never stalls the upload handler.
-		evt := CompletedUpload{
-			Username:     w.username,
-			FullFilePath: w.fullFilepath,
-			FilePath:     w.filepath,
-			ClientIP:     w.clientIP,
-		}
-		select {
-		case w.uploads <- evt:
-		default:
-			log.Printf("upload complete: CompletedUploads queue full, notification for %q dropped", w.filepath)
-		}
+		return closeErr
 	}
-	return err
+
+	// Normal completion path: fsync to guarantee bytes are on stable
+	// storage before we tell the consumer the upload is complete, then
+	// close. Either failure suppresses the completion notification so a
+	// consumer can never observe an event for data that may be lost on a
+	// power-loss crash.
+	if syncErr := w.File.Sync(); syncErr != nil {
+		// Best-effort close; preserve the original (sync) error so the
+		// SFTP client sees the real cause.
+		_ = w.File.Close()
+		log.Printf("upload fsync failed for %q: %v", w.filepath, syncErr)
+		return syncErr
+	}
+	if err := w.File.Close(); err != nil {
+		log.Printf("upload close failed for %q: %v", w.filepath, err)
+		return err
+	}
+
+	log.Printf("upload complete: %q", w.filepath)
+	if hasTempExt(w.filepath, w.tempExts) {
+		// File is still considered "in progress"; defer notification
+		// until the client renames it to its final (non-temp) name.
+		log.Printf("upload complete: %q has temp extension, deferring CompletedUploads notification", w.filepath)
+		return nil
+	}
+	// Announce the completed upload on the queue; non-blocking so a slow
+	// consumer never stalls the upload handler.
+	evt := CompletedUpload{
+		Username:     w.username,
+		FullFilePath: w.fullFilepath,
+		FilePath:     w.filepath,
+		ClientIP:     w.clientIP,
+	}
+	select {
+	case w.uploads <- evt:
+	default:
+		log.Printf("upload complete: CompletedUploads queue full, notification for %q dropped", w.filepath)
+	}
+	return nil
 }
 
 // Filewrite implements sftp.FileWriter.
@@ -2078,6 +2143,12 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 		return
 	}
 
+	// Track whether this STOR created/truncated a fresh file. If it did,
+	// a mid-transfer disconnect leaves no pre-existing data to preserve,
+	// so we should unlink the partial file. For APPE or REST resumes we
+	// must keep whatever bytes already existed.
+	createdFresh := !appendMode && f.restartOffset == 0
+
 	if f.restartOffset > 0 && !appendMode {
 		if _, err := file.Seek(f.restartOffset, io.SeekStart); err != nil {
 			f.restartOffset = 0
@@ -2090,12 +2161,32 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 
 	log.Printf("upload protocol=ftp path=%q", ftpPath)
 	_, copyErr := io.Copy(file, dc)
-	closeErr := file.Close()
 	if copyErr != nil {
+		// Mid-transfer error (typically client disconnect): close the
+		// file, then unlink the partial file if it was newly created
+		// during this STOR. Do not announce.
+		_ = file.Close()
+		if createdFresh {
+			if rmErr := os.Remove(full); rmErr != nil && !os.IsNotExist(rmErr) {
+				log.Printf("partial-upload cleanup: remove %q: %v", full, rmErr)
+			} else {
+				log.Printf("partial-upload cleanup: removed %q", full)
+			}
+		} else {
+			log.Printf("upload aborted: %q (kept existing bytes for APPE/REST)", ftpPath)
+		}
 		_ = f.reply(426, ftpErrMsg(copyErr))
 		return
 	}
-	if closeErr != nil {
+	// fsync before announcing so a consumer never observes a CompletedUpload
+	// for data that may be lost in a power-loss crash.
+	if syncErr := file.Sync(); syncErr != nil {
+		_ = file.Close()
+		log.Printf("upload fsync failed for %q: %v", ftpPath, syncErr)
+		_ = f.reply(451, ftpErrMsg(syncErr))
+		return
+	}
+	if closeErr := file.Close(); closeErr != nil {
 		_ = f.reply(451, ftpErrMsg(closeErr))
 		return
 	}
