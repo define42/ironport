@@ -35,7 +35,7 @@ func main() {
 		signer = mustHostKey()
 	}
 
-	srv := sftpserver.NewServer(*sftpAddr, *ftpAddr, *ftpPassive, users, signer)
+	srv := sftpserver.NewServer(*sftpAddr, *ftpAddr, *ftpPassive, users, signer, 64)
 	// Files written with one of these extensions are considered "still being
 	// written" and won't be announced on CompletedUploads until the client
 	// renames them to a final (non-temp) name.
