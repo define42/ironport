@@ -1,4 +1,4 @@
-// Package sftpserver: jail filesystem backend built on Linux openat2.
+// Package ironport: jail filesystem backend built on Linux openat2.
 //
 // This file implements the "no symlinks anywhere" filesystem policy by
 // performing every per-request filesystem operation through file descriptors
@@ -18,7 +18,7 @@
 // Setting access/modification times (SFTP Acmodtime) is rejected outright per
 // the hardened policy.
 
-package sftpserver
+package ironport
 
 import (
 	"errors"

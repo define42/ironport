@@ -1,4 +1,4 @@
-module github.com/define42/sftpserver
+module github.com/define42/ironport
 
 go 1.25.0
 

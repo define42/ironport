@@ -1,4 +1,4 @@
-# sftpserver
+# ironport
 
 A production-ready, embeddable SFTP server library for Go with a security-first design.
 
@@ -34,25 +34,25 @@ import (
     "crypto/rsa"
     "log"
 
-    "github.com/define42/sftpserver"
+    "github.com/define42/ironport"
     "golang.org/x/crypto/ssh"
 )
 
 func main() {
-    users := map[string]sftpserver.UserInfo{
+    users := map[string]ironport.UserInfo{
         "alice": {Password: "alicepw", Root: "/srv/sftp/alice", CanRead: true, CanWrite: true},
         "bob":   {Password: "bobpw",   Root: "/srv/sftp/bob",   CanRead: true, CanWrite: false},
     }
 
     // Load a stable host key from disk; fall back to an ephemeral key for demos.
-    signer, err := sftpserver.NewSignerFromFile("/etc/ssh/sftp_host_key")
+    signer, err := ironport.NewSignerFromFile("/etc/ssh/sftp_host_key")
     if err != nil {
         priv, _ := rsa.GenerateKey(rand.Reader, 3072)
         signer, _ = ssh.NewSignerFromKey(priv)
     }
 
     // ftpAddr is "" to disable the (plaintext) FTP listener.
-    srv := sftpserver.NewServer(":2022", "", "", users, signer, 64)
+    srv := ironport.NewServer(":2022", "", "", users, signer, 64)
 
     // Drain upload notifications in the background.
     go func() {
@@ -71,7 +71,7 @@ func main() {
 `NewServer` requires an explicit buffer-size argument:
 
 ```go
-srv := sftpserver.NewServer(":2022", "", "", users, signer, 256)
+srv := ironport.NewServer(":2022", "", "", users, signer, 256)
 ```
 
 When constructing a `Server` via a struct literal instead of `NewServer`,
@@ -79,7 +79,7 @@ set `CompletedUploadsSize` and leave `CompletedUploads` nil — `ListenAndServe`
 will initialize the channel automatically with that capacity:
 
 ```go
-srv := &sftpserver.Server{
+srv := &ironport.Server{
     Addr:                 ":2022",
     Signer:               signer,
     Users:                users,
@@ -96,7 +96,7 @@ Configure `TempExtensions` to emit `CompletedUploads` events at that final
 rename boundary:
 
 ```go
-srv := sftpserver.NewServer(":2022", "", "", users, signer, 64)
+srv := ironport.NewServer(":2022", "", "", users, signer, 64)
 srv.TempExtensions = []string{".tmp", ".writing"}
 ```
 
@@ -114,7 +114,7 @@ disabled by default; enable it only on a trusted network segment where you
 control all clients and intermediate hops:
 
 ```go
-srv := sftpserver.NewServer(":2022", ":2121", "5000-5010", users, signer, 64)
+srv := ironport.NewServer(":2022", ":2121", "5000-5010", users, signer, 64)
 ```
 
 When FTP is enabled, only passive mode (`PASV` / `EPSV`) is supported; active
@@ -127,7 +127,7 @@ Add one or more public keys to a user's `AuthorizedKeys` field at construction t
 
 ```go
 // At construction.
-users["alice"] = sftpserver.UserInfo{
+users["alice"] = ironport.UserInfo{
     Root:           "/srv/sftp/alice",
     CanRead:        true,
     CanWrite:       true,
@@ -143,7 +143,7 @@ srv.RemoveUserKey("alice", oldKey)
 
 ```go
 // Add or replace a user.
-srv.AddUser("carol", sftpserver.UserInfo{
+srv.AddUser("carol", ironport.UserInfo{
     Password: "carolpw",
     Root:     "/srv/sftp/carol",
     CanRead:  true,
@@ -162,13 +162,13 @@ srv.RemoveAllUsers()
 Use `NewSignerFromFile` to load a PEM-encoded RSA, ECDSA, or Ed25519 private key:
 
 ```go
-signer, err := sftpserver.NewSignerFromFile("/etc/ssh/sftp_host_key")
+signer, err := ironport.NewSignerFromFile("/etc/ssh/sftp_host_key")
 ```
 
 ## Running the example binary
 
 ```sh
-go run ./cmd/sftpserver -host-key /path/to/host_key
+go run ./cmd/ironport -host-key /path/to/host_key
 ```
 
 If `-host-key` is omitted a fresh RSA-3072 key is generated on every start (not suitable for production, as clients will see a different host key each time).

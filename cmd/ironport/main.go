@@ -6,7 +6,7 @@ import (
 	"flag"
 	"log"
 
-	"github.com/define42/sftpserver"
+	"github.com/define42/ironport"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -19,7 +19,7 @@ func main() {
 
 	// Example user DB (replace with your auth source).
 	// WARNING: never hardcode credentials in production; use env vars or a secret store.
-	users := map[string]sftpserver.UserInfo{
+	users := map[string]ironport.UserInfo{
 		"alice": {Password: "alicepw", Root: "/srv/sftp/alice", CanRead: true, CanWrite: true},
 		"bob":   {Password: "bobpw", Root: "/srv/sftp/bob", CanRead: true, CanWrite: false},
 	}
@@ -27,7 +27,7 @@ func main() {
 	var signer ssh.Signer
 	if *hostKeyPath != "" {
 		var err error
-		signer, err = sftpserver.NewSignerFromFile(*hostKeyPath)
+		signer, err = ironport.NewSignerFromFile(*hostKeyPath)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -35,7 +35,7 @@ func main() {
 		signer = mustHostKey()
 	}
 
-	srv := sftpserver.NewServer(*sftpAddr, *ftpAddr, *ftpPassive, users, signer, 64)
+	srv := ironport.NewServer(*sftpAddr, *ftpAddr, *ftpPassive, users, signer, 64)
 	// Files written with one of these extensions are considered "still being
 	// written" and won't be announced on CompletedUploads until the client
 	// renames them to a final (non-temp) name.

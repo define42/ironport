@@ -1,6 +1,6 @@
 //go:build linux
 
-// Package sftpserver provides an embeddable, security-hardened SFTP and FTP server.
+// Package ironport provides an embeddable, security-hardened SFTP and FTP server.
 //
 // Core features:
 //
@@ -14,9 +14,9 @@
 //
 // Typical usage:
 //
-//	srv := sftpserver.NewServer(":2022", ":2121", "5000-5010", users, signer, 64)
+//	srv := ironport.NewServer(":2022", ":2121", "5000-5010", users, signer, 64)
 //	log.Fatal(srv.ListenAndServe())
-package sftpserver
+package ironport
 
 import (
 	"bufio"
@@ -383,7 +383,7 @@ func (s *Server) RemoveUserKey(username string, key ssh.PublicKey) {
 // channel. Pass a positive integer to set an explicit capacity; non-positive
 // values fall back to the default capacity of 64:
 //
-//	srv := sftpserver.NewServer(":2022", "", "", users, signer, 256)
+//	srv := ironport.NewServer(":2022", "", "", users, signer, 256)
 func NewServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserInfo, signer ssh.Signer, completedUploadsSize int) *Server {
 	s := &Server{
 		Addr:                 addr,
@@ -471,17 +471,17 @@ func (s *Server) listenFTPData(host string) (net.Listener, error) {
 // occurs. It returns nil when stopped via Close.
 func (s *Server) ListenAndServe() error {
 	if strings.TrimSpace(s.Addr) == "" {
-		return errors.New("sftpserver: Addr is required")
+		return errors.New("ironport: Addr is required")
 	}
 	if s.Signer == nil {
-		return errors.New("sftpserver: Signer is required")
+		return errors.New("ironport: Signer is required")
 	}
 	// Hard requirement: the package's containment guarantee relies on
 	// openat2(RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS), available since Linux
 	// 5.6. Fail fast at startup on older kernels rather than silently
 	// degrading the policy at first request.
 	if err := ensureOpenat2(); err != nil {
-		return fmt.Errorf("sftpserver: %w", err)
+		return fmt.Errorf("ironport: %w", err)
 	}
 	s.initCompletedUploads()
 	cfg := s.sshServerConfig()
