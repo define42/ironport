@@ -10,6 +10,9 @@ import (
 )
 
 func main() {
+	// This command is a runnable library demo, not an operator-ready server.
+	// Production deployments should provide their own user source, logging,
+	// metrics, health checks, process supervision, and stable host-key handling.
 	hostKeyPath := flag.String("host-key", "", "path to a PEM-encoded private key file to use as the server host key (generated if not provided)")
 	sftpAddr := flag.String("sftp-addr", ":2022", "TCP address to listen on for SFTP")
 	ftpAddr := flag.String("ftp-addr", "", "TCP address to listen on for plaintext FTP (empty to disable; credentials are sent in the clear, see README)")

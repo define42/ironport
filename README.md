@@ -1,6 +1,6 @@
 # ironport
 
-A production-ready, embeddable SFTP server and FTP server library for Go with a security-first design.
+A production-ready, embeddable SFTP server and FTP server library for Go with a security-first design. The production-ready claim applies to the library API; the command under `cmd/ironport-demo` is only a runnable demo.
 
 ## Features
 
@@ -24,6 +24,12 @@ This package is **Linux-only**. The path-containment guarantee depends on the
 `openat2` syscall with `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS`, available
 since Linux 5.6. `ListenAndServe` probes for `openat2` at startup and
 returns an error on older kernels rather than silently degrading the policy.
+
+## Project policy
+
+- Security reports: see [SECURITY.md](SECURITY.md).
+- Release notes: see [CHANGELOG.md](CHANGELOG.md).
+- Contributions: see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Quick start
 
@@ -221,16 +227,21 @@ RSA-3072 host key and stores it on the server. This is convenient for demos, but
 not suitable for production because clients will see a different host key after
 each process restart.
 
-## Running the example binary
+## Running the demo binary
 
 ```sh
-go run ./cmd/ironport -host-key /path/to/host_key
+go run ./cmd/ironport-demo -host-key /path/to/host_key
 ```
+
+`cmd/ironport-demo` is intentionally not an operator tool. It hard-codes
+example users, uses basic logging, has no metrics, config file,
+readiness/healthcheck endpoint, or service-manager integration, and is meant to
+show library wiring rather than production deployment.
 
 If `-host-key` is omitted, `ListenAndServe` generates a fresh RSA-3072 key on
 every start. This is not suitable for production, as clients will see a
 different host key each time.
-The example binary also accepts comma-separated `-ssh-key-exchanges`,
+The demo binary also accepts comma-separated `-ssh-key-exchanges`,
 `-ssh-ciphers`, `-ssh-macs`, and `-ssh-public-key-auth-algorithms` flags.
 
 ## License
