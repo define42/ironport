@@ -16,7 +16,7 @@ import (
 	"net/textproto"
 	"os"
 	"path/filepath"
-	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -605,16 +605,16 @@ func TestSSHServerConfig_AppliesAlgorithmPins(t *testing.T) {
 	config.TempExtensions[0] = ".writing"
 
 	cfg := srv.sshServerConfig()
-	if !reflect.DeepEqual(cfg.KeyExchanges, []string{ssh.KeyExchangeCurve25519}) {
+	if !slices.Equal(cfg.KeyExchanges, []string{ssh.KeyExchangeCurve25519}) {
 		t.Fatalf("KeyExchanges = %v; want %v", cfg.KeyExchanges, []string{ssh.KeyExchangeCurve25519})
 	}
-	if !reflect.DeepEqual(cfg.Ciphers, []string{ssh.CipherAES256CTR}) {
+	if !slices.Equal(cfg.Ciphers, []string{ssh.CipherAES256CTR}) {
 		t.Fatalf("Ciphers = %v; want %v", cfg.Ciphers, []string{ssh.CipherAES256CTR})
 	}
-	if !reflect.DeepEqual(cfg.MACs, []string{ssh.HMACSHA256}) {
+	if !slices.Equal(cfg.MACs, []string{ssh.HMACSHA256}) {
 		t.Fatalf("MACs = %v; want %v", cfg.MACs, []string{ssh.HMACSHA256})
 	}
-	if !reflect.DeepEqual(cfg.PublicKeyAuthAlgorithms, []string{ssh.KeyAlgoRSASHA256}) {
+	if !slices.Equal(cfg.PublicKeyAuthAlgorithms, []string{ssh.KeyAlgoRSASHA256}) {
 		t.Fatalf("PublicKeyAuthAlgorithms = %v; want %v", cfg.PublicKeyAuthAlgorithms, []string{ssh.KeyAlgoRSASHA256})
 	}
 
@@ -3110,9 +3110,12 @@ func TestCleanSFTPClientPath(t *testing.T) {
 }
 
 // TestServer_TempExtensionsNormalisation verifies that TempExtensions are
-// normalised (lower-cased, dot-prefixed, empty entries stripped) before use.
+// normalised (lower-cased, dot-prefixed, empty entries stripped) at
+// construction.
 func TestServer_TempExtensionsNormalisation(t *testing.T) {
-	srv := &server{tempExtensionsConfig: []string{"TMP", ".Writing", "  ", ".part"}}
+	config := DefaultIronportConfig()
+	config.TempExtensions = []string{"TMP", ".Writing", "  ", ".part"}
+	srv := NewServer(config)
 	got := srv.tempExtensions()
 	want := []string{".tmp", ".writing", ".part"}
 	if len(got) != len(want) {

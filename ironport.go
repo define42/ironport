@@ -267,6 +267,24 @@ func cloneUsers(users map[string]UserInfo) map[string]UserInfo {
 	return cloned
 }
 
+func normalizeTempExtensions(src []string) []string {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(src))
+	for _, ext := range src {
+		ext = strings.ToLower(strings.TrimSpace(ext))
+		if ext == "" {
+			continue
+		}
+		if !strings.HasPrefix(ext, ".") {
+			ext = "." + ext
+		}
+		out = append(out, ext)
+	}
+	return out
+}
+
 // CompletedUpload describes a file upload that has finished successfully.
 // It is the payload delivered on the server's CompletedUploads stream.
 type CompletedUpload struct {
@@ -509,7 +527,7 @@ func NewServer(config *ironportConfig) *server {
 		sshCiphers:                 slices.Clone(config.SSHCiphers),
 		sshMACs:                    slices.Clone(config.SSHMACs),
 		sshPublicKeyAuthAlgorithms: slices.Clone(config.SSHPublicKeyAuthAlgorithms),
-		tempExtensionsConfig:       slices.Clone(config.TempExtensions),
+		tempExtensionsConfig:       normalizeTempExtensions(config.TempExtensions),
 		idleTimeoutConfig:          config.IdleTimeout,
 		allowChownConfig:           config.AllowChown,
 		activeConns:                make(map[net.Conn]struct{}),
@@ -820,39 +838,17 @@ func nextAcceptBackoff(prev time.Duration) time.Duration {
 	return next
 }
 
-// tempExtensions returns a normalised copy of the configured temp extensions:
-// each entry is
-// lower-cased and guaranteed to start with a single leading dot. Empty entries
-// are dropped. The result is safe to use without holding s.mu because it is
-// a freshly allocated slice.
+// tempExtensions returns a copy of the normalised temp extensions configured
+// at construction.
 func (s *server) tempExtensions() []string {
-	s.mu.RLock()
-	src := s.tempExtensionsConfig
-	s.mu.RUnlock()
-	if len(src) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(src))
-	for _, ext := range src {
-		ext = strings.ToLower(strings.TrimSpace(ext))
-		if ext == "" {
-			continue
-		}
-		if !strings.HasPrefix(ext, ".") {
-			ext = "." + ext
-		}
-		out = append(out, ext)
-	}
-	return out
+	return slices.Clone(s.tempExtensionsConfig)
 }
 
 // idleTimeout returns the effective idle timeout for SFTP connections.
 // A zero configured timeout selects the package default; a negative timeout
 // disables the deadline.
 func (s *server) idleTimeout() time.Duration {
-	s.mu.RLock()
 	d := s.idleTimeoutConfig
-	s.mu.RUnlock()
 	switch {
 	case d == 0:
 		return defaultSFTPIdleTimeout
@@ -862,10 +858,8 @@ func (s *server) idleTimeout() time.Duration {
 	return d
 }
 
-// allowChown returns the configured chown permission under the server lock.
+// allowChown returns the configured chown permission.
 func (s *server) allowChown() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	return s.allowChownConfig
 }
 
