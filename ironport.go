@@ -52,6 +52,7 @@ import (
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/sys/unix"
 )
 
 // Default timeouts and limits applied unless callers override them.
@@ -3073,7 +3074,7 @@ func mlstPermFact(info os.FileInfo, canWrite bool) string {
 // fact. Per RFC 3659 the value need only be unique within the server; we
 // derive it from dev+ino when available and fall back to mtime+size.
 func mlstUniqueFact(info os.FileInfo) string {
-	if st, ok := info.Sys().(*syscall.Stat_t); ok && st != nil {
+	if st, ok := info.Sys().(*unix.Stat_t); ok && st != nil {
 		return fmt.Sprintf("%XU%X", st.Dev, st.Ino)
 	}
 	return fmt.Sprintf("M%XS%X", info.ModTime().UnixNano(), info.Size())
