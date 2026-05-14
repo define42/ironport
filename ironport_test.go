@@ -251,7 +251,15 @@ func startTestServerWithConfig(t *testing.T, config *Config) (srv *Server, addr 
 			if err != nil {
 				return // listener closed
 			}
-			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.sftpChownAllowed())
+			if !srv.trackConn(nc) {
+				_ = nc.Close()
+				continue
+			}
+			go func() {
+				defer srv.connWG.Done()
+				defer srv.untrackConn(nc)
+				srv.handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.sftpChownAllowed())
+			}()
 		}
 	}()
 
@@ -2007,6 +2015,64 @@ func TestServer_AddRemoveUser(t *testing.T) {
 	}
 }
 
+// TestServer_RemoveUser_DisconnectsActiveSFTP verifies that RemoveUser
+// force-closes an SFTP session that is currently authenticated as the
+// removed user.
+func TestServer_RemoveUser_DisconnectsActiveSFTP(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"victim": {Password: "pw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "victim", "pw")
+	if _, err := client.ReadDir("/"); err != nil {
+		t.Fatalf("pre-remove ReadDir: %v", err)
+	}
+
+	srv.RemoveUser("victim")
+
+	// After RemoveUser the existing SFTP session must be torn down. Poll
+	// briefly because the close races with the server-side handler goroutine.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		_, err := client.ReadDir("/")
+		if err != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("expected SFTP session to be closed after RemoveUser, but it still serves requests")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestServer_RemoveUser_DisconnectsActiveFTP verifies that RemoveUser
+// force-closes an FTP control connection that is currently authenticated as
+// the removed user.
+func TestServer_RemoveUser_DisconnectsActiveFTP(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"victim": {Password: "pw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestFTPServer(t, users, "")
+	t.Cleanup(stop)
+
+	c := dialFTP(t, addr)
+	c.login("victim", "pw")
+
+	srv.RemoveUser("victim")
+
+	// The control connection should now be closed by the server. A
+	// subsequent command read must surface an error.
+	c.send("NOOP")
+	_ = c.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := c.tp.ReadResponse(0); err == nil {
+		t.Fatal("expected FTP control connection to be closed after RemoveUser, got nil error")
+	}
+}
+
 // TestServer_AddUser_Replace verifies that AddUser replaces an existing user's info.
 func TestServer_AddUser_Replace(t *testing.T) {
 	root := t.TempDir()
@@ -2256,7 +2322,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.sftpChownAllowed())
+			go srv.handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.sftpChownAllowed())
 		}
 	}()
 	t.Cleanup(func() { _ = ln.Close() })
@@ -4071,7 +4137,7 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.sftpChownAllowed())
+			go srv.handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.sftpChownAllowed())
 		}
 	}()
 

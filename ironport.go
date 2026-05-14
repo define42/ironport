@@ -492,9 +492,12 @@ type Server struct {
 	// per the sync.WaitGroup contract.
 	connWG sync.WaitGroup
 	// activeConns holds every accepted connection that has not yet returned
-	// from its handler. It is consulted by Shutdown to force-close
-	// stragglers when the caller's context deadline fires.
-	activeConns map[net.Conn]struct{}
+	// from its handler, mapped to the username currently authenticated on
+	// that connection (empty string before authentication, or after FTP REIN).
+	// It is consulted by Shutdown to force-close stragglers when the caller's
+	// context deadline fires, and by RemoveUser to evict active sessions of
+	// a user being deleted.
+	activeConns map[net.Conn]string
 	// shutdownWaiters counts concurrent Shutdown callers so shuttingDown stays
 	// true until the final caller has finished waiting on connWG.
 	shutdownWaiters int
@@ -556,13 +559,23 @@ func (s *Server) AddUser(username string, info UserInfo) {
 	s.users[username] = cloneUserInfo(info)
 }
 
-// RemoveUser removes a user entry from the server's user map.
-// Active connections for that user are not terminated.
+// RemoveUser removes a user entry from the server's user map and force-closes
+// any connections currently authenticated as that user, so an in-flight
+// session cannot keep operating after its credentials have been revoked.
 // It is safe to call concurrently with active connections.
 func (s *Server) RemoveUser(username string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.users, username)
+	var toClose []net.Conn
+	for nc, u := range s.activeConns {
+		if u == username {
+			toClose = append(toClose, nc)
+		}
+	}
+	s.mu.Unlock()
+	for _, c := range toClose {
+		_ = c.Close()
+	}
 }
 
 // RemoveAllUsers removes every user entry from the server's user map.
@@ -677,7 +690,7 @@ func NewServer(config *Config) *Server {
 		idleTimeout:                config.IdleTimeout,
 		tcpKeepAlivePeriod:         config.TCPKeepAlivePeriod,
 		sftpAllowChown:             config.SftpAllowChown,
-		activeConns:                make(map[net.Conn]struct{}),
+		activeConns:                make(map[net.Conn]string),
 	}
 	return s
 }
@@ -767,11 +780,23 @@ func (s *Server) trackConn(nc net.Conn) bool {
 		return false
 	}
 	if s.activeConns == nil {
-		s.activeConns = make(map[net.Conn]struct{})
+		s.activeConns = make(map[net.Conn]string)
 	}
-	s.activeConns[nc] = struct{}{}
+	s.activeConns[nc] = ""
 	s.connWG.Add(1)
 	return true
+}
+
+// setConnUser records username as the authenticated identity on nc. It is a
+// no-op when nc is not currently tracked (e.g., in tests that bypass the
+// accept loop). Pass an empty username to clear the association (used after
+// FTP REIN so the now-anonymous session is no longer tied to the prior user).
+func (s *Server) setConnUser(nc net.Conn, username string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.activeConns[nc]; ok {
+		s.activeConns[nc] = username
+	}
 }
 
 // untrackConn removes nc from the in-flight set. The corresponding
@@ -989,7 +1014,7 @@ func (s *Server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig, uploads chan<
 	idleTimeout := s.effectiveIdleTimeout()
 	allowChown := s.sftpChownAllowed()
 	return s.acceptLoop(ln, "sftp", func(nc net.Conn) {
-		handleConn(nc, cfg, uploads, authEvents, tempExts, idleTimeout, allowChown)
+		s.handleConn(nc, cfg, uploads, authEvents, tempExts, idleTimeout, allowChown)
 	})
 }
 
@@ -1472,7 +1497,7 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 	return cfg
 }
 
-func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent, tempExts []string, idleTimeout time.Duration, sftpAllowChown bool) {
+func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent, tempExts []string, idleTimeout time.Duration, sftpAllowChown bool) {
 	defer func() { _ = nc.Close() }()
 
 	// Wrap the raw connection so that every Read resets the read deadline.
@@ -1498,6 +1523,9 @@ func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUplo
 	canRead := sshConn.Permissions.Extensions["canRead"] == "true"
 	canWrite := sshConn.Permissions.Extensions["canWrite"] == "true"
 	clientIP := remoteIP(sshConn.RemoteAddr())
+	// Record the authenticated user on this connection so RemoveUser can
+	// force-close it if the account is later revoked.
+	s.setConnUser(nc, user)
 	log.Printf("login protocol=sftp user=%s root=%s from=%s", user, jailRoot, sshConn.RemoteAddr())
 	announceAuthEvent(authEvents, AuthEvent{
 		Type:     AuthEventLoginSuccess,
@@ -2413,6 +2441,9 @@ func (f *ftpSession) authenticate(pass string) bool {
 	f.cwd = "/"
 	f.rnfrPath = ""
 	f.restartOffset = 0
+	// Tie the connection to the authenticated user so RemoveUser can
+	// force-close active FTP sessions if the account is revoked.
+	f.server.setConnUser(f.conn, f.username)
 	return true
 }
 
@@ -3016,6 +3047,10 @@ func (f *ftpSession) cmdRein() {
 	f.rnfrPath = ""
 	f.restartOffset = 0
 	f.expectedUploadSize = 0
+	// The session is no longer tied to the previous user; clear the
+	// connection's user association so a RemoveUser for that name does not
+	// kick this now-anonymous session.
+	f.server.setConnUser(f.conn, "")
 	_ = f.reply(220, "ready for new user")
 }
 
