@@ -528,14 +528,14 @@ func TestNewServer(t *testing.T) {
 	config.Signer = signer
 	config.CompletedUploadSize = defaultCompletedUploadsSize
 	srv := NewServer(config)
-	if srv.Addr != ":0" {
-		t.Errorf("Addr = %q; want :0", srv.Addr)
+	if srv.addr != ":0" {
+		t.Errorf("addr = %q; want :0", srv.addr)
 	}
-	if srv.FTPAddr != ":0" {
-		t.Errorf("FTPAddr = %q; want :0", srv.FTPAddr)
+	if srv.ftpAddr != ":0" {
+		t.Errorf("ftpAddr = %q; want :0", srv.ftpAddr)
 	}
-	if srv.FTPPassivePortRange != "5000-5010" {
-		t.Errorf("FTPPassivePortRange = %q; want 5000-5010", srv.FTPPassivePortRange)
+	if srv.ftpPassivePortRange != "5000-5010" {
+		t.Errorf("ftpPassivePortRange = %q; want 5000-5010", srv.ftpPassivePortRange)
 	}
 	if len(srv.users) != 1 {
 		t.Errorf("users len = %d; want 1", len(srv.users))
@@ -826,7 +826,7 @@ func TestServerListenFTPData(t *testing.T) {
 		t.Cleanup(func() { _ = busyLn.Close() })
 
 		port := busyLn.Addr().(*net.TCPAddr).Port
-		srv := &server{FTPPassivePortRange: strconv.Itoa(port)}
+		srv := &server{ftpPassivePortRange: strconv.Itoa(port)}
 		if _, err := srv.listenFTPData("127.0.0.1"); err == nil {
 			t.Fatal("listenFTPData error = nil; want non-nil when configured port is already in use")
 		}
@@ -2777,7 +2777,7 @@ func TestServer_ListenAndServe_AfterShutdown(t *testing.T) {
 // error immediately when Addr is empty or blank without opening any listener.
 func TestServer_ListenAndServe_EmptyAddr(t *testing.T) {
 	for _, addr := range []string{"", "   ", "\t"} {
-		srv := &server{Addr: addr, signer: testSigner(t)}
+		srv := &server{addr: addr, signer: testSigner(t)}
 		err := srv.ListenAndServe()
 		if err == nil {
 			t.Errorf("addr=%q: expected error, got nil", addr)

@@ -297,15 +297,15 @@ type CompletedUpload struct {
 // server is a self-contained SFTP server with optional FTP support.
 // It is unexported so external callers construct servers through NewServer.
 type server struct {
-	// Addr is the TCP address to listen on for SFTP, e.g. ":2022".
-	Addr string
-	// FTPAddr is the TCP address to listen on for FTP, e.g. ":2121".
+	// addr is the TCP address to listen on for SFTP, e.g. ":2022".
+	addr string
+	// ftpAddr is the TCP address to listen on for FTP, e.g. ":2121".
 	// Set it to "" to disable FTP.
-	FTPAddr string
-	// FTPPassivePortRange optionally constrains FTP passive-mode data listeners
+	ftpAddr string
+	// ftpPassivePortRange optionally constrains FTP passive-mode data listeners
 	// to a single port or inclusive range such as "5000-5010". Leave it empty
 	// to let the OS choose any available port.
-	FTPPassivePortRange string
+	ftpPassivePortRange string
 	// users maps usernames to their credentials and jail roots.
 	users map[string]UserInfo
 	// mu protects users, completedUploads, and listeners for concurrent reads and writes.
@@ -503,9 +503,9 @@ func NewServer(config *ironportConfig) *server {
 		config = DefaultIronportConfig()
 	}
 	s := &server{
-		Addr:                       config.Addr,
-		FTPAddr:                    config.FtpAddr,
-		FTPPassivePortRange:        config.FtpPassivePortRange,
+		addr:                       config.Addr,
+		ftpAddr:                    config.FtpAddr,
+		ftpPassivePortRange:        config.FtpPassivePortRange,
 		users:                      cloneUsers(config.Users),
 		signer:                     config.Signer,
 		completedUploads:           newCompletedUploadsChannel(config.CompletedUploadSize),
@@ -642,7 +642,7 @@ func parseFTPPassivePortRange(portRange string) (start, end int, err error) {
 }
 
 func (s *server) listenFTPData(host string) (net.Listener, error) {
-	portRange := strings.TrimSpace(s.FTPPassivePortRange)
+	portRange := strings.TrimSpace(s.ftpPassivePortRange)
 	if portRange == "" {
 		return net.Listen("tcp", net.JoinHostPort(host, "0"))
 	}
@@ -663,14 +663,14 @@ func (s *server) listenFTPData(host string) (net.Listener, error) {
 	return nil, fmt.Errorf("all FTP passive ports in range %q are unavailable: %w", portRange, lastErr)
 }
 
-// ListenAndServe starts the SFTP server and, when FTPAddr is non-empty, the FTP
-// server too. It blocks until Close or Shutdown is called or an unexpected
+// ListenAndServe starts the SFTP server and, when configured, the FTP server
+// too. It blocks until Close or Shutdown is called or an unexpected
 // listener error occurs. It returns nil when stopped via Close or Shutdown.
 //
 // A server that has been Shutdown cannot be reused; ListenAndServe returns
 // an error in that case. Construct a fresh server instead.
 func (s *server) ListenAndServe() error {
-	if strings.TrimSpace(s.Addr) == "" {
+	if strings.TrimSpace(s.addr) == "" {
 		return errors.New("ironport: Addr is required")
 	}
 	s.mu.RLock()
@@ -692,14 +692,14 @@ func (s *server) ListenAndServe() error {
 	uploads := s.completedUploadsChan()
 	cfg := s.sshServerConfig()
 
-	sftpLn, err := net.Listen("tcp", s.Addr)
+	sftpLn, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		return err
 	}
 
 	var ftpLn net.Listener
-	if strings.TrimSpace(s.FTPAddr) != "" {
-		ftpLn, err = net.Listen("tcp", s.FTPAddr)
+	if strings.TrimSpace(s.ftpAddr) != "" {
+		ftpLn, err = net.Listen("tcp", s.ftpAddr)
 		if err != nil {
 			_ = sftpLn.Close()
 			return err
