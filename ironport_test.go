@@ -6280,6 +6280,139 @@ func TestFTPServer_EPSVAllRejectsActiveMode(t *testing.T) {
 	client.command(229, "EPSV")
 }
 
+// TestFTPServer_ActiveModeAborMidTransfer verifies that the RFC 959 ABOR
+// handshake (426 to the transfer command, 226 to the ABOR) works for an
+// active-mode upload. Active and passive transfers share runTransfer, so
+// this guards against a regression if acceptDataConn is ever split per
+// mode and the abort path diverges.
+func TestFTPServer_ActiveModeAborMidTransfer(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"u": {Password: "p", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestFTPServerWithActive(t, users, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("u", "p")
+	client.command(200, "TYPE I")
+
+	ln := client.activePORTListener()
+	client.send("STOR aborted.txt")
+	client.read(150)
+	dc := acceptFTPActiveData(t, ln)
+	if _, err := dc.Write([]byte("partial-")); err != nil {
+		t.Fatalf("active data Write: %v", err)
+	}
+
+	client.send("ABOR")
+	client.read(426)
+	client.read(226)
+	_ = dc.Close()
+	_ = ln.Close()
+
+	select {
+	case evt := <-srv.CompletedUploads():
+		t.Fatalf("CompletedUploads fired for aborted active upload: %+v", evt)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// Session must remain usable after an active-mode abort: a fresh
+	// EPRT transfer should complete normally.
+	ln2 := client.activeEPRTListener()
+	client.send("STOR after.txt")
+	client.read(150)
+	dc2 := acceptFTPActiveData(t, ln2)
+	body := []byte("after-abort")
+	if _, err := dc2.Write(body); err != nil {
+		t.Fatalf("active data Write (after): %v", err)
+	}
+	_ = dc2.Close()
+	_ = ln2.Close()
+	client.read(226)
+
+	select {
+	case evt := <-srv.CompletedUploads():
+		if evt.FilePath != "/after.txt" {
+			t.Fatalf("CompletedUploads FilePath = %q; want /after.txt", evt.FilePath)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for post-abort active upload event")
+	}
+
+	if got, err := os.ReadFile(filepath.Join(root, "after.txt")); err != nil {
+		t.Fatalf("os.ReadFile(after.txt): %v", err)
+	} else if !bytes.Equal(got, body) {
+		t.Fatalf("after.txt = %q; want %q", got, body)
+	}
+}
+
+// TestFTPServer_ActiveModeDialTimeoutReplies425 verifies that when the
+// server's outbound active-mode dial cannot complete within
+// effectiveFTPDataAcceptTimeout, the transfer command is answered with
+// 150 followed by 425 — never a spurious 226. A 1ns timeout forces the
+// deadline to fire before any connect attempt can succeed.
+func TestFTPServer_ActiveModeDialTimeoutReplies425(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"u": {Password: "p", Root: root, CanRead: true, CanWrite: true},
+	}
+	config := newTestFTPConfig(t, users, "", true)
+	config.FtpDataAcceptTimeout = time.Nanosecond
+	_, addr, stop := startTestFTPServerWithConfig(t, config)
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("u", "p")
+
+	// Reserve and immediately release a local port so the PORT target
+	// is well-formed. The dial would never complete in 1ns anyway, so
+	// whether the port is bound or not is incidental.
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen(probe): %v", err)
+	}
+	target := probe.Addr().(*net.TCPAddr)
+	_ = probe.Close()
+	ip := target.IP.To4()
+	if ip == nil {
+		t.Fatalf("probe listener IP = %v; want IPv4", target.IP)
+	}
+	client.command(200, "PORT %d,%d,%d,%d,%d,%d", ip[0], ip[1], ip[2], ip[3], target.Port/256, target.Port%256)
+
+	client.send("LIST")
+	client.read(150)
+	client.read(425)
+}
+
+// TestFTPServer_REINClearsEpsvAll verifies that REIN flushes the
+// EPSV-ALL latch so a re-authenticated session may use PORT/EPRT again.
+// Without the reset, a long-lived control connection that ever issued
+// EPSV ALL would be locked into passive mode forever.
+func TestFTPServer_REINClearsEpsvAll(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"u": {Password: "p", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestFTPServerWithActive(t, users, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("u", "p")
+
+	client.command(200, "EPSV ALL")
+	client.command(502, "PORT 127,0,0,1,4,210")
+	client.command(502, "EPRT |1|127.0.0.1|4000|")
+
+	client.command(220, "REIN")
+	client.login("u", "p")
+
+	ln := client.activePORTListener()
+	_ = ln.Close()
+	ln2 := client.activeEPRTListener()
+	_ = ln2.Close()
+}
+
 // TestFTPServer_STORWithoutPassiveModeFails verifies that data-transfer
 // commands fail cleanly (150 then 425) when the client never opened a
 // passive listener. The control session must remain usable after each

@@ -2780,6 +2780,7 @@ func (f *ftpSession) acceptDataConn() (net.Conn, error) {
 		if timeout := f.server.effectiveFTPDataAcceptTimeout(); timeout > 0 {
 			dialer.Timeout = timeout
 		}
+		log.Printf("ftp active data dial user=%s from=%s to=%s", f.username, f.conn.RemoteAddr(), addr)
 		return dialer.Dial("tcp", addr.String())
 	}
 
