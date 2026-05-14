@@ -1431,23 +1431,36 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, usernam
 			}
 			_ = req.Reply(true, nil)
 
-			handlers, fs, err := jailedHandlers(jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts, allowChown)
-			if err != nil {
-				log.Printf("open jail root %q: %v", jailRoot, err)
-				return
-			}
-			defer func() { _ = fs.Close() }()
-
-			server := sftp.NewRequestServer(ch, handlers)
-			defer func() { _ = server.Close() }()
-			if err := server.Serve(); err != nil && !errors.Is(err, io.EOF) {
-				log.Println("sftp serve:", err)
-			}
+			// Serving the SFTP subsystem is delegated to a helper so that
+			// its cleanup defers (fs.Close, server.Close) run on its own
+			// return rather than accumulating inside this for/switch — a
+			// defer placed directly in this case would survive across loop
+			// iterations if the trailing `return` were ever removed.
+			serveSFTPSubsystem(ch, jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts, allowChown)
 			return
 
 		default:
 			_ = req.Reply(false, nil)
 		}
+	}
+}
+
+// serveSFTPSubsystem opens the per-session jail, runs the SFTP request server
+// to completion, and tears both down via defer so the cleanup is local to this
+// function and not to handleSession's loop body. Callers must already have
+// replied to the "subsystem" request before invoking it.
+func serveSFTPSubsystem(ch ssh.Channel, jailRoot, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, allowChown bool) {
+	handlers, fs, err := jailedHandlers(jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts, allowChown)
+	if err != nil {
+		log.Printf("open jail root %q: %v", jailRoot, err)
+		return
+	}
+	defer func() { _ = fs.Close() }()
+
+	server := sftp.NewRequestServer(ch, handlers)
+	defer func() { _ = server.Close() }()
+	if err := server.Serve(); err != nil && !errors.Is(err, io.EOF) {
+		log.Println("sftp serve:", err)
 	}
 }
 
@@ -1530,6 +1543,11 @@ type writeLogger struct {
 func (w *writeLogger) WriteAt(p []byte, off int64) (n int, err error) {
 	defer deferRecoverSFTPPanicf(&err, func() { n = 0 }, "sftp write panic user=%q ip=%q path=%q: %v\n%s", w.username, w.clientIP, w.filepath)()
 	if w.appendMode {
+		// O_APPEND semantics (open(2)): on every write the kernel
+		// atomically re-seeks the file offset to EOF before writing, so
+		// the off parameter from the SFTP request is intentionally
+		// dropped — honouring it would not change the destination of
+		// the bytes and would only confuse the next reader.
 		return w.Write(p)
 	}
 	return w.File.WriteAt(p, off)
@@ -2894,8 +2912,12 @@ func (f *ftpSession) cmdRein() {
 // over the control connection (no data connection), which clients often
 // issue immediately after login as a low-overhead probe.
 func (f *ftpSession) cmdStat(arg string) {
-	path := strings.TrimSpace(arg)
-	if path == "" {
+	// Use rawPath rather than path here: a local named "path" would shadow
+	// the imported "path" package, so any future edit that calls path.Base
+	// or path.Clean inside this function would silently become a method
+	// call on a string.
+	rawPath := strings.TrimSpace(arg)
+	if rawPath == "" {
 		lines := []string{
 			fmt.Sprintf("Connected from %s", sanitizeFTPText(f.clientIP)),
 			fmt.Sprintf("Logged in as %s", sanitizeFTPText(f.username)),
@@ -2913,7 +2935,7 @@ func (f *ftpSession) cmdStat(arg string) {
 		_ = f.reply(550, "permission denied")
 		return
 	}
-	ftpPath := f.cleanPath(listPathArg(path))
+	ftpPath := f.cleanPath(listPathArg(rawPath))
 	st, err := f.fs.Stat(ftpPath)
 	if err != nil {
 		_ = f.reply(550, ftpErrMsg(err))

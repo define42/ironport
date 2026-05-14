@@ -369,7 +369,13 @@ func (j *jailFS) Chmod(clientPath string, perm os.FileMode) error {
 	fd, err := j.openat(rel, os.O_RDONLY, 0)
 	if err != nil {
 		// Fall back to read-write if the file is write-only; failing that,
-		// surface the original error.
+		// surface the original O_RDONLY error. The O_WRONLY error is
+		// intentionally discarded: the O_RDONLY result is the one the
+		// caller actually asked about (it covers the common cases —
+		// ENOENT, EACCES on the path, jail escape) whereas an O_WRONLY
+		// failure on the fallback only tells us that "the second guess
+		// didn't work either", which would be more confusing than
+		// helpful.
 		fd2, err2 := j.openat(rel, os.O_WRONLY, 0)
 		if err2 != nil {
 			return &os.PathError{Op: "chmod", Path: clientPath, Err: err}
