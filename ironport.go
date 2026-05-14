@@ -483,8 +483,9 @@ type Config struct {
 	// notifications until a later rename to a non-temp name. Matching is
 	// case-insensitive.
 	TempExtensions []string
-	// IdleTimeout bounds authenticated SFTP connection inactivity. Zero selects
-	// the package default; negative disables the idle timeout.
+	// IdleTimeout bounds authenticated SFTP connection inactivity and FTP
+	// control-session inactivity between commands. Zero selects the package
+	// default; negative disables the idle timeout.
 	IdleTimeout time.Duration
 	// TCPKeepAlivePeriod controls the SO_KEEPALIVE idle period applied to
 	// accepted SFTP and FTP control connections. Zero selects the package
