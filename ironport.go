@@ -27,6 +27,8 @@ package ironport
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/binary"
@@ -72,6 +74,9 @@ const (
 	// defaultCompletedUploadsSize is the fallback buffer size used for the
 	// CompletedUploads channel.
 	defaultCompletedUploadsSize = 64
+	// ephemeralHostKeyBits is the size of the in-memory RSA host key generated
+	// when a server is started without an explicit signer.
+	ephemeralHostKeyBits = 3072
 	// authorizedKeyTimingPad is the minimum number of constant-time key
 	// comparisons performed by the public-key auth callback. Users with
 	// fewer AuthorizedKeys are padded with dummy comparisons up to this
@@ -483,8 +488,9 @@ func (s *server) RemoveUserKey(username string, key ssh.PublicKey) {
 }
 
 // DefaultIronportConfig returns a fresh server configuration with package
-// defaults applied. Callers should set Users and Signer before starting the
-// server.
+// defaults applied. Callers should set Users before starting the server. Set
+// Signer to use a stable host key; when Signer is nil, ListenAndServe generates
+// an ephemeral in-memory host key.
 func DefaultIronportConfig() *ironportConfig {
 	return &ironportConfig{
 		Addr:                ":2022",
@@ -519,6 +525,28 @@ func NewServer(config *ironportConfig) *server {
 		activeConns:         make(map[net.Conn]struct{}),
 	}
 	return s
+}
+
+func generateEphemeralSigner() (ssh.Signer, error) {
+	priv, err := rsa.GenerateKey(rand.Reader, ephemeralHostKeyBits)
+	if err != nil {
+		return nil, err
+	}
+	return ssh.NewSignerFromKey(priv)
+}
+
+func (s *server) ensureSigner() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.signer != nil {
+		return nil
+	}
+	signer, err := generateEphemeralSigner()
+	if err != nil {
+		return fmt.Errorf("generate ephemeral host key: %w", err)
+	}
+	s.signer = signer
+	return nil
 }
 
 // trackConn records nc as an in-flight handler-owned connection. It returns
@@ -654,14 +682,14 @@ func (s *server) ListenAndServe() error {
 	if strings.TrimSpace(s.Addr) == "" {
 		return errors.New("ironport: Addr is required")
 	}
-	if s.signer == nil {
-		return errors.New("ironport: signer is required")
-	}
 	s.mu.RLock()
 	closed := s.shuttingDown
 	s.mu.RUnlock()
 	if closed {
 		return errors.New("ironport: server has been shut down")
+	}
+	if err := s.ensureSigner(); err != nil {
+		return fmt.Errorf("ironport: %w", err)
 	}
 	// Hard requirement: the package's containment guarantee relies on
 	// openat2(RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS), available since Linux

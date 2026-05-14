@@ -1,8 +1,6 @@
 package main
 
 import (
-	"crypto/rand"
-	"crypto/rsa"
 	"flag"
 	"log"
 	"strings"
@@ -36,8 +34,6 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-	} else {
-		signer = mustHostKey()
 	}
 
 	config := ironport.DefaultIronportConfig()
@@ -85,18 +81,4 @@ func splitCSV(value string) []string {
 		return nil
 	}
 	return values
-}
-
-func mustHostKey() ssh.Signer {
-	// For demo: generate a new key on each start.
-	// In production: load from disk and keep stable.
-	priv, err := rsa.GenerateKey(rand.Reader, 3072)
-	if err != nil {
-		log.Fatal(err)
-	}
-	signer, err := ssh.NewSignerFromKey(priv)
-	if err != nil {
-		log.Fatal(err)
-	}
-	return signer
 }

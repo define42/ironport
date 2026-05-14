@@ -2771,18 +2771,48 @@ func TestServer_ListenAndServe_EmptyAddr(t *testing.T) {
 	}
 }
 
-// TestServer_ListenAndServe_NilSigner verifies that ListenAndServe returns an
-// error immediately when signer is nil without opening any listener.
-func TestServer_ListenAndServe_NilSigner(t *testing.T) {
-	srv := &server{Addr: ":0"}
-	err := srv.ListenAndServe()
-	if err == nil {
-		t.Fatal("expected error, got nil")
+// TestServer_ListenAndServe_NilSignerGeneratesHostKey verifies that
+// ListenAndServe generates an ephemeral host key when signer is nil.
+func TestServer_ListenAndServe_NilSignerGeneratesHostKey(t *testing.T) {
+	config := DefaultIronportConfig()
+	config.Addr = "127.0.0.1:0"
+	config.FtpPassivePortRange = ""
+	srv := NewServer(config)
+	if srv.signer != nil {
+		t.Fatal("expected nil signer before ListenAndServe")
 	}
-	const want = "ironport: signer is required"
-	if err.Error() != want {
-		t.Errorf("got %q; want %q", err.Error(), want)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe() }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if a := srv.ListeningAddr(); a != nil {
+			if srv.signer == nil {
+				t.Fatal("signer was not generated")
+			}
+			if err := srv.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			select {
+			case err := <-errCh:
+				if err != nil {
+					t.Fatalf("ListenAndServe returned %v; want nil", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("ListenAndServe did not return after Close")
+			}
+			return
+		}
+		select {
+		case err := <-errCh:
+			t.Fatalf("ListenAndServe returned early: %v", err)
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	_ = srv.Close()
+	t.Fatal("server did not start in time")
 }
 
 // TestSFTPServer_DeleteFolderWithFilesInside verifies that removing a

@@ -31,12 +31,9 @@ returns an error on older kernels rather than silently degrading the policy.
 package main
 
 import (
-    "crypto/rand"
-    "crypto/rsa"
     "log"
 
     "github.com/define42/ironport"
-    "golang.org/x/crypto/ssh"
 )
 
 func main() {
@@ -45,18 +42,20 @@ func main() {
         "bob":   {Password: "bobpw",   Root: "/srv/sftp/bob",   CanRead: true, CanWrite: false},
     }
 
-    // Load a stable host key from disk; fall back to an ephemeral key for demos.
+    // Load a stable host key from disk. If this is left unset, ListenAndServe
+    // generates an ephemeral in-memory host key.
     signer, err := ironport.NewSignerFromFile("/etc/ssh/sftp_host_key")
     if err != nil {
-        priv, _ := rsa.GenerateKey(rand.Reader, 3072)
-        signer, _ = ssh.NewSignerFromKey(priv)
+        log.Printf("host key unavailable, using ephemeral key: %v", err)
     }
 
     // FtpAddr is "" by default, disabling the (plaintext) FTP listener.
     config := ironport.DefaultIronportConfig()
     config.Addr = ":2022"
     config.Users = users
-    config.Signer = signer
+    if signer != nil {
+        config.Signer = signer
+    }
     srv := ironport.NewServer(config)
 
     // Drain upload notifications in the background.
@@ -217,13 +216,20 @@ Use `NewSignerFromFile` to load a PEM-encoded RSA, ECDSA, or Ed25519 private key
 signer, err := ironport.NewSignerFromFile("/etc/ssh/sftp_host_key")
 ```
 
+If `config.Signer` is nil, `ListenAndServe` generates an ephemeral in-memory
+RSA-3072 host key and stores it on the server. This is convenient for demos, but
+not suitable for production because clients will see a different host key after
+each process restart.
+
 ## Running the example binary
 
 ```sh
 go run ./cmd/ironport -host-key /path/to/host_key
 ```
 
-If `-host-key` is omitted a fresh RSA-3072 key is generated on every start (not suitable for production, as clients will see a different host key each time).
+If `-host-key` is omitted, `ListenAndServe` generates a fresh RSA-3072 key on
+every start. This is not suitable for production, as clients will see a
+different host key each time.
 The example binary also accepts comma-separated `-ssh-key-exchanges`,
 `-ssh-ciphers`, `-ssh-macs`, and `-ssh-public-key-auth-algorithms` flags.
 
