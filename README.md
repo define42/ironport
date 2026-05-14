@@ -63,7 +63,7 @@ func main() {
 
     // FtpAddr is "" by default, disabling the (plaintext) FTP listener.
     config := ironport.DefaultConfig()
-    config.Addr = ":2022"
+    config.SftpAddr = ":2022"
     config.Users = users
     if signer != nil {
         config.Signer = signer

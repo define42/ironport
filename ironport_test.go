@@ -208,7 +208,7 @@ func testSigner(t *testing.T) ssh.Signer {
 
 func newTestConfig(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserInfo, signer ssh.Signer, completedUploadsSize int) *Config {
 	config := DefaultConfig()
-	config.Addr = addr
+	config.SftpAddr = addr
 	config.FtpAddr = ftpAddr
 	config.FtpPassivePortRange = ftpPassivePortRange
 	config.Users = users
@@ -241,7 +241,7 @@ func startTestServerWithConfig(t *testing.T, config *Config) (srv *Server, addr 
 		config = DefaultConfig()
 	}
 	serverConfig := *config
-	serverConfig.Addr = addr
+	serverConfig.SftpAddr = addr
 	srv = NewServer(&serverConfig)
 	cfg := srv.sshServerConfig()
 
@@ -623,7 +623,7 @@ func TestNewServer(t *testing.T) {
 	}
 	signer := testSigner(t)
 	config := DefaultConfig()
-	config.Addr = ":0"
+	config.SftpAddr = ":0"
 	config.FtpAddr = ":0"
 	config.FtpPassivePortRange = "5000-5010"
 	config.FtpDataAcceptTimeout = 17 * time.Second
@@ -661,8 +661,8 @@ func TestNewServer(t *testing.T) {
 
 func TestDefaultConfig(t *testing.T) {
 	config := DefaultConfig()
-	if config.Addr != ":2022" {
-		t.Errorf("Addr = %q; want :2022", config.Addr)
+	if config.SftpAddr != ":2022" {
+		t.Errorf("SftpAddr = %q; want :2022", config.SftpAddr)
 	}
 	if config.FtpAddr != "" {
 		t.Errorf("FtpAddr = %q; want empty", config.FtpAddr)
@@ -714,9 +714,9 @@ func TestDefaultConfig(t *testing.T) {
 	if config == other {
 		t.Fatal("DefaultConfig returned the same pointer twice")
 	}
-	config.Addr = ":9999"
-	if other.Addr != ":2022" {
-		t.Errorf("second config Addr = %q after mutating first; want :2022", other.Addr)
+	config.SftpAddr = ":9999"
+	if other.SftpAddr != ":2022" {
+		t.Errorf("second config SftpAddr = %q after mutating first; want :2022", other.SftpAddr)
 	}
 }
 
@@ -836,7 +836,7 @@ func TestCompletedUploadsBufferSize(t *testing.T) {
 
 	// Default capacity: a non-positive config value selects defaultCompletedUploadsSize.
 	config := DefaultConfig()
-	config.Addr = ":0"
+	config.SftpAddr = ":0"
 	config.FtpPassivePortRange = ""
 	config.Users = users
 	config.Signer = signer
@@ -848,7 +848,7 @@ func TestCompletedUploadsBufferSize(t *testing.T) {
 
 	// Custom capacity via NewServer config.
 	config2 := DefaultConfig()
-	config2.Addr = ":0"
+	config2.SftpAddr = ":0"
 	config2.FtpPassivePortRange = ""
 	config2.Users = users
 	config2.Signer = signer
@@ -873,7 +873,7 @@ func TestAuthEventsBufferSize(t *testing.T) {
 
 	// Default capacity: a non-positive config value selects defaultAuthEventsSize.
 	config := DefaultConfig()
-	config.Addr = ":0"
+	config.SftpAddr = ":0"
 	config.FtpPassivePortRange = ""
 	config.Users = users
 	config.Signer = signer
@@ -885,7 +885,7 @@ func TestAuthEventsBufferSize(t *testing.T) {
 
 	// Custom capacity via NewServer config.
 	config2 := DefaultConfig()
-	config2.Addr = ":0"
+	config2.SftpAddr = ":0"
 	config2.FtpPassivePortRange = ""
 	config2.Users = users
 	config2.Signer = signer
@@ -3925,9 +3925,9 @@ func TestServer_ListenAndServe_AfterShutdown(t *testing.T) {
 	}
 }
 
-// TestServer_ListenAndServe_EmptyAddr verifies that ListenAndServe returns an
-// error immediately when Addr is empty or blank without opening any listener.
-func TestServer_ListenAndServe_EmptyAddr(t *testing.T) {
+// TestServer_ListenAndServe_EmptySftpAddr verifies that ListenAndServe returns an
+// error immediately when SftpAddr is empty or blank without opening any listener.
+func TestServer_ListenAndServe_EmptySftpAddr(t *testing.T) {
 	for _, addr := range []string{"", "   ", "\t"} {
 		srv := &Server{addr: addr, signer: testSigner(t)}
 		err := srv.ListenAndServe()
@@ -3935,7 +3935,7 @@ func TestServer_ListenAndServe_EmptyAddr(t *testing.T) {
 			t.Errorf("addr=%q: expected error, got nil", addr)
 			continue
 		}
-		const want = "ironport: Addr is required"
+		const want = "ironport: SftpAddr is required"
 		if err.Error() != want {
 			t.Errorf("addr=%q: got %q; want %q", addr, err.Error(), want)
 		}
@@ -3946,7 +3946,7 @@ func TestServer_ListenAndServe_EmptyAddr(t *testing.T) {
 // ListenAndServe generates an ephemeral host key when signer is nil.
 func TestServer_ListenAndServe_NilSignerGeneratesHostKey(t *testing.T) {
 	config := DefaultConfig()
-	config.Addr = "127.0.0.1:0"
+	config.SftpAddr = "127.0.0.1:0"
 	config.FtpPassivePortRange = ""
 	srv := NewServer(config)
 	if srv.signer != nil {

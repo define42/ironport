@@ -17,7 +17,7 @@
 // Typical usage:
 //
 //	cfg := ironport.DefaultConfig()
-//	cfg.Addr = ":2022"
+//	cfg.SftpAddr = ":2022"
 //	cfg.FtpAddr = ":2121"
 //	cfg.Users = users
 //	cfg.Signer = signer
@@ -460,7 +460,7 @@ type Server struct {
 
 // Config holds the values used to construct a server.
 type Config struct {
-	Addr                string
+	SftpAddr            string
 	FtpAddr             string
 	FtpPassivePortRange string
 	// FtpDataAcceptTimeout bounds how long passive-mode FTP data listeners wait
@@ -587,7 +587,7 @@ func (s *Server) RemoveUserKey(username string, key ssh.PublicKey) {
 // an ephemeral in-memory host key.
 func DefaultConfig() *Config {
 	return &Config{
-		Addr:                ":2022",
+		SftpAddr:            ":2022",
 		FtpAddr:             "",
 		FtpPassivePortRange: "5000-5010",
 		CompletedUploadSize: defaultCompletedUploadsSize,
@@ -613,7 +613,7 @@ func NewServer(config *Config) *Server {
 		config = DefaultConfig()
 	}
 	s := &Server{
-		addr:                       config.Addr,
+		addr:                       config.SftpAddr,
 		ftpAddr:                    config.FtpAddr,
 		ftpPassivePortRange:        config.FtpPassivePortRange,
 		ftpDataAcceptTimeout:       config.FtpDataAcceptTimeout,
@@ -874,7 +874,7 @@ func (s *Server) listenFTPData(host string) (net.Listener, error) {
 // or Shutdown returns. Concurrent ListenAndServe calls are rejected.
 func (s *Server) ListenAndServe() error {
 	if strings.TrimSpace(s.addr) == "" {
-		return errors.New("ironport: Addr is required")
+		return errors.New("ironport: SftpAddr is required")
 	}
 	runID, err := s.beginListenAndServe()
 	if err != nil {
