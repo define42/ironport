@@ -26,6 +26,7 @@ import (
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/sys/unix"
 )
 
 // ---- cleanRelClientPath / jailFS path-handling tests ----
@@ -962,6 +963,113 @@ func TestFTPSessionAnnounceAuthEventUsesCapturedAuthEvents(t *testing.T) {
 	requireNoAuthEvent(t, serverEvents)
 }
 
+func TestAnnounceAuthEventDropsWhenQueueFull(t *testing.T) {
+	events := make(chan AuthEvent, 1)
+	first := AuthEvent{Type: AuthEventLoginSuccess, Username: "first", Protocol: CompletedUploadProtocolSFTP}
+	events <- first
+
+	announceAuthEvent(events, AuthEvent{Type: AuthEventLoginFailed, Username: "second", Protocol: CompletedUploadProtocolSFTP})
+
+	select {
+	case got := <-events:
+		if got != first {
+			t.Fatalf("queued event = %+v; want original %+v", got, first)
+		}
+	default:
+		t.Fatal("expected original event to remain queued")
+	}
+	requireNoAuthEvent(t, events)
+}
+
+func TestFTPSessionAnnounceUploadDefersTempAndDropsWhenQueueFull(t *testing.T) {
+	uploads := make(chan CompletedUpload, 1)
+	first := CompletedUpload{Username: "first", FilePath: "/first.txt", Protocol: CompletedUploadProtocolFTP}
+	uploads <- first
+	fs := &ftpSession{
+		username: "alice",
+		clientIP: "127.0.0.1",
+		tempExts: []string{".tmp"},
+		uploads:  uploads,
+	}
+
+	fs.announceUpload("/deferred.tmp", "/srv/deferred.tmp")
+	fs.announceUpload("/dropped.txt", "/srv/dropped.txt")
+
+	select {
+	case got := <-uploads:
+		if got != first {
+			t.Fatalf("queued upload = %+v; want original %+v", got, first)
+		}
+	default:
+		t.Fatal("expected original upload to remain queued")
+	}
+	select {
+	case got := <-uploads:
+		t.Fatalf("unexpected additional upload event: %+v", got)
+	default:
+	}
+}
+
+func TestFTPPathHelpers(t *testing.T) {
+	listCases := []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"   ", ""},
+		{"-la", ""},
+		{"-la /incoming", "/incoming"},
+		{"-la -- almost", "almost"},
+		{"file name.txt", "file name.txt"},
+	}
+	for _, tc := range listCases {
+		if got := listPathArg(tc.in); got != tc.want {
+			t.Errorf("listPathArg(%q) = %q; want %q", tc.in, got, tc.want)
+		}
+	}
+
+	unquoteCases := []struct {
+		in   string
+		want string
+	}{
+		{`plain.txt`, "plain.txt"},
+		{` "space dir" `, "space dir"},
+		{`"a""quote.txt"`, `a"quote.txt`},
+		{`"unterminated`, `"unterminated`},
+	}
+	for _, tc := range unquoteCases {
+		if got := unquoteFTPPath(tc.in); got != tc.want {
+			t.Errorf("unquoteFTPPath(%q) = %q; want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestStatFileInfoMode(t *testing.T) {
+	tests := []struct {
+		name string
+		mode uint32
+		want os.FileMode
+	}{
+		{name: "regular", mode: syscall.S_IFREG | 0o644, want: 0o644},
+		{name: "directory", mode: syscall.S_IFDIR | 0o755, want: os.ModeDir | 0o755},
+		{name: "symlink", mode: syscall.S_IFLNK | 0o777, want: os.ModeSymlink | 0o777},
+		{name: "fifo", mode: syscall.S_IFIFO | 0o600, want: os.ModeNamedPipe | 0o600},
+		{name: "socket", mode: syscall.S_IFSOCK | 0o600, want: os.ModeSocket | 0o600},
+		{name: "block device", mode: syscall.S_IFBLK | 0o600, want: os.ModeDevice | 0o600},
+		{name: "char device", mode: syscall.S_IFCHR | 0o600, want: os.ModeDevice | os.ModeCharDevice | 0o600},
+		{name: "special bits", mode: syscall.S_IFREG | syscall.S_ISUID | syscall.S_ISGID | syscall.S_ISVTX | 0o700, want: os.ModeSetuid | os.ModeSetgid | os.ModeSticky | 0o700},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			info := &statFileInfo{st: unix.Stat_t{Mode: tc.mode}}
+			if got := info.Mode(); got != tc.want {
+				t.Fatalf("Mode() = %v; want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestParseFTPPassivePortRange(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -1108,6 +1216,178 @@ func TestFTPServer_UploadDownloadList(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for FTP upload completion event")
 	}
+}
+
+func TestFTPServer_FileManagementCommands(t *testing.T) {
+	root := t.TempDir()
+	content := []byte("hello ftp commands")
+	filePath := filepath.Join(root, "file.txt")
+	if err := os.WriteFile(filePath, content, 0o644); err != nil {
+		t.Fatalf("os.WriteFile(file): %v", err)
+	}
+	mtime := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	if err := os.Chtimes(filePath, mtime, mtime); err != nil {
+		t.Fatalf("os.Chtimes(file): %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "space dir"), 0o755); err != nil {
+		t.Fatalf("os.Mkdir(space dir): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "rename-src.txt"), []byte("rename me"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(rename-src): %v", err)
+	}
+
+	_, addr, stop := startTestFTPServer(t, map[string]UserInfo{
+		"ftpuser": {Password: "ftppw", Root: root, CanRead: true, CanWrite: true},
+	}, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("ftpuser", "ftppw")
+
+	features := client.command(211, "FEAT")
+	if !strings.Contains(features, "UTF8") || !strings.Contains(features, "EPSV") {
+		t.Fatalf("FEAT response = %q; want advertised UTF8 and EPSV", features)
+	}
+	client.command(229, "EPSV")
+
+	if got := client.command(213, "SIZE file.txt"); got != strconv.Itoa(len(content)) {
+		t.Fatalf("SIZE response = %q; want %d", got, len(content))
+	}
+	client.command(550, "SIZE space dir")
+	if got := client.command(213, "MDTM file.txt"); got != "20240102030405" {
+		t.Fatalf("MDTM response = %q; want 20240102030405", got)
+	}
+
+	client.command(250, `CWD "space dir"`)
+	if got := client.command(257, "PWD"); !strings.Contains(got, `"/space dir"`) {
+		t.Fatalf("PWD after CWD = %q; want /space dir", got)
+	}
+	client.command(250, "CDUP")
+	client.command(550, "CWD file.txt")
+	client.command(550, "CWD missing")
+
+	listConn, _ := client.passiveConn()
+	client.send("NLST -a file.txt")
+	client.read(150)
+	listing, err := io.ReadAll(listConn)
+	if err != nil {
+		t.Fatalf("io.ReadAll(NLST): %v", err)
+	}
+	_ = listConn.Close()
+	client.read(226)
+	if strings.TrimSpace(string(listing)) != "file.txt" {
+		t.Fatalf("NLST file listing = %q; want file.txt", listing)
+	}
+
+	listFileConn, _ := client.passiveConn()
+	client.send("LIST -l file.txt")
+	client.read(150)
+	listFile, err := io.ReadAll(listFileConn)
+	if err != nil {
+		t.Fatalf("io.ReadAll(LIST file): %v", err)
+	}
+	_ = listFileConn.Close()
+	client.read(226)
+	if !strings.Contains(string(listFile), "file.txt") || !strings.Contains(string(listFile), strconv.Itoa(len(content))) {
+		t.Fatalf("LIST file response = %q; want filename and size", listFile)
+	}
+
+	client.command(501, "REST -1")
+	client.command(350, "REST 6")
+	downloadConn, _ := client.passiveConn()
+	client.send("RETR file.txt")
+	client.read(150)
+	downloaded, err := io.ReadAll(downloadConn)
+	if err != nil {
+		t.Fatalf("io.ReadAll(RETR): %v", err)
+	}
+	_ = downloadConn.Close()
+	client.read(226)
+	if !bytes.Equal(downloaded, content[6:]) {
+		t.Fatalf("resumed RETR returned %q; want %q", downloaded, content[6:])
+	}
+
+	appendConn, _ := client.passiveConn()
+	client.send("APPE file.txt")
+	client.read(150)
+	if _, err := appendConn.Write([]byte("!")); err != nil {
+		t.Fatalf("APPE write: %v", err)
+	}
+	_ = appendConn.Close()
+	client.read(226)
+	appended := append(append([]byte{}, content...), '!')
+	if got, err := os.ReadFile(filePath); err != nil {
+		t.Fatalf("os.ReadFile after APPE: %v", err)
+	} else if !bytes.Equal(got, appended) {
+		t.Fatalf("file after APPE = %q; want %q", got, appended)
+	}
+
+	client.command(350, "REST 5")
+	resumeStorConn, _ := client.passiveConn()
+	client.send("STOR file.txt")
+	client.read(150)
+	if _, err := resumeStorConn.Write([]byte("++")); err != nil {
+		t.Fatalf("resumed STOR write: %v", err)
+	}
+	_ = resumeStorConn.Close()
+	client.read(226)
+	resumed := append([]byte{}, appended...)
+	copy(resumed[5:], []byte("++"))
+	if got, err := os.ReadFile(filePath); err != nil {
+		t.Fatalf("os.ReadFile after resumed STOR: %v", err)
+	} else if !bytes.Equal(got, resumed) {
+		t.Fatalf("file after resumed STOR = %q; want %q", got, resumed)
+	}
+
+	client.command(550, "MDTM missing.txt")
+
+	mkdirMsg := client.command(257, "MKD made")
+	if !strings.Contains(mkdirMsg, `"/made"`) {
+		t.Fatalf("MKD response = %q; want created /made path", mkdirMsg)
+	}
+	client.command(550, "MKD made")
+	client.command(250, "RMD made")
+	client.command(550, "RMD made")
+
+	client.command(503, "RNTO renamed.txt")
+	client.command(550, "RNFR missing.txt")
+	client.command(350, "RNFR rename-src.txt")
+	client.command(250, "RNTO renamed.txt")
+	if _, err := os.Stat(filepath.Join(root, "renamed.txt")); err != nil {
+		t.Fatalf("renamed file stat: %v", err)
+	}
+	client.command(250, "DELE renamed.txt")
+	client.command(550, "DELE renamed.txt")
+}
+
+func TestFTPServer_CommandPermissionDenials(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "file.txt"), []byte("contents"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "dir"), 0o755); err != nil {
+		t.Fatalf("os.Mkdir: %v", err)
+	}
+
+	_, addr, stop := startTestFTPServer(t, map[string]UserInfo{
+		"blocked": {Password: "blockedpw", Root: root},
+	}, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("blocked", "blockedpw")
+
+	client.command(550, "CWD dir")
+	client.command(550, "LIST")
+	client.command(550, "RETR file.txt")
+	client.command(550, "STOR upload.txt")
+	client.command(550, "SIZE file.txt")
+	client.command(550, "MDTM file.txt")
+	client.command(550, "DELE file.txt")
+	client.command(550, "MKD made")
+	client.command(550, "RMD dir")
+	client.command(550, "RNFR file.txt")
+	client.command(550, "RNTO renamed.txt")
 }
 
 func TestFTPServer_AuthEventsLoginSuccess(t *testing.T) {
