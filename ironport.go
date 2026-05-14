@@ -1954,7 +1954,35 @@ func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
 			"SIZE",
 			"MDTM",
 			"REST STREAM",
+			"MLST type*;size*;modify*;perm*;unique*;",
+			"MLSD",
+			"TVFS",
+			"LANG en-US*",
+			"HOST",
 		}, "End")
+		return false
+
+	case "HELP":
+		f.cmdHelp(arg)
+		return false
+
+	case "STAT":
+		// STAT with no argument is server status and is commonly issued before
+		// login; the path form falls through to the authenticated switch by
+		// reusing cmdStat's own auth checks.
+		f.cmdStat(arg)
+		return false
+
+	case "LANG":
+		f.cmdLang(arg)
+		return false
+
+	case "HOST":
+		f.cmdHost(arg)
+		return false
+
+	case "REIN":
+		f.cmdRein()
 		return false
 
 	case "AUTH":
@@ -2062,6 +2090,24 @@ func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
 		f.closeDataListener()
 		f.restartOffset = 0
 		_ = f.reply(226, "abort successful")
+
+	case "MLST":
+		f.cmdMLST(arg)
+
+	case "MLSD":
+		f.cmdMLSD(arg)
+
+	case "SITE":
+		// SITE has no portable subcommands here; reply cleanly rather than
+		// the generic 502 so clients can probe without ambiguity.
+		_ = f.reply(502, "SITE command not implemented")
+
+	case "MFMT", "MFCT":
+		// Setting modification times on jailed files is denied wholesale by the
+		// same policy that rejects SFTP Acmodtime. Reply with the canonical
+		// "command not implemented for that parameter" code so MFMT-aware
+		// clients (backup/sync tools) get a deterministic, well-formed refusal.
+		_ = f.reply(502, cmd+" not supported")
 
 	default:
 		_ = f.reply(502, "command not implemented")
@@ -2542,6 +2588,264 @@ func (f *ftpSession) announceUpload(ftpPath, fullPath string) {
 	default:
 		log.Printf("upload complete: CompletedUploads queue full, notification for %q dropped", ftpPath)
 	}
+}
+
+// cmdHelp answers the HELP command. With no argument it returns a multi-line
+// reply listing supported commands; with an argument it returns a short
+// per-command line. The list deliberately covers only commands this server
+// implements — clients that probe for an unlisted command will still get a
+// 502 from the command dispatcher itself.
+func (f *ftpSession) cmdHelp(arg string) {
+	arg = strings.TrimSpace(arg)
+	if arg != "" {
+		_ = f.reply(214, fmt.Sprintf("%s command recognized", strings.ToUpper(arg)))
+		return
+	}
+	_ = f.multilineReply(214, "The following commands are recognized:", []string{
+		"USER PASS QUIT NOOP SYST FEAT HELP STAT",
+		"PWD CWD CDUP TYPE MODE STRU OPTS REIN",
+		"PASV EPSV LIST NLST MLST MLSD",
+		"RETR STOR APPE REST SIZE MDTM",
+		"DELE MKD RMD RNFR RNTO ABOR",
+		"LANG HOST",
+	}, "End")
+}
+
+// cmdLang answers the LANG command (RFC 2640). The server's only output
+// language is English; UTF-8 byte semantics are already announced via OPTS
+// UTF8. We accept "en", "en-US", or an empty argument as success and reject
+// everything else with 504, mirroring how OpenSSH and other minimal servers
+// handle language negotiation.
+func (f *ftpSession) cmdLang(arg string) {
+	tag := strings.TrimSpace(arg)
+	if tag == "" {
+		_ = f.reply(200, "language set to en-US")
+		return
+	}
+	upper := strings.ToUpper(tag)
+	if upper == "EN" || upper == "EN-US" {
+		_ = f.reply(200, "language set to en-US")
+		return
+	}
+	_ = f.reply(504, "language not supported")
+}
+
+// cmdHost answers the HOST command (RFC 7151). This server does not implement
+// per-virtual-host user databases — every listener serves the single user set
+// configured on the server. Accept any well-formed host name so HOST-aware
+// clients can advance past the handshake; reject only the few cases where the
+// argument is clearly malformed.
+func (f *ftpSession) cmdHost(arg string) {
+	if f.authenticated {
+		// RFC 7151 §3.1: HOST must be sent before authentication. Once a user
+		// is logged in, refuse to switch virtual hosts.
+		_ = f.reply(503, "HOST cannot be issued after login")
+		return
+	}
+	host := strings.TrimSpace(arg)
+	if host == "" || hasCRLF(host) || len(host) > 255 {
+		_ = f.reply(501, "invalid host name")
+		return
+	}
+	_ = f.reply(220, "host accepted")
+}
+
+// cmdRein answers the REIN command. RFC 959 specifies that REIN flushes any
+// authentication state and returns the session to the pre-login state without
+// closing the control connection. Any pending data transfer is aborted.
+func (f *ftpSession) cmdRein() {
+	f.closeDataListener()
+	f.logoutIfAuthenticated()
+	f.username = ""
+	f.cwd = "/"
+	f.rnfrPath = ""
+	f.restartOffset = 0
+	_ = f.reply(220, "ready for new user")
+}
+
+// cmdStat answers the STAT command. With no argument it reports server
+// status; with a path argument it returns a directory/file listing inline
+// over the control connection (no data connection), which clients often
+// issue immediately after login as a low-overhead probe.
+func (f *ftpSession) cmdStat(arg string) {
+	path := strings.TrimSpace(arg)
+	if path == "" {
+		lines := []string{
+			fmt.Sprintf("Connected from %s", sanitizeFTPText(f.clientIP)),
+			fmt.Sprintf("Logged in as %s", sanitizeFTPText(f.username)),
+			"TYPE: BINARY",
+			"No data connection",
+		}
+		_ = f.multilineReply(211, "Server status:", lines, "End of status")
+		return
+	}
+	if !f.authenticated {
+		_ = f.reply(530, "not logged in")
+		return
+	}
+	if !f.user.CanRead {
+		_ = f.reply(550, "permission denied")
+		return
+	}
+	ftpPath := f.cleanPath(listPathArg(path))
+	st, err := f.fs.Stat(ftpPath)
+	if err != nil {
+		_ = f.reply(550, ftpErrMsg(err))
+		return
+	}
+	var lines []string
+	if st.IsDir() {
+		entries, err := f.fs.List(ftpPath)
+		if err != nil {
+			_ = f.reply(550, ftpErrMsg(err))
+			return
+		}
+		for _, info := range entries {
+			lines = append(lines, ftpListLine(info, info.Name()))
+		}
+	} else {
+		lines = append(lines, ftpListLine(st, ftpPathBase(ftpPath)))
+	}
+	_ = f.multilineReply(213, "Status of "+ftpQuotePath(ftpPath)+":", lines, "End of status")
+}
+
+// cmdMLST answers MLST (RFC 3659). MLST returns machine-readable facts for a
+// single path inline on the control connection, never opening a data
+// connection. The reply format is "211-Listing\r\n <facts> name\r\n211 End".
+func (f *ftpSession) cmdMLST(arg string) {
+	if !f.user.CanRead {
+		_ = f.reply(550, "permission denied")
+		return
+	}
+	ftpPath := f.cleanPath(arg)
+	st, err := f.fs.Stat(ftpPath)
+	if err != nil {
+		_ = f.reply(550, ftpErrMsg(err))
+		return
+	}
+	// The MLST fact-line is required to start with a single space, per RFC
+	// 3659 §4.8 ("Each fact-set is preceded by a single space"). multilineReply
+	// already prefixes intermediate lines with a space, so the payload here is
+	// just "facts; name" without leading whitespace.
+	line := mlstFactLine(st, ftpPath, f.user.CanWrite)
+	_ = f.multilineReply(250, "Listing "+ftpQuotePath(ftpPath), []string{line}, "End")
+}
+
+// cmdMLSD answers MLSD (RFC 3659). MLSD returns machine-readable facts for
+// every entry in a directory over the data connection, terminating with
+// 226 once the listing has been written.
+func (f *ftpSession) cmdMLSD(arg string) {
+	if !f.user.CanRead {
+		_ = f.reply(550, "permission denied")
+		return
+	}
+	ftpPath := f.cleanPath(arg)
+	st, err := f.fs.Stat(ftpPath)
+	if err != nil {
+		_ = f.reply(550, ftpErrMsg(err))
+		return
+	}
+	if !st.IsDir() {
+		_ = f.reply(501, "MLSD requires a directory")
+		return
+	}
+	entries, err := f.fs.List(ftpPath)
+	if err != nil {
+		_ = f.reply(550, ftpErrMsg(err))
+		return
+	}
+
+	if err := f.reply(150, "opening data connection"); err != nil {
+		return
+	}
+	dc, err := f.acceptDataConn()
+	if err != nil {
+		_ = f.reply(425, ftpErrMsg(err))
+		return
+	}
+	defer func() { _ = dc.Close() }()
+
+	idleDC := &idleConn{Conn: dc}
+	idleDC.setWriteTimeout(ftpDataIdleTimeout)
+	for _, info := range entries {
+		line := mlstFactLine(info, info.Name(), f.user.CanWrite)
+		if _, err := io.WriteString(idleDC, line+"\r\n"); err != nil {
+			_ = f.reply(426, ftpErrMsg(err))
+			return
+		}
+	}
+	_ = f.reply(226, "transfer complete")
+}
+
+// mlstFactLine renders a single MLST/MLSD entry: a fact-set followed by a
+// space and the entry name. The facts emitted match the FEAT advertisement
+// (type, size, modify, perm, unique). For MLST the caller passes the full
+// path; for MLSD the basename.
+func mlstFactLine(info os.FileInfo, name string, canWrite bool) string {
+	var typeFact string
+	switch {
+	case info.IsDir():
+		typeFact = "dir"
+	case info.Mode()&os.ModeSymlink != 0:
+		typeFact = "OS.unix=symlink"
+	default:
+		typeFact = "file"
+	}
+	var b strings.Builder
+	b.WriteString("type=")
+	b.WriteString(typeFact)
+	b.WriteString(";size=")
+	b.WriteString(strconv.FormatInt(info.Size(), 10))
+	b.WriteString(";modify=")
+	b.WriteString(info.ModTime().UTC().Format("20060102150405"))
+	b.WriteString(";perm=")
+	b.WriteString(mlstPermFact(info, canWrite))
+	b.WriteString(";unique=")
+	b.WriteString(mlstUniqueFact(info))
+	b.WriteString("; ")
+	b.WriteString(sanitizeFTPText(name))
+	return b.String()
+}
+
+// mlstPermFact builds the RFC 3659 "perm" fact for an entry. The flags
+// reported are bounded by what this server actually exposes: read implies
+// list/retrieve, write implies store/append/delete/rename/mkdir. Symlinks
+// are never traversable through the jail and so report no permissions.
+func mlstPermFact(info os.FileInfo, canWrite bool) string {
+	if info.Mode()&os.ModeSymlink != 0 {
+		return ""
+	}
+	var b strings.Builder
+	if info.IsDir() {
+		b.WriteString("el") // enter / list
+		if canWrite {
+			b.WriteString("cmp") // create / make-dir / delete contents
+		}
+	} else {
+		b.WriteString("r") // retrieve
+		if canWrite {
+			b.WriteString("adfw") // append / delete / rename-from / store
+		}
+	}
+	return b.String()
+}
+
+// mlstUniqueFact returns a stable per-entry identifier for the "unique"
+// fact. Per RFC 3659 the value need only be unique within the server; we
+// derive it from dev+ino when available and fall back to mtime+size.
+func mlstUniqueFact(info os.FileInfo) string {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && st != nil {
+		return fmt.Sprintf("%XU%X", st.Dev, st.Ino)
+	}
+	return fmt.Sprintf("M%XS%X", info.ModTime().UnixNano(), info.Size())
+}
+
+// ftpPathBase returns the basename of an FTP path, treating "/" as the root.
+func ftpPathBase(p string) string {
+	if p == "/" || p == "" {
+		return "/"
+	}
+	return path.Base(p)
 }
 
 func (f *ftpSession) cmdRest(arg string) {

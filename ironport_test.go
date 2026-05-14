@@ -1390,6 +1390,116 @@ func TestFTPServer_CommandPermissionDenials(t *testing.T) {
 	client.command(550, "RNTO renamed.txt")
 }
 
+func TestFTPServer_ExtendedCommands(t *testing.T) {
+	root := t.TempDir()
+	content := []byte("hello mlsd world")
+	if err := os.WriteFile(filepath.Join(root, "file.txt"), content, 0o644); err != nil {
+		t.Fatalf("os.WriteFile: %v", err)
+	}
+	mtime := time.Date(2024, 6, 7, 8, 9, 10, 0, time.UTC)
+	if err := os.Chtimes(filepath.Join(root, "file.txt"), mtime, mtime); err != nil {
+		t.Fatalf("os.Chtimes: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "sub"), 0o755); err != nil {
+		t.Fatalf("os.Mkdir: %v", err)
+	}
+
+	_, addr, stop := startTestFTPServer(t, map[string]UserInfo{
+		"ftpuser": {Password: "ftppw", Root: root, CanRead: true, CanWrite: true},
+	}, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+
+	// HELP / STAT / HOST / LANG work before login.
+	helpMsg := client.command(214, "HELP")
+	if !strings.Contains(helpMsg, "MLSD") || !strings.Contains(helpMsg, "STAT") {
+		t.Fatalf("HELP response = %q; want MLSD and STAT advertised", helpMsg)
+	}
+	client.command(214, "HELP RETR")
+	preLoginStat := client.command(211, "STAT")
+	if !strings.Contains(preLoginStat, "Connected from") {
+		t.Fatalf("STAT pre-login response = %q; want connection status", preLoginStat)
+	}
+	client.command(220, "HOST example.com")
+	client.command(501, "HOST ")
+	client.command(200, "LANG")
+	client.command(200, "LANG en-US")
+	client.command(504, "LANG fr")
+
+	// FEAT must advertise the new capabilities.
+	features := client.command(211, "FEAT")
+	for _, want := range []string{"MLST", "MLSD", "TVFS", "LANG", "HOST"} {
+		if !strings.Contains(features, want) {
+			t.Fatalf("FEAT response = %q; want %s advertised", features, want)
+		}
+	}
+
+	client.login("ftpuser", "ftppw")
+
+	// HOST after login is rejected.
+	client.command(503, "HOST other.example.com")
+
+	// SITE refuses cleanly with 502.
+	client.command(502, "SITE CHMOD 600 file.txt")
+
+	// MFMT/MFCT refuse cleanly with 502 (Acmodtime policy).
+	client.command(502, "MFMT 20240101000000 file.txt")
+	client.command(502, "MFCT 20240101000000 file.txt")
+
+	// MLST returns a single-entry multi-line 250 reply.
+	mlstResp := client.command(250, "MLST file.txt")
+	if !strings.Contains(mlstResp, "type=file") {
+		t.Fatalf("MLST response = %q; want type=file", mlstResp)
+	}
+	if !strings.Contains(mlstResp, "size="+strconv.Itoa(len(content))) {
+		t.Fatalf("MLST response = %q; want size=%d", mlstResp, len(content))
+	}
+	if !strings.Contains(mlstResp, "modify=20240607080910") {
+		t.Fatalf("MLST response = %q; want modify=20240607080910", mlstResp)
+	}
+	if !strings.Contains(mlstResp, "perm=") {
+		t.Fatalf("MLST response = %q; want perm fact", mlstResp)
+	}
+
+	// MLSD opens a data connection and lists directory entries with facts.
+	mlsdConn, _ := client.passiveConn()
+	client.send("MLSD /")
+	client.read(150)
+	mlsdData, err := io.ReadAll(mlsdConn)
+	if err != nil {
+		t.Fatalf("io.ReadAll(MLSD): %v", err)
+	}
+	_ = mlsdConn.Close()
+	client.read(226)
+	mlsd := string(mlsdData)
+	if !strings.Contains(mlsd, "type=file") || !strings.Contains(mlsd, "file.txt") {
+		t.Fatalf("MLSD listing = %q; want file.txt with type=file", mlsd)
+	}
+	if !strings.Contains(mlsd, "type=dir") || !strings.Contains(mlsd, "sub") {
+		t.Fatalf("MLSD listing = %q; want sub with type=dir", mlsd)
+	}
+
+	// MLSD on a regular file is rejected.
+	client.command(501, "MLSD file.txt")
+
+	// STAT with a path returns an inline listing without a data connection.
+	statListing := client.command(213, "STAT /")
+	if !strings.Contains(statListing, "file.txt") {
+		t.Fatalf("STAT path response = %q; want file.txt", statListing)
+	}
+
+	// REIN returns to the unauthenticated state; commands that need auth
+	// should then be rejected until a new login.
+	client.command(220, "REIN")
+	client.command(530, "PWD")
+	client.login("ftpuser", "ftppw")
+	client.command(257, "PWD")
+
+	// Unknown commands still get the generic 502.
+	client.command(502, "FOOBAR")
+}
+
 func TestFTPServer_AuthEventsLoginSuccess(t *testing.T) {
 	root := t.TempDir()
 	users := map[string]UserInfo{
