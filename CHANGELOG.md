@@ -12,8 +12,9 @@ changes are tracked under `Unreleased`.
 - Renamed the runnable example command to `cmd/ironport-demo` and clarified
   that it is not an operator-ready production binary.
 - Added project security and contribution documentation.
+- Added a main-branch release workflow that bumps the next SemVer tag and
+  creates a GitHub Release.
 
 ## Releases
 
 No tagged releases yet.
-

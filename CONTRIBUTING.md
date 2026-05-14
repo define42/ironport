@@ -29,10 +29,16 @@ For changes touching jail containment, authentication, path handling, upload
 completion, FTP reply text, or listener lifecycle, include regression tests when
 practical.
 
+## Releases
+
+Merges to `main` run the release workflow. The workflow tests the repository,
+bumps the next SemVer tag, pushes the tag, and creates a GitHub Release. The
+default bump is `patch`; maintainers can run the workflow manually from `main`
+and choose `patch`, `minor`, or `major`.
+
 ## Demo Command
 
 `cmd/ironport-demo` is a runnable library demo. It is not intended to become an
 operator-ready server. Production deployments should embed the library and
 provide their own user source, logging, metrics, health checks, process
 supervision, and stable host-key management.
-
