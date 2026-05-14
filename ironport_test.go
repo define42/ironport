@@ -251,7 +251,7 @@ func startTestServerWithConfig(t *testing.T, config *Config) (srv *Server, addr 
 			if err != nil {
 				return // listener closed
 			}
-			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.chownAllowed())
+			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.sftpChownAllowed())
 		}
 	}()
 
@@ -706,8 +706,8 @@ func TestDefaultConfig(t *testing.T) {
 	if config.TCPKeepAlivePeriod != 0 {
 		t.Errorf("TCPKeepAlivePeriod = %v; want 0", config.TCPKeepAlivePeriod)
 	}
-	if config.AllowChown {
-		t.Error("AllowChown is true; want false")
+	if config.SftpAllowChown {
+		t.Error("SftpAllowChown is true; want false")
 	}
 
 	other := DefaultConfig()
@@ -2256,7 +2256,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.chownAllowed())
+			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.sftpChownAllowed())
 		}
 	}()
 	t.Cleanup(func() { _ = ln.Close() })
@@ -3382,7 +3382,7 @@ func TestSFTPServer_Chown(t *testing.T) {
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
 	config := newTestConfig("", "", "", users, testSigner(t), defaultCompletedUploadsSize)
-	config.AllowChown = true
+	config.SftpAllowChown = true
 	_, addr, stop := startTestServerWithConfig(t, config)
 	t.Cleanup(stop)
 
@@ -3425,7 +3425,7 @@ func TestSFTPServer_Chgrp(t *testing.T) {
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
 	config := newTestConfig("", "", "", users, testSigner(t), defaultCompletedUploadsSize)
-	config.AllowChown = true
+	config.SftpAllowChown = true
 	_, addr, stop := startTestServerWithConfig(t, config)
 	t.Cleanup(stop)
 
@@ -4071,7 +4071,7 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.chownAllowed())
+			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.sftpChownAllowed())
 		}
 	}()
 
@@ -5018,7 +5018,7 @@ func TestNextAcceptBackoff(t *testing.T) {
 }
 
 // TestSFTPServer_Chown_DefaultDenied verifies that a chown request is
-// rejected with a permission error when config.AllowChown is left at its
+// rejected with a permission error when config.SftpAllowChown is left at its
 // default (false). This is the opt-in flag that hardens deployments where
 // the server runs with enough privilege (e.g. as root) to actually change
 // ownership: clients must not be able to chown jailed files unless the
@@ -5030,8 +5030,8 @@ func TestSFTPServer_Chown_DefaultDenied(t *testing.T) {
 	}
 	srv, addr, stop := startTestServer(t, users)
 	t.Cleanup(stop)
-	if srv.chownAllowed() {
-		t.Fatalf("AllowChown should default to false")
+	if srv.sftpChownAllowed() {
+		t.Fatalf("SftpAllowChown should default to false")
 	}
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
@@ -5054,12 +5054,12 @@ func TestSFTPServer_Chown_DefaultDenied(t *testing.T) {
 		t.Skip("cannot read uid/gid on this platform")
 	}
 	// Chown to the current uid/gid: this would succeed on disk (same owner),
-	// so the only thing that can fail this call is the configured AllowChown
+	// so the only thing that can fail this call is the configured SftpAllowChown
 	// gate. If the gate is wired up correctly we get a permission error
 	// regardless of the underlying filesystem semantics.
 	err = client.Chown("/chown_denied.txt", int(stat.Uid), int(stat.Gid))
 	if err == nil {
-		t.Fatalf("Chown succeeded with AllowChown=false; want permission denied")
+		t.Fatalf("Chown succeeded with SftpAllowChown=false; want permission denied")
 	}
 	if !strings.Contains(strings.ToLower(err.Error()), "permission") {
 		t.Errorf("Chown error = %v; want a permission denied error", err)

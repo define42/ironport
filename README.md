@@ -22,7 +22,7 @@ A production-ready, embeddable SFTP server and FTP server library for Go with a 
 - **SSH algorithm pinning** — optionally constrain SSH key exchange, ciphers, MACs, and public-key auth signature algorithms
 - **Idle-session timeout** — configurable via `IdleTimeout` on the config (default 15 minutes); inactive authenticated SFTP sessions are reaped
 - **Empty-password protection** — users whose stored `Password` is empty cannot authenticate via password, and empty supplied passwords are always rejected
-- **Chown opt-in** — `Setstat`/`Fsetstat` requests that try to change file ownership (uid/gid) are rejected with a permission error unless `AllowChown` is explicitly set to `true` on the config. Symlink creation by clients is always refused, and `Setstat`/`Fsetstat` requests that try to change access/modification times (`Chtimes`) are likewise rejected.
+- **Chown opt-in** — `Setstat`/`Fsetstat` requests that try to change file ownership (uid/gid) are rejected with a permission error unless `SftpAllowChown` is explicitly set to `true` on the config. Symlink creation by clients is always refused, and `Setstat`/`Fsetstat` requests that try to change access/modification times (`Chtimes`) are likewise rejected.
 
 ## Platform support
 

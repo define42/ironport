@@ -430,13 +430,13 @@ type Server struct {
 	// accepted SFTP and FTP control connections. A zero value selects the
 	// package default; a negative value disables keepalive entirely.
 	tcpKeepAlivePeriod time.Duration
-	// allowChown controls whether SFTP clients may change the ownership
+	// sftpAllowChown controls whether SFTP clients may change the ownership
 	// (uid/gid) of files in their jail via Setstat/Fsetstat requests.
 	// It defaults to false: chown requests are rejected with a permission
 	// error. Enable it only when the server runs with sufficient privilege
 	// (typically as root with CAP_CHOWN) AND the deployment trusts
 	// authenticated users not to chown their files to other UIDs.
-	allowChown bool
+	sftpAllowChown bool
 	// connWG tracks in-flight per-connection handler goroutines so that
 	// Shutdown can wait for them to finish. Each accepted connection adds
 	// one before its goroutine starts and decrements on goroutine exit.
@@ -492,9 +492,9 @@ type Config struct {
 	// Probes keep idle control connections alive through stateful
 	// firewalls/NAT and surface half-open peers as read errors.
 	TCPKeepAlivePeriod time.Duration
-	// AllowChown controls whether SFTP clients may change file ownership inside
-	// their jail. It defaults to false.
-	AllowChown bool
+	// SftpAllowChown controls whether SFTP clients may change file ownership
+	// inside their jail. It defaults to false.
+	SftpAllowChown bool
 }
 
 // AddUser adds or replaces a user entry in the server's user map.
@@ -628,7 +628,7 @@ func NewServer(config *Config) *Server {
 		tempExtensions:             normalizeTempExtensions(config.TempExtensions),
 		idleTimeout:                config.IdleTimeout,
 		tcpKeepAlivePeriod:         config.TCPKeepAlivePeriod,
-		allowChown:                 config.AllowChown,
+		sftpAllowChown:             config.SftpAllowChown,
 		activeConns:                make(map[net.Conn]struct{}),
 	}
 	return s
@@ -969,7 +969,7 @@ func (s *Server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig, uploads chan<
 					_ = nc.Close()
 				}
 			}()
-			handleConn(nc, cfg, uploads, authEvents, s.configuredTempExtensions(), s.effectiveIdleTimeout(), s.chownAllowed())
+			handleConn(nc, cfg, uploads, authEvents, s.configuredTempExtensions(), s.effectiveIdleTimeout(), s.sftpChownAllowed())
 		}()
 	}
 }
@@ -1054,9 +1054,9 @@ func (s *Server) effectiveFTPDataAcceptTimeout() time.Duration {
 	return d
 }
 
-// chownAllowed returns the configured chown permission.
-func (s *Server) chownAllowed() bool {
-	return s.allowChown
+// sftpChownAllowed returns the configured SFTP chown permission.
+func (s *Server) sftpChownAllowed() bool {
+	return s.sftpAllowChown
 }
 
 // effectiveTCPKeepAlivePeriod returns the effective SO_KEEPALIVE idle period for
@@ -1449,7 +1449,7 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 	return cfg
 }
 
-func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent, tempExts []string, idleTimeout time.Duration, allowChown bool) {
+func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent, tempExts []string, idleTimeout time.Duration, sftpAllowChown bool) {
 	defer func() { _ = nc.Close() }()
 
 	// Wrap the raw connection so that every Read resets the read deadline.
@@ -1504,7 +1504,7 @@ func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUplo
 			continue
 		}
 
-		go handleSession(ch, inReqs, jailRoot, user, clientIP, canRead, canWrite, uploads, tempExts, allowChown)
+		go handleSession(ch, inReqs, jailRoot, user, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown)
 	}
 }
 
@@ -1522,7 +1522,7 @@ func remoteIP(addr net.Addr) string {
 	return s
 }
 
-func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, allowChown bool) {
+func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool) {
 	defer func() {
 		recoverSFTPSessionPanic(username, clientIP, recover())
 		_ = ch.Close()
@@ -1551,7 +1551,7 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, usernam
 			// return rather than accumulating inside this for/switch — a
 			// defer placed directly in this case would survive across loop
 			// iterations if the trailing `return` were ever removed.
-			serveSFTPSubsystem(ch, jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts, allowChown)
+			serveSFTPSubsystem(ch, jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown)
 			return
 
 		default:
@@ -1564,8 +1564,8 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, usernam
 // to completion, and tears both down via defer so the cleanup is local to this
 // function and not to handleSession's loop body. Callers must already have
 // replied to the "subsystem" request before invoking it.
-func serveSFTPSubsystem(ch ssh.Channel, jailRoot, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, allowChown bool) {
-	handlers, fs, err := jailedHandlers(jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts, allowChown)
+func serveSFTPSubsystem(ch ssh.Channel, jailRoot, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool) {
+	handlers, fs, err := jailedHandlers(jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown)
 	if err != nil {
 		log.Printf("open jail root %q: %v", jailRoot, err)
 		return
@@ -1596,12 +1596,12 @@ type jail struct {
 	// announced on uploads; renaming such a file to a name without any of
 	// these extensions announces the final path on uploads instead.
 	tempExts []string
-	// allowChown controls whether Setstat/Fsetstat requests carrying a
+	// sftpAllowChown controls whether Setstat/Fsetstat requests carrying a
 	// uid/gid attribute are honoured. When false, chown requests are
 	// rejected with a permission error so an authenticated user cannot
 	// change ownership of jailed files even if the server process has
 	// the privilege to do so (for example when running as root).
-	allowChown bool
+	sftpAllowChown bool
 }
 
 // jail implements the four sftp handler interfaces for a chrooted filesystem.
@@ -1870,7 +1870,7 @@ func (j jail) Filelist(r *sftp.Request) (lister sftp.ListerAt, err error) {
 //
 // Supported flags:
 //   - Permissions       → fchmod via openat2-obtained fd
-//   - UidGid            → fchownat (only when allowChown is true; otherwise
+//   - UidGid            → fchownat (only when sftpAllowChown is true; otherwise
 //     the request is rejected with os.ErrPermission so an authenticated user
 //     cannot change ownership of jailed files even when the server process
 //     has the privilege to do so)
@@ -1879,7 +1879,7 @@ func (j jail) Filelist(r *sftp.Request) (lister sftp.ListerAt, err error) {
 //     on jailed files is denied wholesale under the hardened policy; clients
 //     get a deterministic permission error rather than a partial success.
 //
-// Policy-level rejections (Acmodtime, and UidGid when allowChown is false)
+// Policy-level rejections (Acmodtime, and UidGid when sftpAllowChown is false)
 // are evaluated before any mutating operation is performed, so a multi-flag
 // request that violates policy fails atomically rather than leaving the
 // file partially mutated. Remaining mutating operations are then applied in
@@ -1897,7 +1897,7 @@ func (j jail) applyAttrs(r *sftp.Request) error {
 	if flags.Acmodtime {
 		return os.ErrPermission
 	}
-	if flags.UidGid && !j.allowChown {
+	if flags.UidGid && !j.sftpAllowChown {
 		return os.ErrPermission
 	}
 	if flags.Size {
@@ -1918,20 +1918,20 @@ func (j jail) applyAttrs(r *sftp.Request) error {
 	return nil
 }
 
-func jailedHandlers(root, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, allowChown bool) (sftp.Handlers, *jailFS, error) {
+func jailedHandlers(root, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool) (sftp.Handlers, *jailFS, error) {
 	fs, err := openJailFS(filepath.Clean(root))
 	if err != nil {
 		return sftp.Handlers{}, nil, err
 	}
 	j := jail{
-		fs:         fs,
-		username:   username,
-		clientIP:   clientIP,
-		canRead:    canRead,
-		canWrite:   canWrite,
-		uploads:    uploads,
-		tempExts:   tempExts,
-		allowChown: allowChown,
+		fs:             fs,
+		username:       username,
+		clientIP:       clientIP,
+		canRead:        canRead,
+		canWrite:       canWrite,
+		uploads:        uploads,
+		tempExts:       tempExts,
+		sftpAllowChown: sftpAllowChown,
 	}
 	return sftp.Handlers{
 		FileGet:  j,
