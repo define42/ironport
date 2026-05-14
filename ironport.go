@@ -41,6 +41,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -251,19 +252,8 @@ type UserInfo struct {
 }
 
 func cloneUserInfo(u UserInfo) UserInfo {
-	if u.AuthorizedKeys != nil {
-		u.AuthorizedKeys = append([]ssh.PublicKey(nil), u.AuthorizedKeys...)
-	}
+	u.AuthorizedKeys = slices.Clone(u.AuthorizedKeys)
 	return u
-}
-
-func cloneStringSlice(in []string) []string {
-	if in == nil {
-		return nil
-	}
-	out := make([]string, len(in))
-	copy(out, in)
-	return out
 }
 
 func cloneUsers(users map[string]UserInfo) map[string]UserInfo {
@@ -515,11 +505,11 @@ func NewServer(config *ironportConfig) *server {
 		users:                      cloneUsers(config.Users),
 		signer:                     config.Signer,
 		completedUploads:           newCompletedUploadsChannel(config.CompletedUploadSize),
-		sshKeyExchanges:            cloneStringSlice(config.SSHKeyExchanges),
-		sshCiphers:                 cloneStringSlice(config.SSHCiphers),
-		sshMACs:                    cloneStringSlice(config.SSHMACs),
-		sshPublicKeyAuthAlgorithms: cloneStringSlice(config.SSHPublicKeyAuthAlgorithms),
-		tempExtensionsConfig:       cloneStringSlice(config.TempExtensions),
+		sshKeyExchanges:            slices.Clone(config.SSHKeyExchanges),
+		sshCiphers:                 slices.Clone(config.SSHCiphers),
+		sshMACs:                    slices.Clone(config.SSHMACs),
+		sshPublicKeyAuthAlgorithms: slices.Clone(config.SSHPublicKeyAuthAlgorithms),
+		tempExtensionsConfig:       slices.Clone(config.TempExtensions),
 		idleTimeoutConfig:          config.IdleTimeout,
 		allowChownConfig:           config.AllowChown,
 		activeConns:                make(map[net.Conn]struct{}),
@@ -1078,11 +1068,11 @@ func canonicalJailRoot(root string) (string, error) {
 func (s *server) sshServerConfig() *ssh.ServerConfig {
 	cfg := &ssh.ServerConfig{
 		Config: ssh.Config{
-			KeyExchanges: cloneStringSlice(s.sshKeyExchanges),
-			Ciphers:      cloneStringSlice(s.sshCiphers),
-			MACs:         cloneStringSlice(s.sshMACs),
+			KeyExchanges: slices.Clone(s.sshKeyExchanges),
+			Ciphers:      slices.Clone(s.sshCiphers),
+			MACs:         slices.Clone(s.sshMACs),
 		},
-		PublicKeyAuthAlgorithms: cloneStringSlice(s.sshPublicKeyAuthAlgorithms),
+		PublicKeyAuthAlgorithms: slices.Clone(s.sshPublicKeyAuthAlgorithms),
 		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
 			s.mu.RLock()
 			u, ok := s.users[c.User()]
