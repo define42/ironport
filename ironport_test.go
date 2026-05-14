@@ -758,6 +758,9 @@ func TestFTPSessionAnnounceUploadUsesCapturedCompletedUploads(t *testing.T) {
 		if got.FullFilePath != "/srv/upload.txt" {
 			t.Errorf("FullFilePath = %q; want /srv/upload.txt", got.FullFilePath)
 		}
+		if got.Protocol != CompletedUploadProtocolFTP {
+			t.Errorf("Protocol = %q; want %q", got.Protocol, CompletedUploadProtocolFTP)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("expected CompletedUpload on captured FTP session channel")
 	}
@@ -908,6 +911,9 @@ func TestFTPServer_UploadDownloadList(t *testing.T) {
 		}
 		if evt.FullFilePath != filepath.Join(root, "upload.txt") {
 			t.Fatalf("CompletedUploads FullFilePath = %q; want %q", evt.FullFilePath, filepath.Join(root, "upload.txt"))
+		}
+		if evt.Protocol != CompletedUploadProtocolFTP {
+			t.Fatalf("CompletedUploads Protocol = %q; want %q", evt.Protocol, CompletedUploadProtocolFTP)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for FTP upload completion event")
@@ -1364,6 +1370,9 @@ func TestSFTPServer_CompletedUploadsQueue(t *testing.T) {
 			}
 			if got.ClientIP == "" {
 				t.Errorf("CompletedUploads ClientIP is empty; want non-empty")
+			}
+			if got.Protocol != CompletedUploadProtocolSFTP {
+				t.Errorf("CompletedUploads Protocol = %q; want %q", got.Protocol, CompletedUploadProtocolSFTP)
 			}
 		case <-time.After(2 * time.Second):
 			t.Fatalf("timed out waiting for CompletedUploads signal for %q", name)
@@ -3184,6 +3193,9 @@ func TestSFTPServer_TempExtensions_SuppressesUploadAndAnnouncesOnRename(t *testi
 		if got.ClientIP == "" {
 			t.Errorf("CompletedUploads ClientIP is empty; want non-empty")
 		}
+		if got.Protocol != CompletedUploadProtocolSFTP {
+			t.Errorf("CompletedUploads Protocol = %q; want %q", got.Protocol, CompletedUploadProtocolSFTP)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for CompletedUploads signal for renamed file %q", finalName)
 	}
@@ -3250,6 +3262,9 @@ func TestSFTPServer_TempExtensions_PlainUploadStillAnnounced(t *testing.T) {
 	case got := <-srv.CompletedUploads():
 		if got.FilePath != name {
 			t.Errorf("CompletedUploads FilePath = %q; want %q", got.FilePath, name)
+		}
+		if got.Protocol != CompletedUploadProtocolSFTP {
+			t.Errorf("CompletedUploads Protocol = %q; want %q", got.Protocol, CompletedUploadProtocolSFTP)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for CompletedUploads for plain upload")
@@ -3891,6 +3906,9 @@ func TestWriteLogger_CleanCloseAnnouncesUpload(t *testing.T) {
 		if evt.FilePath != "/ok.bin" {
 			t.Errorf("FilePath = %q; want /ok.bin", evt.FilePath)
 		}
+		if evt.Protocol != CompletedUploadProtocolSFTP {
+			t.Errorf("Protocol = %q; want %q", evt.Protocol, CompletedUploadProtocolSFTP)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("expected CompletedUpload notification for clean Close")
 	}
@@ -3917,8 +3935,10 @@ func TestWriteLogger_TransferErrorNilIsNoop(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 	select {
-	case <-uploads:
-		// expected
+	case evt := <-uploads:
+		if evt.Protocol != CompletedUploadProtocolSFTP {
+			t.Errorf("Protocol = %q; want %q", evt.Protocol, CompletedUploadProtocolSFTP)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("expected CompletedUpload notification for clean Close after TransferError(nil)")
 	}

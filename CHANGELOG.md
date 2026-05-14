@@ -18,6 +18,7 @@ changes are tracked under `Unreleased`.
 - Moved temp-extension handling and idle timeout configuration onto
   `ironportConfig`.
 - Moved chown opt-in configuration onto `ironportConfig`.
+- Added `CompletedUpload.Protocol` to distinguish SFTP and FTP uploads.
 
 ## Releases
 

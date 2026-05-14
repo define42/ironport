@@ -87,6 +87,13 @@ const (
 	authorizedKeyTimingPad = 32
 )
 
+const (
+	// CompletedUploadProtocolSFTP identifies an upload completed through SFTP.
+	CompletedUploadProtocolSFTP = "SFTP"
+	// CompletedUploadProtocolFTP identifies an upload completed through FTP.
+	CompletedUploadProtocolFTP = "FTP"
+)
+
 // errFTPLineTooLong is returned when an FTP client sends a control-channel
 // command that exceeds ftpMaxControlLineLen bytes.
 var errFTPLineTooLong = errors.New("ftp control line too long")
@@ -300,6 +307,9 @@ type CompletedUpload struct {
 	// the upload, without the port. It is empty if the address could not
 	// be parsed.
 	ClientIP string
+	// Protocol is the file-transfer protocol used for the upload.
+	// It is either CompletedUploadProtocolSFTP or CompletedUploadProtocolFTP.
+	Protocol string
 }
 
 // server is a self-contained SFTP server with optional FTP support.
@@ -616,9 +626,9 @@ func (s *server) completedUploadsChan() chan CompletedUpload {
 }
 
 // CompletedUploads returns a receive-only stream of successful upload
-// notifications. The channel is buffered; sends are non-blocking so a slow
-// consumer never stalls an upload. Callers should drain the stream
-// continuously.
+// notifications. Each CompletedUpload includes the protocol that produced it.
+// The channel is buffered; sends are non-blocking so a slow consumer never
+// stalls an upload. Callers should drain the stream continuously.
 //
 // The buffer capacity is set by ironportConfig.CompletedUploadSize. A
 // non-positive value falls back to the package default (64).
@@ -1396,6 +1406,7 @@ func (w *writeLogger) Close() (err error) {
 			FullFilePath: w.fullFilepath,
 			FilePath:     w.filepath,
 			ClientIP:     w.clientIP,
+			Protocol:     CompletedUploadProtocolSFTP,
 		}
 		select {
 		case w.uploads <- evt:
@@ -1496,6 +1507,7 @@ func (j jail) Filecmd(r *sftp.Request) (err error) {
 				FullFilePath: j.fs.fullPath(r.Target),
 				FilePath:     newClientPath,
 				ClientIP:     j.clientIP,
+				Protocol:     CompletedUploadProtocolSFTP,
 			}
 			select {
 			case j.uploads <- evt:
@@ -2395,6 +2407,7 @@ func (f *ftpSession) announceUpload(ftpPath, fullPath string) {
 		FullFilePath: fullPath,
 		FilePath:     ftpPath,
 		ClientIP:     f.clientIP,
+		Protocol:     CompletedUploadProtocolFTP,
 	}
 	select {
 	case f.uploads <- evt:

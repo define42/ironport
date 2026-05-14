@@ -8,7 +8,7 @@ A production-ready, embeddable SFTP server and FTP server library for Go with a 
 - **Per-user jail (chroot)** — each user is confined to a configurable root directory. Every filesystem operation is performed via Linux `openat2` with `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS`, so the kernel itself rejects path traversal and any symlink anywhere in the lookup
 - **Fine-grained permissions** — independent `CanRead` / `CanWrite` flags per user
 - **Dynamic user management** — add, remove, and update users and their authorized keys at runtime without restarting the server
-- **Upload notifications** — a buffered `CompletedUploads()` stream delivers a `CompletedUpload` struct (username, full on-disk path, jail-relative path, and client IP) for every successfully closed upload
+- **Upload notifications** — a buffered `CompletedUploads()` stream delivers a `CompletedUpload` struct (protocol, username, full on-disk path, jail-relative path, and client IP) for every successfully closed upload
 - **Temp-file aware completion** — optionally set `TempExtensions` on the config (for example, `.tmp`, `.writing`) to suppress completion notifications for temporary upload names and emit the notification when the file is renamed to a non-temp name
 - **Graceful shutdown** — `Close()` stops the listener immediately and lets in-flight sessions finish on their own. `Shutdown(ctx)` stops the listener AND waits for in-flight sessions to finish, force-closing any that remain when `ctx` expires
 - **Thread-safe runtime APIs** — user-management helpers and listener lifecycle methods are safe to call while the server is running
@@ -67,8 +67,8 @@ func main() {
     // Drain upload notifications in the background.
     go func() {
         for ev := range srv.CompletedUploads() {
-            log.Printf("upload complete: user=%q ip=%q path=%q full=%q",
-                ev.Username, ev.ClientIP, ev.FilePath, ev.FullFilePath)
+            log.Printf("upload complete: protocol=%q user=%q ip=%q path=%q full=%q",
+                ev.Protocol, ev.Username, ev.ClientIP, ev.FilePath, ev.FullFilePath)
         }
     }()
 
