@@ -128,6 +128,53 @@ var errFTPLineTooLong = errors.New("ftp control line too long")
 // so internal paths and server details are not exposed.
 var errSFTPRequestFailed = errors.New("request failed")
 
+// errInvalidCredentials is returned by SSH auth callbacks when authentication
+// is rejected. Returning a single sentinel keeps the response identical
+// regardless of which step failed (unknown user, wrong password/key, or
+// jail-root resolution), so a client cannot distinguish the cases by error
+// text.
+var errInvalidCredentials = errors.New("invalid credentials")
+
+// publishUpload sends evt to uploads without blocking the caller. When the
+// channel buffer is full the event is dropped and a single line is logged so
+// operators can spot a slow consumer.
+func publishUpload(uploads chan<- CompletedUpload, evt CompletedUpload) {
+	if uploads == nil {
+		return
+	}
+	select {
+	case uploads <- evt:
+	default:
+		log.Printf("upload complete: CompletedUploads queue full, notification for %q dropped", evt.FilePath)
+	}
+}
+
+// maybeAnnounceTempRename publishes a CompletedUpload event when a file is
+// renamed from a temp-suffixed name to a non-temp name (matching is
+// case-insensitive and the extension list comes from Config.TempExtensions).
+// It is a no-op in every other case, so both protocols share the same
+// "rename completes an upload" decision and log line.
+func maybeAnnounceTempRename(uploads chan<- CompletedUpload, tempExts []string, oldPath string, evt CompletedUpload) {
+	if !hasTempExt(oldPath, tempExts) || hasTempExt(evt.FilePath, tempExts) {
+		return
+	}
+	log.Printf("upload complete via rename: %q -> %q", oldPath, evt.FilePath)
+	publishUpload(uploads, evt)
+}
+
+// resolveDur applies the package-wide "configured duration" rule: zero selects
+// defaultV, a negative value disables the deadline (returns 0), any other
+// value is honoured as-is.
+func resolveDur(configured, defaultV time.Duration) time.Duration {
+	switch {
+	case configured == 0:
+		return defaultV
+	case configured < 0:
+		return 0
+	}
+	return configured
+}
+
 // idleConn wraps a net.Conn and resets the read and/or write deadlines
 // before each Read/Write so that a connection is closed when no data has
 // moved in the configured direction within the configured idle timeout.
@@ -938,6 +985,28 @@ func (s *Server) ListenAndServe() error {
 }
 
 func (s *Server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) error {
+	tempExts := s.configuredTempExtensions()
+	idleTimeout := s.effectiveIdleTimeout()
+	allowChown := s.sftpChownAllowed()
+	return s.acceptLoop(ln, "sftp", func(nc net.Conn) {
+		handleConn(nc, cfg, uploads, authEvents, tempExts, idleTimeout, allowChown)
+	})
+}
+
+func (s *Server) serveFTP(ln net.Listener, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) error {
+	tempExts := s.configuredTempExtensions()
+	return s.acceptLoop(ln, "ftp", func(nc net.Conn) {
+		s.handleFTPConn(nc, tempExts, uploads, authEvents)
+	})
+}
+
+// acceptLoop runs the shared Accept loop used by both protocol listeners:
+// it applies the configured TCP keepalive to every new connection, tracks
+// the connection for graceful shutdown, recovers from handler panics, and
+// applies exponential backoff between 5ms and 1s on transient Accept errors
+// so a momentary EMFILE/ENFILE cannot kill the listener. name is used in log
+// messages to distinguish the SFTP and FTP loops.
+func (s *Server) acceptLoop(ln net.Listener, name string, handler func(net.Conn)) error {
 	var backoff time.Duration
 	for {
 		nc, err := ln.Accept()
@@ -945,11 +1014,8 @@ func (s *Server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig, uploads chan<
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			// Transient accept errors should not tear the server down: a
-			// momentary EMFILE/ENFILE or similar would otherwise kill all
-			// listeners. Apply exponential backoff between 5ms and 1s.
 			backoff = nextAcceptBackoff(backoff)
-			log.Printf("sftp accept: %v; retrying in %s", err, backoff)
+			log.Printf("%s accept: %v; retrying in %s", name, err, backoff)
 			time.Sleep(backoff)
 			continue
 		}
@@ -966,44 +1032,11 @@ func (s *Server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig, uploads chan<
 			defer s.untrackConn(nc)
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("sftp handler panic from=%s: %v\n%s", nc.RemoteAddr(), r, debug.Stack())
+					log.Printf("%s handler panic from=%s: %v\n%s", name, nc.RemoteAddr(), r, debug.Stack())
 					_ = nc.Close()
 				}
 			}()
-			handleConn(nc, cfg, uploads, authEvents, s.configuredTempExtensions(), s.effectiveIdleTimeout(), s.sftpChownAllowed())
-		}()
-	}
-}
-
-func (s *Server) serveFTP(ln net.Listener, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) error {
-	var backoff time.Duration
-	for {
-		nc, err := ln.Accept()
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return nil
-			}
-			backoff = nextAcceptBackoff(backoff)
-			log.Printf("ftp accept: %v; retrying in %s", err, backoff)
-			time.Sleep(backoff)
-			continue
-		}
-		backoff = 0
-		applyTCPKeepAlive(nc, s.effectiveTCPKeepAlivePeriod())
-		if !s.trackConn(nc) {
-			_ = nc.Close()
-			continue
-		}
-		go func() {
-			defer s.connWG.Done()
-			defer s.untrackConn(nc)
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("ftp handler panic from=%s: %v\n%s", nc.RemoteAddr(), r, debug.Stack())
-					_ = nc.Close()
-				}
-			}()
-			s.handleFTPConn(nc, s.configuredTempExtensions(), uploads, authEvents)
+			handler(nc)
 		}()
 	}
 }
@@ -1031,28 +1064,14 @@ func (s *Server) configuredTempExtensions() []string {
 // A zero configured timeout selects the package default; a negative timeout
 // disables the deadline.
 func (s *Server) effectiveIdleTimeout() time.Duration {
-	d := s.idleTimeout
-	switch {
-	case d == 0:
-		return defaultSFTPIdleTimeout
-	case d < 0:
-		return 0
-	}
-	return d
+	return resolveDur(s.idleTimeout, defaultSFTPIdleTimeout)
 }
 
 // effectiveFTPDataAcceptTimeout returns the effective passive data-connection
 // accept timeout. A zero configured timeout selects the package default; a
 // negative timeout disables the deadline.
 func (s *Server) effectiveFTPDataAcceptTimeout() time.Duration {
-	d := s.ftpDataAcceptTimeout
-	switch {
-	case d == 0:
-		return defaultFTPDataAcceptTimeout
-	case d < 0:
-		return 0
-	}
-	return d
+	return resolveDur(s.ftpDataAcceptTimeout, defaultFTPDataAcceptTimeout)
 }
 
 // sftpChownAllowed returns the configured SFTP chown permission.
@@ -1064,14 +1083,7 @@ func (s *Server) sftpChownAllowed() bool {
 // accepted control connections. A zero configured value selects the package
 // default; a negative value disables keepalive (returns 0).
 func (s *Server) effectiveTCPKeepAlivePeriod() time.Duration {
-	d := s.tcpKeepAlivePeriod
-	switch {
-	case d == 0:
-		return defaultTCPKeepAlivePeriod
-	case d < 0:
-		return 0
-	}
-	return d
+	return resolveDur(s.tcpKeepAlivePeriod, defaultTCPKeepAlivePeriod)
 }
 
 // applyTCPKeepAlive enables SO_KEEPALIVE on a freshly accepted control
@@ -1348,6 +1360,30 @@ func checkPassword(storedPw, suppliedPw string) bool {
 	return match && len(storedPw) > 0 && len(suppliedPw) > 0
 }
 
+// authenticateUser performs the credential check shared by SFTP and FTP
+// logins. It returns a cloned UserInfo snapshot and the canonical jail-root
+// path on success. ok is false when either the credentials do not match or
+// the jail-root cannot be canonicalised; callers should not distinguish those
+// cases when replying to clients, to avoid leaking which step failed.
+//
+// keyCheck supplies the matching logic so the SSH PasswordCallback can pass a
+// password comparator and the PublicKeyCallback can pass a constant-time-padded
+// key comparator. keyCheck receives the zero-value UserInfo when the user is
+// unknown, so it MUST be constant-time (independent of stored password length
+// and AuthorizedKeys count) to avoid leaking username existence; checkPassword
+// and the public-key timing pad already satisfy this.
+func (s *Server) authenticateUser(username string, keyCheck func(stored UserInfo) bool) (UserInfo, string, bool) {
+	u, ok := s.userSnapshot(username)
+	if !keyCheck(u) || !ok {
+		return UserInfo{}, "", false
+	}
+	jailRoot, err := canonicalJailRoot(u.Root)
+	if err != nil {
+		return UserInfo{}, "", false
+	}
+	return u, jailRoot, true
+}
+
 // sshServerConfig builds the SSH server configuration with both password-based
 // and public-key-based authentication enabled.
 //
@@ -1359,13 +1395,21 @@ func checkPassword(storedPw, suppliedPw string) bool {
 // bytes).
 func (s *Server) sshServerConfig() *ssh.ServerConfig {
 	authEvents := s.authEventsChan()
-	announceFailure := func(c ssh.ConnMetadata) {
-		announceAuthEvent(authEvents, AuthEvent{
-			Type:     AuthEventLoginFailed,
-			Username: c.User(),
-			ClientIP: remoteIP(c.RemoteAddr()),
-			Protocol: CompletedUploadProtocolSFTP,
-		})
+	// completeLogin centralises the failure announcement and the success
+	// permissions construction so PasswordCallback and PublicKeyCallback only
+	// have to express their own credential-matching logic.
+	completeLogin := func(c ssh.ConnMetadata, keyCheck func(UserInfo) bool) (*ssh.Permissions, error) {
+		u, jailRoot, ok := s.authenticateUser(c.User(), keyCheck)
+		if !ok {
+			announceAuthEvent(authEvents, AuthEvent{
+				Type:     AuthEventLoginFailed,
+				Username: c.User(),
+				ClientIP: remoteIP(c.RemoteAddr()),
+				Protocol: CompletedUploadProtocolSFTP,
+			})
+			return nil, errInvalidCredentials
+		}
+		return permissionsFor(u, c.User(), jailRoot), nil
 	}
 
 	cfg := &ssh.ServerConfig{
@@ -1376,74 +1420,52 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 		},
 		PublicKeyAuthAlgorithms: slices.Clone(s.sshPublicKeyAuthAlgorithms),
 		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
-			u, ok := s.userSnapshot(c.User())
-			// Compare SHA-256 hashes of both passwords so that the comparison
-			// always operates on the same 32-byte length regardless of whether
-			// the username exists or what length the stored password has. A
-			// direct subtle.ConstantTimeCompare on the raw strings would return
-			// immediately on a length mismatch, leaking username existence via
-			// timing side-channel (non-existent users have an empty stored
-			// password that differs in length from any real password).
-			var storedPw string
-			if ok {
-				storedPw = u.Password
-			}
-			match := checkPassword(storedPw, string(pass))
-			if !ok || !match {
-				announceFailure(c)
-				return nil, fmt.Errorf("invalid credentials")
-			}
-			jailRoot, err := canonicalJailRoot(u.Root)
-			if err != nil {
-				announceFailure(c)
-				return nil, fmt.Errorf("invalid credentials")
-			}
-			return permissionsFor(u, c.User(), jailRoot), nil
+			return completeLogin(c, func(u UserInfo) bool {
+				// checkPassword treats an empty stored password as
+				// "no password set" and rejects it. Passing u.Password
+				// directly works for both the existing-user and
+				// unknown-user (zero-value UserInfo) cases, and the SHA-256
+				// length-normalisation inside checkPassword keeps the
+				// comparison constant-time regardless.
+				return checkPassword(u.Password, string(pass))
+			})
 		},
 		PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			u, ok := s.userSnapshot(c.User())
-			keyBytes := key.Marshal()
-			// Hash the presented key's wire-format bytes to a fixed 32-byte
-			// value so that all comparisons in the loop are the same length
-			// regardless of key algorithm. RSA, ECDSA, and Ed25519 wire
-			// formats all differ in length; a raw ConstantTimeCompare would
-			// short-circuit on any length mismatch, leaking type information.
-			keyHash := sha256.Sum256(keyBytes)
-			// All comparisons are constant-time on a fixed 32-byte hash and
-			// the total iteration count is padded out to authorizedKeyTimingPad
-			// below so the response time does not leak (a) whether the user
-			// exists, (b) the position of a matching key in AuthorizedKeys, or
-			// (c) the number of keys the user has configured (up to the pad
-			// constant).
-			var zeroHash [sha256.Size]byte
-			matched := false
-			compares := 0
-			for _, authorizedKey := range u.AuthorizedKeys {
-				if authorizedKey == nil {
-					continue
+			return completeLogin(c, func(u UserInfo) bool {
+				keyBytes := key.Marshal()
+				// Hash the presented key's wire-format bytes to a fixed 32-byte
+				// value so that all comparisons in the loop are the same length
+				// regardless of key algorithm. RSA, ECDSA, and Ed25519 wire
+				// formats all differ in length; a raw ConstantTimeCompare would
+				// short-circuit on any length mismatch, leaking type information.
+				keyHash := sha256.Sum256(keyBytes)
+				// All comparisons are constant-time on a fixed 32-byte hash and
+				// the total iteration count is padded out to authorizedKeyTimingPad
+				// below so the response time does not leak (a) whether the user
+				// exists, (b) the position of a matching key in AuthorizedKeys, or
+				// (c) the number of keys the user has configured (up to the pad
+				// constant).
+				var zeroHash [sha256.Size]byte
+				matched := false
+				compares := 0
+				for _, authorizedKey := range u.AuthorizedKeys {
+					if authorizedKey == nil {
+						continue
+					}
+					authHash := sha256.Sum256(authorizedKey.Marshal())
+					if subtle.ConstantTimeCompare(keyHash[:], authHash[:]) == 1 {
+						matched = true
+					}
+					compares++
 				}
-				authHash := sha256.Sum256(authorizedKey.Marshal())
-				if subtle.ConstantTimeCompare(keyHash[:], authHash[:]) == 1 {
-					matched = true
+				// Pad with dummy comparisons against an all-zero hash (which can
+				// never match a real key's SHA-256) so that the total number of
+				// constant-time compares is independent of len(AuthorizedKeys).
+				for ; compares < authorizedKeyTimingPad; compares++ {
+					_ = subtle.ConstantTimeCompare(keyHash[:], zeroHash[:])
 				}
-				compares++
-			}
-			// Pad with dummy comparisons against an all-zero hash (which can
-			// never match a real key's SHA-256) so that the total number of
-			// constant-time compares is independent of len(AuthorizedKeys).
-			for ; compares < authorizedKeyTimingPad; compares++ {
-				_ = subtle.ConstantTimeCompare(keyHash[:], zeroHash[:])
-			}
-			if !ok || !matched {
-				announceFailure(c)
-				return nil, fmt.Errorf("invalid credentials")
-			}
-			jailRoot, err := canonicalJailRoot(u.Root)
-			if err != nil {
-				announceFailure(c)
-				return nil, fmt.Errorf("invalid credentials")
-			}
-			return permissionsFor(u, c.User(), jailRoot), nil
+				return matched
+			})
 		},
 	}
 	cfg.AddHostKey(s.sftpSigner)
@@ -1706,18 +1728,13 @@ func (w *writeLogger) Close() (err error) {
 		}
 		// Announce the completed upload on the queue; non-blocking so a slow
 		// consumer never stalls the upload handler.
-		evt := CompletedUpload{
+		publishUpload(w.uploads, CompletedUpload{
 			Username:     w.username,
 			FullFilePath: w.fullFilepath,
 			FilePath:     w.filepath,
 			ClientIP:     w.clientIP,
 			Protocol:     CompletedUploadProtocolSFTP,
-		}
-		select {
-		case w.uploads <- evt:
-		default:
-			log.Printf("upload complete: CompletedUploads queue full, notification for %q dropped", w.filepath)
-		}
+		})
 	}
 	return err
 }
@@ -1797,21 +1814,13 @@ func (j jail) Filecmd(r *sftp.Request) (err error) {
 		// completes and announce the new SFTP path on uploads.
 		oldClientPath := cleanSFTPClientPath(r.Filepath)
 		newClientPath := cleanSFTPClientPath(r.Target)
-		if hasTempExt(oldClientPath, j.tempExts) && !hasTempExt(newClientPath, j.tempExts) {
-			log.Printf("upload complete via rename: %q -> %q", oldClientPath, newClientPath)
-			evt := CompletedUpload{
-				Username:     j.username,
-				FullFilePath: j.fs.fullPath(r.Target),
-				FilePath:     newClientPath,
-				ClientIP:     j.clientIP,
-				Protocol:     CompletedUploadProtocolSFTP,
-			}
-			select {
-			case j.uploads <- evt:
-			default:
-				log.Printf("upload complete: CompletedUploads queue full, notification for %q dropped", newClientPath)
-			}
-		}
+		maybeAnnounceTempRename(j.uploads, j.tempExts, oldClientPath, CompletedUpload{
+			Username:     j.username,
+			FullFilePath: j.fs.fullPath(r.Target),
+			FilePath:     newClientPath,
+			ClientIP:     j.clientIP,
+			Protocol:     CompletedUploadProtocolSFTP,
+		})
 		return nil
 
 	case "Rmdir":
@@ -2181,7 +2190,7 @@ func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
 		}
 		if !f.authenticate(arg) {
 			f.announceAuthEvent(AuthEventLoginFailed)
-			_ = f.reply(530, "invalid credentials")
+			_ = f.reply(530, errInvalidCredentials.Error())
 			return false
 		}
 		log.Printf("login protocol=ftp user=%s root=%s from=%s", f.username, f.user.Root, f.conn.RemoteAddr())
@@ -2375,18 +2384,10 @@ func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
 }
 
 func (f *ftpSession) authenticate(pass string) bool {
-	u, ok := f.server.userSnapshot(f.username)
-
-	var storedPw string
-	if ok {
-		storedPw = u.Password
-	}
-	match := checkPassword(storedPw, pass)
-	if !ok || !match {
-		return false
-	}
-	jailRoot, err := canonicalJailRoot(u.Root)
-	if err != nil {
+	u, jailRoot, ok := f.server.authenticateUser(f.username, func(stored UserInfo) bool {
+		return checkPassword(stored.Password, pass)
+	})
+	if !ok {
 		return false
 	}
 	// Open the fd-relative jail filesystem now. If openat2 is not available
@@ -2935,18 +2936,13 @@ func (f *ftpSession) announceUpload(ftpPath, fullPath string) {
 		log.Printf("upload complete: %q has temp extension, deferring CompletedUploads notification", ftpPath)
 		return
 	}
-	evt := CompletedUpload{
+	publishUpload(f.uploads, CompletedUpload{
 		Username:     f.username,
 		FullFilePath: fullPath,
 		FilePath:     ftpPath,
 		ClientIP:     f.clientIP,
 		Protocol:     CompletedUploadProtocolFTP,
-	}
-	select {
-	case f.uploads <- evt:
-	default:
-		log.Printf("upload complete: CompletedUploads queue full, notification for %q dropped", ftpPath)
-	}
+	})
 }
 
 // cmdHelp answers the HELP command. With no argument it returns a multi-line
@@ -3357,10 +3353,12 @@ func (f *ftpSession) cmdRnto(arg string) {
 		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
-	if hasTempExt(oldPath, f.tempExts) && !hasTempExt(newPath, f.tempExts) {
-		newFull := f.fs.fullPath(newPath)
-		log.Printf("upload complete via rename: %q -> %q", oldPath, newPath)
-		f.announceUpload(newPath, newFull)
-	}
+	maybeAnnounceTempRename(f.uploads, f.tempExts, oldPath, CompletedUpload{
+		Username:     f.username,
+		FullFilePath: f.fs.fullPath(newPath),
+		FilePath:     newPath,
+		ClientIP:     f.clientIP,
+		Protocol:     CompletedUploadProtocolFTP,
+	})
 	_ = f.reply(250, "renamed")
 }
