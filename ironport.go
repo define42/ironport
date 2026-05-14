@@ -1035,6 +1035,29 @@ func recoverSFTPHandlerPanic(username, clientIP, method, filepath string, recove
 	return true
 }
 
+func deferRecoverSFTPHandlerPanic(username, clientIP string, r *sftp.Request, errp *error, onPanic func()) func() {
+	method, filePath := sftpRequestContext(r)
+	return func() {
+		if recoverSFTPHandlerPanic(username, clientIP, method, filePath, recover(), errp) && onPanic != nil {
+			onPanic()
+		}
+	}
+}
+
+func recoverSFTPPanicf(errp *error, onPanic func(), format string, args ...any) func() {
+	return func() {
+		if recovered := recover(); recovered != nil {
+			log.Printf(format, append(args, recovered, debug.Stack())...)
+			if onPanic != nil {
+				onPanic()
+			}
+			if errp != nil {
+				*errp = errSFTPRequestFailed
+			}
+		}
+	}
+}
+
 // hasTempExt reports whether name ends with one of the given (already
 // normalised, lower-case, dot-prefixed) extensions. Matching is
 // case-insensitive on the filename.
@@ -1447,12 +1470,7 @@ type jail struct {
 // jail implements the four sftp handler interfaces for a chrooted filesystem.
 // Fileread implements sftp.FileReader.
 func (j jail) Fileread(r *sftp.Request) (reader io.ReaderAt, err error) {
-	method, filePath := sftpRequestContext(r)
-	defer func() {
-		if recoverSFTPHandlerPanic(j.username, j.clientIP, method, filePath, recover(), &err) {
-			reader = nil
-		}
-	}()
+	defer deferRecoverSFTPHandlerPanic(j.username, j.clientIP, r, &err, func() { reader = nil })()
 	if !j.canRead {
 		return nil, os.ErrPermission
 	}
@@ -1501,13 +1519,7 @@ type writeLogger struct {
 }
 
 func (w *writeLogger) WriteAt(p []byte, off int64) (n int, err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			log.Printf("sftp write panic user=%q ip=%q path=%q: %v\n%s", w.username, w.clientIP, w.filepath, recovered, debug.Stack())
-			n = 0
-			err = errSFTPRequestFailed
-		}
-	}()
+	defer recoverSFTPPanicf(&err, func() { n = 0 }, "sftp write panic user=%q ip=%q path=%q: %v\n%s", w.username, w.clientIP, w.filepath)()
 	if w.appendMode {
 		return w.Write(p)
 	}
@@ -1532,12 +1544,7 @@ func (w *writeLogger) TransferError(err error) {
 }
 
 func (w *writeLogger) Close() (err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			log.Printf("sftp write close panic user=%q ip=%q path=%q: %v\n%s", w.username, w.clientIP, w.filepath, recovered, debug.Stack())
-			err = errSFTPRequestFailed
-		}
-	}()
+	defer recoverSFTPPanicf(&err, nil, "sftp write close panic user=%q ip=%q path=%q: %v\n%s", w.username, w.clientIP, w.filepath)()
 	err = w.File.Close()
 	w.mu.Lock()
 	transferErr := w.transferErr
@@ -1574,12 +1581,7 @@ func (w *writeLogger) Close() (err error) {
 
 // Filewrite implements sftp.FileWriter.
 func (j jail) Filewrite(r *sftp.Request) (writer io.WriterAt, err error) {
-	method, filePath := sftpRequestContext(r)
-	defer func() {
-		if recoverSFTPHandlerPanic(j.username, j.clientIP, method, filePath, recover(), &err) {
-			writer = nil
-		}
-	}()
+	defer deferRecoverSFTPHandlerPanic(j.username, j.clientIP, r, &err, func() { writer = nil })()
 	if !j.canWrite {
 		return nil, os.ErrPermission
 	}
@@ -1632,10 +1634,7 @@ func sftpWriteOpenFlags(r *sftp.Request) (int, bool, error) {
 
 // Filecmd implements sftp.FileCmder.
 func (j jail) Filecmd(r *sftp.Request) (err error) {
-	method, filePath := sftpRequestContext(r)
-	defer func() {
-		recoverSFTPHandlerPanic(j.username, j.clientIP, method, filePath, recover(), &err)
-	}()
+	defer deferRecoverSFTPHandlerPanic(j.username, j.clientIP, r, &err, nil)()
 	if !j.canWrite {
 		return os.ErrPermission
 	}
@@ -1697,12 +1696,7 @@ func (j jail) Filecmd(r *sftp.Request) (err error) {
 
 // Filelist implements sftp.FileLister.
 func (j jail) Filelist(r *sftp.Request) (lister sftp.ListerAt, err error) {
-	method, filePath := sftpRequestContext(r)
-	defer func() {
-		if recoverSFTPHandlerPanic(j.username, j.clientIP, method, filePath, recover(), &err) {
-			lister = nil
-		}
-	}()
+	defer deferRecoverSFTPHandlerPanic(j.username, j.clientIP, r, &err, func() { lister = nil })()
 	if !j.canRead {
 		return nil, os.ErrPermission
 	}
@@ -1808,13 +1802,7 @@ func jailedHandlers(root, username, clientIP string, canRead, canWrite bool, upl
 type fileInfoLister struct{ infos []os.FileInfo }
 
 func (l fileInfoLister) ListAt(fis []os.FileInfo, offset int64) (n int, err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			log.Printf("sftp list panic offset=%d: %v\n%s", offset, recovered, debug.Stack())
-			n = 0
-			err = errSFTPRequestFailed
-		}
-	}()
+	defer recoverSFTPPanicf(&err, func() { n = 0 }, "sftp list panic offset=%d: %v\n%s", offset)()
 	if offset < 0 {
 		return 0, os.ErrInvalid
 	}
