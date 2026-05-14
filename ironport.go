@@ -2608,7 +2608,20 @@ func ftpModeString(mode os.FileMode) string {
 	return string(buf)
 }
 
+// consumeTransferHints atomically captures and clears both the REST restart
+// offset and the ALLO expected-size hint. Calling it at the top of cmdStor
+// (and cmdRetr) ensures that every exit path — error or success — always
+// leaves both fields zeroed, with no risk of a stale hint leaking into a
+// subsequent transfer command.
+func (f *ftpSession) consumeTransferHints() (restartOffset, expectedSize int64) {
+	restartOffset, expectedSize = f.restartOffset, f.expectedUploadSize
+	f.restartOffset = 0
+	f.expectedUploadSize = 0
+	return
+}
+
 func (f *ftpSession) cmdRetr(arg string) {
+	restartOffset, _ := f.consumeTransferHints()
 	if !f.user.CanRead {
 		_ = f.reply(550, "permission denied")
 		return
@@ -2616,20 +2629,17 @@ func (f *ftpSession) cmdRetr(arg string) {
 	ftpPath := f.cleanPath(arg)
 	file, err := f.fs.OpenRead(ftpPath)
 	if err != nil {
-		f.restartOffset = 0
 		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	defer func() { _ = file.Close() }()
 
-	if f.restartOffset > 0 {
-		if _, err := file.Seek(f.restartOffset, io.SeekStart); err != nil {
-			f.restartOffset = 0
+	if restartOffset > 0 {
+		if _, err := file.Seek(restartOffset, io.SeekStart); err != nil {
 			_ = f.reply(550, ftpErrMsg(err))
 			return
 		}
 	}
-	f.restartOffset = 0
 
 	if err := f.reply(150, "opening data connection"); err != nil {
 		return
@@ -2662,25 +2672,22 @@ func (f *ftpSession) cmdRetr(arg string) {
 }
 
 func (f *ftpSession) cmdStor(arg string, appendMode bool) {
+	restartOffset, expectedSize := f.consumeTransferHints()
 	if !f.user.CanWrite {
-		f.restartOffset = 0
 		_ = f.reply(550, "permission denied")
 		return
 	}
 	if hasCRLF(arg) {
-		f.restartOffset = 0
 		_ = f.reply(553, "invalid filename")
 		return
 	}
 	ftpPath := f.cleanPath(arg)
 
 	if err := f.reply(150, "opening data connection"); err != nil {
-		f.restartOffset = 0
 		return
 	}
 	dc, err := f.acceptDataConn()
 	if err != nil {
-		f.restartOffset = 0
 		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
@@ -2690,7 +2697,7 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 	switch {
 	case appendMode:
 		flags |= os.O_APPEND
-	case f.restartOffset > 0:
+	case restartOffset > 0:
 		// Keep existing bytes and resume at requested offset.
 	default:
 		flags |= os.O_TRUNC
@@ -2698,12 +2705,11 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 
 	file, err := f.fs.OpenWrite(ftpPath, flags, 0600)
 	if err != nil {
-		f.restartOffset = 0
 		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 
-	if f.restartOffset > 0 && !appendMode {
+	if restartOffset > 0 && !appendMode {
 		// Reject restart offsets beyond the current end of file. Without
 		// this guard, O_CREATE+seek+write would happily produce a sparse
 		// file with a hole between the previous EOF and restartOffset —
@@ -2713,31 +2719,22 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 		// file is created at size 0 and any positive offset is invalid.
 		st, statErr := file.Stat()
 		if statErr != nil {
-			f.restartOffset = 0
 			_ = file.Close()
 			_ = f.reply(550, ftpErrMsg(statErr))
 			return
 		}
-		if f.restartOffset > st.Size() {
-			offset, size := f.restartOffset, st.Size()
-			f.restartOffset = 0
+		if restartOffset > st.Size() {
+			offset, size := restartOffset, st.Size()
 			_ = file.Close()
 			_ = f.reply(554, fmt.Sprintf("restart offset %d exceeds file size %d", offset, size))
 			return
 		}
-		if _, err := file.Seek(f.restartOffset, io.SeekStart); err != nil {
-			f.restartOffset = 0
+		if _, err := file.Seek(restartOffset, io.SeekStart); err != nil {
 			_ = file.Close()
 			_ = f.reply(550, ftpErrMsg(err))
 			return
 		}
 	}
-	f.restartOffset = 0
-
-	// Consume any prior ALLO hint up front so a transfer that errors out
-	// below cannot leave the hint hanging for an unrelated later STOR.
-	expectedSize := f.expectedUploadSize
-	f.expectedUploadSize = 0
 
 	log.Printf("upload protocol=ftp path=%q", ftpPath)
 	// Wrap the data connection so that every Read enforces a fresh idle
