@@ -1049,7 +1049,7 @@ func deferRecoverSFTPHandlerPanic(username, clientIP string, r *sftp.Request, er
 }
 
 // deferRecoverSFTPPanicf returns a deferred panic-recovery function for helpers that
-// do not have an sftp.Request available for recoverSFTPHandlerPanic. format
+// do not have an sftp.Request available for deferRecoverSFTPHandlerPanic. format
 // must include two trailing verbs for the recovered panic value and stack trace
 // after args.
 func deferRecoverSFTPPanicf(errp *error, onPanic func(), format string, args ...any) func() {
