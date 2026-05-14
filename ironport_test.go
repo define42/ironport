@@ -249,7 +249,7 @@ func startTestServerWithConfig(t *testing.T, config *ironportConfig) (srv *serve
 			if err != nil {
 				return // listener closed
 			}
-			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.tempExtensions(), srv.idleTimeout(), srv.allowChown())
+			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.tempExtensions(), srv.idleTimeout(), srv.allowChown())
 		}
 	}()
 
@@ -393,6 +393,35 @@ func (c *ftpTestClient) passiveConn() (net.Conn, int) {
 	return dc, port
 }
 
+func requireAuthEvent(t *testing.T, events <-chan AuthEvent, eventType AuthEventType, username, protocol string) AuthEvent {
+	t.Helper()
+	select {
+	case got := <-events:
+		if got.Type != eventType {
+			t.Fatalf("AuthEvent Type = %q; want %q (event %+v)", got.Type, eventType, got)
+		}
+		if got.Username != username {
+			t.Fatalf("AuthEvent Username = %q; want %q (event %+v)", got.Username, username, got)
+		}
+		if got.Protocol != protocol {
+			t.Fatalf("AuthEvent Protocol = %q; want %q (event %+v)", got.Protocol, protocol, got)
+		}
+		return got
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for AuthEvent type=%q user=%q protocol=%q", eventType, username, protocol)
+		return AuthEvent{}
+	}
+}
+
+func requireNoAuthEvent(t *testing.T, events <-chan AuthEvent) {
+	t.Helper()
+	select {
+	case got := <-events:
+		t.Fatalf("unexpected AuthEvent: %+v", got)
+	default:
+	}
+}
+
 func parseFTPPASVResponse(msg string) (string, int, error) {
 	start := strings.IndexByte(msg, '(')
 	end := strings.LastIndexByte(msg, ')')
@@ -504,6 +533,88 @@ func TestSFTPServer_InvalidCredentials(t *testing.T) {
 	}
 }
 
+func TestSFTPServer_AuthEventsLoginSuccessAndLogout(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "rightpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	sshCfg := &ssh.ClientConfig{
+		User:            "testuser",
+		Auth:            []ssh.AuthMethod{ssh.Password("rightpw")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	conn, err := ssh.Dial("tcp", addr, sshCfg)
+	if err != nil {
+		t.Fatalf("ssh.Dial: %v", err)
+	}
+
+	login := requireAuthEvent(t, srv.AuthEvents(), AuthEventLoginSuccess, "testuser", CompletedUploadProtocolSFTP)
+	if login.ClientIP == "" {
+		t.Fatal("LoginSuccess ClientIP is empty; want non-empty")
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("ssh client Close: %v", err)
+	}
+	logout := requireAuthEvent(t, srv.AuthEvents(), AuthEventLogout, "testuser", CompletedUploadProtocolSFTP)
+	if logout.ClientIP == "" {
+		t.Fatal("Logout ClientIP is empty; want non-empty")
+	}
+}
+
+func TestSFTPServer_AuthEventsPasswordLoginFailed(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "rightpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	sshCfg := &ssh.ClientConfig{
+		User:            "testuser",
+		Auth:            []ssh.AuthMethod{ssh.Password("wrongpw")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	if conn, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
+		_ = conn.Close()
+		t.Fatal("expected authentication error, got nil")
+	}
+
+	failed := requireAuthEvent(t, srv.AuthEvents(), AuthEventLoginFailed, "testuser", CompletedUploadProtocolSFTP)
+	if failed.ClientIP == "" {
+		t.Fatal("LoginFailed ClientIP is empty; want non-empty")
+	}
+}
+
+func TestSFTPServer_AuthEventsPublicKeyLoginFailed(t *testing.T) {
+	root := t.TempDir()
+	_, authorizedPubKey := testClientKey(t)
+	wrongSigner, _ := testClientKey(t)
+	users := map[string]UserInfo{
+		"keyuser": {AuthorizedKeys: []ssh.PublicKey{authorizedPubKey}, Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	sshCfg := &ssh.ClientConfig{
+		User:            "keyuser",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(wrongSigner)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	if conn, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
+		_ = conn.Close()
+		t.Fatal("expected public-key authentication error, got nil")
+	}
+
+	failed := requireAuthEvent(t, srv.AuthEvents(), AuthEventLoginFailed, "keyuser", CompletedUploadProtocolSFTP)
+	if failed.ClientIP == "" {
+		t.Fatal("LoginFailed ClientIP is empty; want non-empty")
+	}
+}
+
 func TestNewServer(t *testing.T) {
 	users := map[string]UserInfo{
 		"alice": {Password: "pw", Root: "/tmp/alice", CanRead: true, CanWrite: true},
@@ -516,6 +627,7 @@ func TestNewServer(t *testing.T) {
 	config.Users = users
 	config.Signer = signer
 	config.CompletedUploadSize = defaultCompletedUploadsSize
+	config.AuthEventSize = defaultAuthEventsSize
 	srv := NewServer(config)
 	if srv.addr != ":0" {
 		t.Errorf("addr = %q; want :0", srv.addr)
@@ -536,6 +648,9 @@ func TestNewServer(t *testing.T) {
 	if srv.signer != signer {
 		t.Error("signer not set correctly")
 	}
+	if cap(srv.AuthEvents()) != defaultAuthEventsSize {
+		t.Errorf("AuthEvents cap = %d; want %d", cap(srv.AuthEvents()), defaultAuthEventsSize)
+	}
 }
 
 func TestDefaultIronportConfig(t *testing.T) {
@@ -551,6 +666,9 @@ func TestDefaultIronportConfig(t *testing.T) {
 	}
 	if config.CompletedUploadSize != defaultCompletedUploadsSize {
 		t.Errorf("CompletedUploadSize = %d; want %d", config.CompletedUploadSize, defaultCompletedUploadsSize)
+	}
+	if config.AuthEventSize != defaultAuthEventsSize {
+		t.Errorf("AuthEventSize = %d; want %d", config.AuthEventSize, defaultAuthEventsSize)
 	}
 	if config.Users != nil {
 		t.Error("Users is non-nil; want nil")
@@ -733,6 +851,43 @@ func TestCompletedUploadsBufferSize(t *testing.T) {
 	}
 }
 
+// TestAuthEventsBufferSize verifies that NewServer controls the buffer
+// capacity of the AuthEvents channel.
+func TestAuthEventsBufferSize(t *testing.T) {
+	signer := testSigner(t)
+	users := map[string]UserInfo{
+		"u": {Password: "pw", Root: t.TempDir(), CanWrite: true},
+	}
+
+	// Default capacity: a non-positive config value selects defaultAuthEventsSize.
+	config := DefaultIronportConfig()
+	config.Addr = ":0"
+	config.FtpPassivePortRange = ""
+	config.Users = users
+	config.Signer = signer
+	config.AuthEventSize = 0
+	srv := NewServer(config)
+	if cap(srv.AuthEvents()) != defaultAuthEventsSize {
+		t.Errorf("default cap = %d; want %d", cap(srv.AuthEvents()), defaultAuthEventsSize)
+	}
+
+	// Custom capacity via NewServer config.
+	config2 := DefaultIronportConfig()
+	config2.Addr = ":0"
+	config2.FtpPassivePortRange = ""
+	config2.Users = users
+	config2.Signer = signer
+	config2.AuthEventSize = 256
+	srv2 := NewServer(config2)
+	if cap(srv2.AuthEvents()) != 256 {
+		t.Errorf("custom cap via NewServer = %d; want 256", cap(srv2.AuthEvents()))
+	}
+
+	if srv2.authEventsChan() != srv2.authEvents {
+		t.Error("authEventsChan did not return the server auth event channel")
+	}
+}
+
 func TestFTPSessionAnnounceUploadUsesCapturedCompletedUploads(t *testing.T) {
 	serverUploads := make(chan CompletedUpload, 1)
 	sessionUploads := make(chan CompletedUpload, 1)
@@ -770,6 +925,41 @@ func TestFTPSessionAnnounceUploadUsesCapturedCompletedUploads(t *testing.T) {
 		t.Fatalf("announceUpload sent to server CompletedUploads after session capture: %+v", got)
 	default:
 	}
+}
+
+func TestFTPSessionAnnounceAuthEventUsesCapturedAuthEvents(t *testing.T) {
+	serverEvents := make(chan AuthEvent, 1)
+	sessionEvents := make(chan AuthEvent, 1)
+	fs := &ftpSession{
+		server: &server{
+			authEvents: serverEvents,
+		},
+		username:   "alice",
+		clientIP:   "127.0.0.1",
+		authEvents: sessionEvents,
+	}
+
+	fs.announceAuthEvent(AuthEventLoginSuccess)
+
+	select {
+	case got := <-sessionEvents:
+		if got.Type != AuthEventLoginSuccess {
+			t.Errorf("Type = %q; want %q", got.Type, AuthEventLoginSuccess)
+		}
+		if got.Username != "alice" {
+			t.Errorf("Username = %q; want alice", got.Username)
+		}
+		if got.ClientIP != "127.0.0.1" {
+			t.Errorf("ClientIP = %q; want 127.0.0.1", got.ClientIP)
+		}
+		if got.Protocol != CompletedUploadProtocolFTP {
+			t.Errorf("Protocol = %q; want %q", got.Protocol, CompletedUploadProtocolFTP)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected AuthEvent on captured FTP session channel")
+	}
+
+	requireNoAuthEvent(t, serverEvents)
 }
 
 func TestParseFTPPassivePortRange(t *testing.T) {
@@ -918,6 +1108,108 @@ func TestFTPServer_UploadDownloadList(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for FTP upload completion event")
 	}
+}
+
+func TestFTPServer_AuthEventsLoginSuccess(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"ftpuser": {Password: "ftppw", Root: root, CanRead: true, CanWrite: true},
+	}
+
+	srv, addr, stop := startTestFTPServer(t, users, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("ftpuser", "ftppw")
+
+	login := requireAuthEvent(t, srv.AuthEvents(), AuthEventLoginSuccess, "ftpuser", CompletedUploadProtocolFTP)
+	if login.ClientIP == "" {
+		t.Fatal("LoginSuccess ClientIP is empty; want non-empty")
+	}
+}
+
+func TestFTPServer_AuthEventsLoginFailed(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"ftpuser": {Password: "ftppw", Root: root, CanRead: true, CanWrite: true},
+	}
+
+	srv, addr, stop := startTestFTPServer(t, users, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.command(331, "USER ftpuser")
+	client.command(530, "PASS wrongpw")
+
+	failed := requireAuthEvent(t, srv.AuthEvents(), AuthEventLoginFailed, "ftpuser", CompletedUploadProtocolFTP)
+	if failed.ClientIP == "" {
+		t.Fatal("LoginFailed ClientIP is empty; want non-empty")
+	}
+}
+
+func TestFTPServer_AuthEventsLogoutOnQuitAndDisconnect(t *testing.T) {
+	t.Run("quit", func(t *testing.T) {
+		root := t.TempDir()
+		users := map[string]UserInfo{
+			"ftpuser": {Password: "ftppw", Root: root, CanRead: true, CanWrite: true},
+		}
+
+		srv, addr, stop := startTestFTPServer(t, users, "")
+		t.Cleanup(stop)
+
+		client := dialFTP(t, addr)
+		client.login("ftpuser", "ftppw")
+		requireAuthEvent(t, srv.AuthEvents(), AuthEventLoginSuccess, "ftpuser", CompletedUploadProtocolFTP)
+
+		client.command(221, "QUIT")
+		logout := requireAuthEvent(t, srv.AuthEvents(), AuthEventLogout, "ftpuser", CompletedUploadProtocolFTP)
+		if logout.ClientIP == "" {
+			t.Fatal("Logout ClientIP is empty; want non-empty")
+		}
+	})
+
+	t.Run("disconnect", func(t *testing.T) {
+		root := t.TempDir()
+		users := map[string]UserInfo{
+			"ftpuser": {Password: "ftppw", Root: root, CanRead: true, CanWrite: true},
+		}
+
+		srv, addr, stop := startTestFTPServer(t, users, "")
+		t.Cleanup(stop)
+
+		client := dialFTP(t, addr)
+		client.login("ftpuser", "ftppw")
+		requireAuthEvent(t, srv.AuthEvents(), AuthEventLoginSuccess, "ftpuser", CompletedUploadProtocolFTP)
+
+		_ = client.tp.Close()
+		logout := requireAuthEvent(t, srv.AuthEvents(), AuthEventLogout, "ftpuser", CompletedUploadProtocolFTP)
+		if logout.ClientIP == "" {
+			t.Fatal("Logout ClientIP is empty; want non-empty")
+		}
+	})
+}
+
+func TestFTPServer_AuthEventsUserLogsOutPreviousSession(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
+		"bob":   {Password: "bobpw", Root: root, CanRead: true, CanWrite: true},
+	}
+
+	srv, addr, stop := startTestFTPServer(t, users, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("alice", "alicepw")
+	requireAuthEvent(t, srv.AuthEvents(), AuthEventLoginSuccess, "alice", CompletedUploadProtocolFTP)
+
+	client.command(331, "USER bob")
+	requireAuthEvent(t, srv.AuthEvents(), AuthEventLogout, "alice", CompletedUploadProtocolFTP)
+
+	client.command(230, "PASS bobpw")
+	requireAuthEvent(t, srv.AuthEvents(), AuthEventLoginSuccess, "bob", CompletedUploadProtocolFTP)
+	client.command(221, "QUIT")
+	requireAuthEvent(t, srv.AuthEvents(), AuthEventLogout, "bob", CompletedUploadProtocolFTP)
 }
 
 // TestSFTPServer_ReadOnlyUser verifies that a read-only user can download and
@@ -1254,7 +1546,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.tempExtensions(), srv.idleTimeout(), srv.allowChown())
+			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.tempExtensions(), srv.idleTimeout(), srv.allowChown())
 		}
 	}()
 	t.Cleanup(func() { _ = ln.Close() })
@@ -2935,7 +3227,7 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.tempExtensions(), srv.idleTimeout(), srv.allowChown())
+			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.tempExtensions(), srv.idleTimeout(), srv.allowChown())
 		}
 	}()
 

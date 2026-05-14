@@ -9,6 +9,7 @@ A production-ready, embeddable SFTP server and FTP server library for Go with a 
 - **Fine-grained permissions** — independent `CanRead` / `CanWrite` flags per user
 - **Dynamic user management** — add, remove, and update users and their authorized keys at runtime without restarting the server
 - **Upload notifications** — a buffered `CompletedUploads()` stream delivers a `CompletedUpload` struct (protocol, username, full on-disk path, jail-relative path, and client IP) for every successfully closed upload
+- **Auth notifications** — a buffered `AuthEvents()` stream delivers `LoginSuccess`, `LoginFailed`, and `Logout` events for SFTP and FTP sessions
 - **Temp-file aware completion** — optionally set `TempExtensions` on the config (for example, `.tmp`, `.writing`) to suppress completion notifications for temporary upload names and emit the notification when the file is renamed to a non-temp name
 - **Graceful shutdown** — `Close()` stops the listener immediately and lets in-flight sessions finish on their own. `Shutdown(ctx)` stops the listener AND waits for in-flight sessions to finish, force-closing any that remain when `ctx` expires
 - **Thread-safe runtime APIs** — user-management helpers and listener lifecycle methods are safe to call while the server is running
@@ -72,6 +73,14 @@ func main() {
         }
     }()
 
+    // Drain auth/session notifications in the background.
+    go func() {
+        for ev := range srv.AuthEvents() {
+            log.Printf("auth event: type=%q protocol=%q user=%q ip=%q",
+                ev.Type, ev.Protocol, ev.Username, ev.ClientIP)
+        }
+    }()
+
     log.Fatal(srv.ListenAndServe())
 }
 ```
@@ -92,6 +101,22 @@ Read upload notifications from the receive-only `CompletedUploads()` stream.
 The underlying channel is internal, so callers cannot send to it, close it, or
 replace it while the server is running. To change the buffer capacity, set a
 different `CompletedUploadSize` before calling `NewServer`.
+
+### Configuring the auth-notification buffer size
+
+Set `AuthEventSize` on the server config:
+
+```go
+config := ironport.DefaultIronportConfig()
+config.Users = users
+config.Signer = signer
+config.AuthEventSize = 256
+srv := ironport.NewServer(config)
+```
+
+Read authentication and logout notifications from the receive-only
+`AuthEvents()` stream. The underlying channel is internal and follows the same
+non-blocking, caller-drained behavior as `CompletedUploads()`.
 
 ### Deferring completion notifications until final rename
 

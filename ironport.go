@@ -9,9 +9,10 @@
 //   - Fine-grained CanRead / CanWrite per-user permission flags.
 //   - Runtime user management (AddUser, RemoveUser, RemoveAllUsers, AddUserKey, RemoveUserKey).
 //   - Optional SSH algorithm pinning for key exchange, ciphers, MACs, and public-key auth signatures.
-//   - Graceful shutdown via Close; upload-completion notifications via CompletedUploads.
+//   - Graceful shutdown via Close; upload-completion notifications via CompletedUploads;
+//     authentication/session notifications via AuthEvents.
 //   - Optional passive-mode FTP listener sharing the same users, jails, permissions,
-//     temp-extension handling, and CompletedUploads stream as SFTP.
+//     temp-extension handling, CompletedUploads stream, and AuthEvents stream as SFTP.
 //
 // Typical usage:
 //
@@ -75,6 +76,9 @@ const (
 	// defaultCompletedUploadsSize is the fallback buffer size used for the
 	// CompletedUploads channel.
 	defaultCompletedUploadsSize = 64
+	// defaultAuthEventsSize is the fallback buffer size used for the
+	// AuthEvents channel.
+	defaultAuthEventsSize = 64
 	// ephemeralHostKeyBits is the size of the in-memory RSA host key generated
 	// when a server is started without an explicit signer.
 	ephemeralHostKeyBits = 3072
@@ -92,6 +96,17 @@ const (
 	CompletedUploadProtocolSFTP = "SFTP"
 	// CompletedUploadProtocolFTP identifies an upload completed through FTP.
 	CompletedUploadProtocolFTP = "FTP"
+)
+
+type AuthEventType string
+
+const (
+	// AuthEventLoginSuccess identifies a successful user login.
+	AuthEventLoginSuccess AuthEventType = "LoginSuccess"
+	// AuthEventLoginFailed identifies a rejected user login attempt.
+	AuthEventLoginFailed AuthEventType = "LoginFailed"
+	// AuthEventLogout identifies the end of an authenticated session.
+	AuthEventLogout AuthEventType = "Logout"
 )
 
 // errFTPLineTooLong is returned when an FTP client sends a control-channel
@@ -312,6 +327,21 @@ type CompletedUpload struct {
 	Protocol string
 }
 
+// AuthEvent describes an authentication or session-lifecycle event.
+// It is the payload delivered on the server's AuthEvents stream.
+type AuthEvent struct {
+	// Type is the authentication event kind.
+	Type AuthEventType
+	// Username is the username supplied by the client for this event.
+	Username string
+	// ClientIP is the remote IP address of the client, without the port. It is
+	// empty if the address could not be parsed.
+	ClientIP string
+	// Protocol is the file-transfer protocol used for the event.
+	// It is either CompletedUploadProtocolSFTP or CompletedUploadProtocolFTP.
+	Protocol string
+}
+
 // server is a self-contained SFTP server with optional FTP support.
 // It is unexported so external callers construct servers through NewServer.
 type server struct {
@@ -326,7 +356,7 @@ type server struct {
 	ftpPassivePortRange string
 	// users maps usernames to their credentials and jail roots.
 	users map[string]UserInfo
-	// mu protects users, completedUploads, and listeners for concurrent reads and writes.
+	// mu protects users, completedUploads, authEvents, and listeners for concurrent reads and writes.
 	mu sync.RWMutex
 	// ln is the active SFTP listener; set by ListenAndServe and closed by Close.
 	ln net.Listener
@@ -343,6 +373,9 @@ type server struct {
 	// completedUploads receives upload notifications. Use CompletedUploads to
 	// access it as a receive-only stream.
 	completedUploads chan CompletedUpload
+	// authEvents receives authentication/session notifications. Use AuthEvents
+	// to access it as a receive-only stream.
+	authEvents chan AuthEvent
 	// tempExtensionsConfig is an optional list of file extensions (each beginning
 	// with a leading dot, e.g. ".tmp", ".writing") that mark files as still
 	// being written and therefore not yet "complete".
@@ -395,6 +428,7 @@ type ironportConfig struct {
 	Users               map[string]UserInfo
 	Signer              ssh.Signer
 	CompletedUploadSize int
+	AuthEventSize       int
 	// SSHKeyExchanges, SSHCiphers, SSHMACs, and
 	// SSHPublicKeyAuthAlgorithms optionally pin SSH negotiation and public-key
 	// auth signature algorithms. Nil slices use golang.org/x/crypto/ssh
@@ -508,6 +542,7 @@ func DefaultIronportConfig() *ironportConfig {
 		FtpAddr:             "",
 		FtpPassivePortRange: "5000-5010",
 		CompletedUploadSize: defaultCompletedUploadsSize,
+		AuthEventSize:       defaultAuthEventsSize,
 	}
 }
 
@@ -515,12 +550,14 @@ func DefaultIronportConfig() *ironportConfig {
 // FTP. Leave FtpPassivePortRange empty to use OS-assigned passive data ports.
 //
 // CompletedUploadSize sets the buffer capacity of the CompletedUploads channel.
-// A non-positive value falls back to the package default (64):
+// AuthEventSize sets the buffer capacity of the AuthEvents channel. A
+// non-positive value falls back to the package default (64) for either stream:
 //
 //	cfg := ironport.DefaultIronportConfig()
 //	cfg.Users = users
 //	cfg.Signer = signer
 //	cfg.CompletedUploadSize = 256
+//	cfg.AuthEventSize = 256
 //	srv := ironport.NewServer(cfg)
 func NewServer(config *ironportConfig) *server {
 	if config == nil {
@@ -533,6 +570,7 @@ func NewServer(config *ironportConfig) *server {
 		users:                      cloneUsers(config.Users),
 		signer:                     config.Signer,
 		completedUploads:           newCompletedUploadsChannel(config.CompletedUploadSize),
+		authEvents:                 newAuthEventsChannel(config.AuthEventSize),
 		sshKeyExchanges:            slices.Clone(config.SSHKeyExchanges),
 		sshCiphers:                 slices.Clone(config.SSHCiphers),
 		sshMACs:                    slices.Clone(config.SSHMACs),
@@ -619,10 +657,23 @@ func newCompletedUploadsChannel(size int) chan CompletedUpload {
 	return make(chan CompletedUpload, size)
 }
 
+func newAuthEventsChannel(size int) chan AuthEvent {
+	if size <= 0 {
+		size = defaultAuthEventsSize
+	}
+	return make(chan AuthEvent, size)
+}
+
 func (s *server) completedUploadsChan() chan CompletedUpload {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.completedUploads
+}
+
+func (s *server) authEventsChan() chan AuthEvent {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.authEvents
 }
 
 // CompletedUploads returns a receive-only stream of successful upload
@@ -634,6 +685,29 @@ func (s *server) completedUploadsChan() chan CompletedUpload {
 // non-positive value falls back to the package default (64).
 func (s *server) CompletedUploads() <-chan CompletedUpload {
 	return s.completedUploadsChan()
+}
+
+// AuthEvents returns a receive-only stream of authentication/session
+// notifications. Each AuthEvent includes the protocol that produced it.
+// The channel is buffered; sends are non-blocking so a slow consumer never
+// stalls authentication or logout handling. Callers should drain the stream
+// continuously.
+//
+// The buffer capacity is set by ironportConfig.AuthEventSize. A non-positive
+// value falls back to the package default (64).
+func (s *server) AuthEvents() <-chan AuthEvent {
+	return s.authEventsChan()
+}
+
+func announceAuthEvent(events chan<- AuthEvent, evt AuthEvent) {
+	if events == nil {
+		return
+	}
+	select {
+	case events <- evt:
+	default:
+		log.Printf("auth event: AuthEvents queue full, notification type=%q protocol=%q user=%q dropped", evt.Type, evt.Protocol, evt.Username)
+	}
 }
 
 func parseFTPPassivePortRange(portRange string) (start, end int, err error) {
@@ -717,6 +791,7 @@ func (s *server) ListenAndServe() error {
 		return fmt.Errorf("ironport: %w", err)
 	}
 	uploads := s.completedUploadsChan()
+	authEvents := s.authEventsChan()
 	cfg := s.sshServerConfig()
 
 	sftpLn, err := net.Listen("tcp", s.addr)
@@ -748,12 +823,12 @@ func (s *server) ListenAndServe() error {
 	log.Printf("SFTP listening on %s", sftpLn.Addr())
 	workers := 1
 	errCh := make(chan error, 2)
-	go func() { errCh <- s.serveSFTP(sftpLn, cfg, uploads) }()
+	go func() { errCh <- s.serveSFTP(sftpLn, cfg, uploads, authEvents) }()
 
 	if ftpLn != nil {
 		workers++
 		log.Printf("FTP listening on %s", ftpLn.Addr())
-		go func() { errCh <- s.serveFTP(ftpLn, uploads) }()
+		go func() { errCh <- s.serveFTP(ftpLn, uploads, authEvents) }()
 	}
 
 	var ret error
@@ -766,7 +841,7 @@ func (s *server) ListenAndServe() error {
 	return ret
 }
 
-func (s *server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload) error {
+func (s *server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) error {
 	var backoff time.Duration
 	for {
 		nc, err := ln.Accept()
@@ -798,12 +873,12 @@ func (s *server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig, uploads chan<
 					_ = nc.Close()
 				}
 			}()
-			handleConn(nc, cfg, uploads, s.tempExtensions(), s.idleTimeout(), s.allowChown())
+			handleConn(nc, cfg, uploads, authEvents, s.tempExtensions(), s.idleTimeout(), s.allowChown())
 		}()
 	}
 }
 
-func (s *server) serveFTP(ln net.Listener, uploads chan<- CompletedUpload) error {
+func (s *server) serveFTP(ln net.Listener, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) error {
 	var backoff time.Duration
 	for {
 		nc, err := ln.Accept()
@@ -830,7 +905,7 @@ func (s *server) serveFTP(ln net.Listener, uploads chan<- CompletedUpload) error
 					_ = nc.Close()
 				}
 			}()
-			s.handleFTPConn(nc, s.tempExtensions(), uploads)
+			s.handleFTPConn(nc, s.tempExtensions(), uploads, authEvents)
 		}()
 	}
 }
@@ -1070,6 +1145,16 @@ func canonicalJailRoot(root string) (string, error) {
 // in the user's AuthorizedKeys slice (constant-time comparison of wire-format
 // bytes).
 func (s *server) sshServerConfig() *ssh.ServerConfig {
+	authEvents := s.authEventsChan()
+	announceFailure := func(c ssh.ConnMetadata) {
+		announceAuthEvent(authEvents, AuthEvent{
+			Type:     AuthEventLoginFailed,
+			Username: c.User(),
+			ClientIP: remoteIP(c.RemoteAddr()),
+			Protocol: CompletedUploadProtocolSFTP,
+		})
+	}
+
 	cfg := &ssh.ServerConfig{
 		Config: ssh.Config{
 			KeyExchanges: slices.Clone(s.sshKeyExchanges),
@@ -1101,10 +1186,12 @@ func (s *server) sshServerConfig() *ssh.ServerConfig {
 			// never a valid credential. This guards against accidentally
 			// permitting login when a UserInfo is added with Password: "".
 			if !ok || !match || len(pass) == 0 || len(storedPw) == 0 {
+				announceFailure(c)
 				return nil, fmt.Errorf("invalid credentials")
 			}
 			jailRoot, err := canonicalJailRoot(u.Root)
 			if err != nil {
+				announceFailure(c)
 				return nil, fmt.Errorf("invalid credentials")
 			}
 			return permissionsFor(u, c.User(), jailRoot), nil
@@ -1146,10 +1233,12 @@ func (s *server) sshServerConfig() *ssh.ServerConfig {
 				_ = subtle.ConstantTimeCompare(keyHash[:], zeroHash[:])
 			}
 			if !ok || !matched {
+				announceFailure(c)
 				return nil, fmt.Errorf("invalid credentials")
 			}
 			jailRoot, err := canonicalJailRoot(u.Root)
 			if err != nil {
+				announceFailure(c)
 				return nil, fmt.Errorf("invalid credentials")
 			}
 			return permissionsFor(u, c.User(), jailRoot), nil
@@ -1159,7 +1248,7 @@ func (s *server) sshServerConfig() *ssh.ServerConfig {
 	return cfg
 }
 
-func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload, tempExts []string, idleTimeout time.Duration, allowChown bool) {
+func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent, tempExts []string, idleTimeout time.Duration, allowChown bool) {
 	defer func() { _ = nc.Close() }()
 
 	// Wrap the raw connection so that every Read resets the read deadline.
@@ -1186,6 +1275,18 @@ func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUplo
 	canWrite := sshConn.Permissions.Extensions["canWrite"] == "true"
 	clientIP := remoteIP(sshConn.RemoteAddr())
 	log.Printf("login protocol=sftp user=%s root=%s from=%s", user, jailRoot, sshConn.RemoteAddr())
+	announceAuthEvent(authEvents, AuthEvent{
+		Type:     AuthEventLoginSuccess,
+		Username: user,
+		ClientIP: clientIP,
+		Protocol: CompletedUploadProtocolSFTP,
+	})
+	defer announceAuthEvent(authEvents, AuthEvent{
+		Type:     AuthEventLogout,
+		Username: user,
+		ClientIP: clientIP,
+		Protocol: CompletedUploadProtocolSFTP,
+	})
 
 	// Discard global requests
 	go ssh.DiscardRequests(reqs)
@@ -1696,27 +1797,30 @@ type ftpSession struct {
 	clientIP      string
 	tempExts      []string
 	uploads       chan<- CompletedUpload
+	authEvents    chan<- AuthEvent
 	// fs is the fd-relative filesystem backing this session's jail. It is
 	// constructed by authenticate on successful login and released when the
 	// session ends (closeJail). Until login succeeds it is nil.
 	fs *jailFS
 }
 
-func (s *server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- CompletedUpload) {
+func (s *server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) {
 	defer func() { _ = nc.Close() }()
 
 	sess := &ftpSession{
-		server:   s,
-		conn:     nc,
-		r:        bufio.NewReader(nc),
-		w:        bufio.NewWriter(nc),
-		cwd:      "/",
-		clientIP: remoteIP(nc.RemoteAddr()),
-		tempExts: tempExts,
-		uploads:  uploads,
+		server:     s,
+		conn:       nc,
+		r:          bufio.NewReader(nc),
+		w:          bufio.NewWriter(nc),
+		cwd:        "/",
+		clientIP:   remoteIP(nc.RemoteAddr()),
+		tempExts:   tempExts,
+		uploads:    uploads,
+		authEvents: authEvents,
 	}
 	defer sess.closeDataListener()
 	defer sess.closeJail()
+	defer sess.logoutIfAuthenticated()
 
 	if err := sess.reply(220, "ready"); err != nil {
 		return
@@ -1808,6 +1912,7 @@ func parseFTPCommand(line string) (string, string) {
 func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
 	switch cmd {
 	case "USER":
+		f.logoutIfAuthenticated()
 		f.username = arg
 		f.authenticated = false
 		f.user = UserInfo{}
@@ -1820,10 +1925,12 @@ func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
 			return false
 		}
 		if !f.authenticate(arg) {
+			f.announceAuthEvent(AuthEventLoginFailed)
 			_ = f.reply(530, "invalid credentials")
 			return false
 		}
 		log.Printf("login protocol=ftp user=%s root=%s from=%s", f.username, f.user.Root, f.conn.RemoteAddr())
+		f.announceAuthEvent(AuthEventLoginSuccess)
 		_ = f.reply(230, "login successful")
 		return false
 
@@ -2008,6 +2115,27 @@ func (f *ftpSession) authenticate(pass string) bool {
 	f.rnfrPath = ""
 	f.restartOffset = 0
 	return true
+}
+
+func (f *ftpSession) announceAuthEvent(eventType AuthEventType) {
+	announceAuthEvent(f.authEvents, AuthEvent{
+		Type:     eventType,
+		Username: f.username,
+		ClientIP: f.clientIP,
+		Protocol: CompletedUploadProtocolFTP,
+	})
+}
+
+func (f *ftpSession) logoutIfAuthenticated() {
+	if !f.authenticated {
+		return
+	}
+	f.announceAuthEvent(AuthEventLogout)
+	f.authenticated = false
+	f.user = UserInfo{}
+	f.rnfrPath = ""
+	f.restartOffset = 0
+	f.closeJail()
 }
 
 // closeJail releases the session's jail filesystem fd, if any. It is safe to

@@ -46,6 +46,7 @@ func main() {
 	config.Users = users
 	config.Signer = signer
 	config.CompletedUploadSize = 64
+	config.AuthEventSize = 64
 	config.SSHKeyExchanges = splitCSV(*sshKex)
 	config.SSHCiphers = splitCSV(*sshCiphers)
 	config.SSHMACs = splitCSV(*sshMACs)
@@ -60,6 +61,13 @@ func main() {
 		for ev := range srv.CompletedUploads() {
 			log.Printf("completed upload: protocol=%q user=%q ip=%q path=%q full=%q",
 				ev.Protocol, ev.Username, ev.ClientIP, ev.FilePath, ev.FullFilePath)
+		}
+	}()
+
+	go func() {
+		for ev := range srv.AuthEvents() {
+			log.Printf("auth event: type=%q protocol=%q user=%q ip=%q",
+				ev.Type, ev.Protocol, ev.Username, ev.ClientIP)
 		}
 	}()
 
