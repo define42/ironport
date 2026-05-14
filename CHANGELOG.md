@@ -15,6 +15,9 @@ changes are tracked under `Unreleased`.
 - Added a main-branch release workflow that bumps the next SemVer tag and
   creates a GitHub Release.
 - Moved SSH algorithm pinning onto `ironportConfig` fields.
+- Moved temp-extension handling and idle timeout configuration onto
+  `ironportConfig`.
+- Moved chown opt-in configuration onto `ironportConfig`.
 
 ## Releases
 

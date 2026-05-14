@@ -55,7 +55,7 @@ import (
 // Default timeouts and limits applied unless callers override them.
 const (
 	// defaultSFTPIdleTimeout is the default per-connection inactivity timeout
-	// applied to SFTP sessions when server.IdleTimeout is zero. A client that
+	// applied to SFTP sessions when ironportConfig.IdleTimeout is zero. A client that
 	// sends no data for this duration has its connection closed.
 	defaultSFTPIdleTimeout = 15 * time.Minute
 	// sshHandshakeTimeout bounds the time the raw TCP connection has to
@@ -325,7 +325,7 @@ type server struct {
 	// completedUploads receives upload notifications. Use CompletedUploads to
 	// access it as a receive-only stream.
 	completedUploads chan CompletedUpload
-	// TempExtensions is an optional list of file extensions (each beginning
+	// tempExtensionsConfig is an optional list of file extensions (each beginning
 	// with a leading dot, e.g. ".tmp", ".writing") that mark files as still
 	// being written and therefore not yet "complete".
 	//
@@ -337,24 +337,20 @@ type server struct {
 	//     path is announced on CompletedUploads, signalling that the upload
 	//     is finally complete.
 	//
-	// Matching is case-insensitive. Setting this field after the server has
-	// started has effect only on connections accepted afterwards.
-	TempExtensions []string
-	// IdleTimeout bounds how long an authenticated SFTP connection may sit
+	// Matching is case-insensitive.
+	tempExtensionsConfig []string
+	// idleTimeoutConfig bounds how long an authenticated SFTP connection may sit
 	// without receiving any data before being closed. A zero value selects
 	// the package default (15 minutes); a negative value disables the idle
-	// timeout entirely. Setting this field after the server has started has
-	// effect only on connections accepted afterwards.
-	IdleTimeout time.Duration
-	// AllowChown controls whether SFTP clients may change the ownership
+	// timeout entirely.
+	idleTimeoutConfig time.Duration
+	// allowChownConfig controls whether SFTP clients may change the ownership
 	// (uid/gid) of files in their jail via Setstat/Fsetstat requests.
 	// It defaults to false: chown requests are rejected with a permission
 	// error. Enable it only when the server runs with sufficient privilege
 	// (typically as root with CAP_CHOWN) AND the deployment trusts
 	// authenticated users not to chown their files to other UIDs.
-	// Setting this field after the server has started has effect only on
-	// connections accepted afterwards.
-	AllowChown bool
+	allowChownConfig bool
 	// connWG tracks in-flight per-connection handler goroutines so that
 	// Shutdown can wait for them to finish. Each accepted connection adds
 	// one before its goroutine starts and decrements on goroutine exit.
@@ -389,6 +385,16 @@ type ironportConfig struct {
 	SSHCiphers                 []string
 	SSHMACs                    []string
 	SSHPublicKeyAuthAlgorithms []string
+	// TempExtensions marks file extensions that should defer completion
+	// notifications until a later rename to a non-temp name. Matching is
+	// case-insensitive.
+	TempExtensions []string
+	// IdleTimeout bounds authenticated SFTP connection inactivity. Zero selects
+	// the package default; negative disables the idle timeout.
+	IdleTimeout time.Duration
+	// AllowChown controls whether SFTP clients may change file ownership inside
+	// their jail. It defaults to false.
+	AllowChown bool
 }
 
 // AddUser adds or replaces a user entry in the server's user map.
@@ -513,6 +519,9 @@ func NewServer(config *ironportConfig) *server {
 		sshCiphers:                 cloneStringSlice(config.SSHCiphers),
 		sshMACs:                    cloneStringSlice(config.SSHMACs),
 		sshPublicKeyAuthAlgorithms: cloneStringSlice(config.SSHPublicKeyAuthAlgorithms),
+		tempExtensionsConfig:       cloneStringSlice(config.TempExtensions),
+		idleTimeoutConfig:          config.IdleTimeout,
+		allowChownConfig:           config.AllowChown,
 		activeConns:                make(map[net.Conn]struct{}),
 	}
 	return s
@@ -821,13 +830,14 @@ func nextAcceptBackoff(prev time.Duration) time.Duration {
 	return next
 }
 
-// tempExtensions returns a normalised copy of s.TempExtensions: each entry is
+// tempExtensions returns a normalised copy of the configured temp extensions:
+// each entry is
 // lower-cased and guaranteed to start with a single leading dot. Empty entries
 // are dropped. The result is safe to use without holding s.mu because it is
 // a freshly allocated slice.
 func (s *server) tempExtensions() []string {
 	s.mu.RLock()
-	src := s.TempExtensions
+	src := s.tempExtensionsConfig
 	s.mu.RUnlock()
 	if len(src) == 0 {
 		return nil
@@ -847,11 +857,11 @@ func (s *server) tempExtensions() []string {
 }
 
 // idleTimeout returns the effective idle timeout for SFTP connections.
-// A zero IdleTimeout selects the package default; a negative IdleTimeout
+// A zero configured timeout selects the package default; a negative timeout
 // disables the deadline.
 func (s *server) idleTimeout() time.Duration {
 	s.mu.RLock()
-	d := s.IdleTimeout
+	d := s.idleTimeoutConfig
 	s.mu.RUnlock()
 	switch {
 	case d == 0:
@@ -862,11 +872,11 @@ func (s *server) idleTimeout() time.Duration {
 	return d
 }
 
-// allowChown returns the current value of AllowChown under the server lock.
+// allowChown returns the configured chown permission under the server lock.
 func (s *server) allowChown() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.AllowChown
+	return s.allowChownConfig
 }
 
 // cleanSFTPClientPath normalises a raw SFTP client path into an absolute,
@@ -1717,8 +1727,8 @@ func (s *server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- Co
 	}
 
 	// Capture the configured idle timeout once at session start. Mutating
-	// server.IdleTimeout afterwards only affects sessions accepted later,
-	// matching the SFTP per-session semantics. A zero value disables the
+	// The timeout is captured when the session starts, matching the SFTP
+	// per-session semantics. A zero value disables the
 	// deadline.
 	idleTimeout := s.idleTimeout()
 	for {

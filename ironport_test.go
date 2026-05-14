@@ -221,19 +221,13 @@ func newTestServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]U
 
 // startTestServer launches a server on a random OS-assigned port and returns
 // the address and a cancel function that closes the listener.
-//
-// Each optional configure callback runs against the freshly constructed
-// *server BEFORE the accept goroutine starts, so tests can safely mutate
-// fields like AllowChown or TempExtensions without racing the accept loop.
-// Mutating those fields on the returned *server after this function returns
-// is unsafe under the race detector.
-func startTestServer(t *testing.T, users map[string]UserInfo, configure ...func(*server)) (srv *server, addr string, stop func()) {
+func startTestServer(t *testing.T, users map[string]UserInfo) (srv *server, addr string, stop func()) {
 	t.Helper()
 	config := newTestConfig("", "", "", users, testSigner(t), defaultCompletedUploadsSize)
-	return startTestServerWithConfig(t, config, configure...)
+	return startTestServerWithConfig(t, config)
 }
 
-func startTestServerWithConfig(t *testing.T, config *ironportConfig, configure ...func(*server)) (srv *server, addr string, stop func()) {
+func startTestServerWithConfig(t *testing.T, config *ironportConfig) (srv *server, addr string, stop func()) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -247,11 +241,6 @@ func startTestServerWithConfig(t *testing.T, config *ironportConfig, configure .
 	serverConfig := *config
 	serverConfig.Addr = addr
 	srv = NewServer(&serverConfig)
-	for _, fn := range configure {
-		if fn != nil {
-			fn(srv)
-		}
-	}
 	cfg := srv.sshServerConfig()
 
 	go func() {
@@ -581,6 +570,15 @@ func TestDefaultIronportConfig(t *testing.T) {
 	if config.SSHPublicKeyAuthAlgorithms != nil {
 		t.Error("SSHPublicKeyAuthAlgorithms is non-nil; want nil")
 	}
+	if config.TempExtensions != nil {
+		t.Error("TempExtensions is non-nil; want nil")
+	}
+	if config.IdleTimeout != 0 {
+		t.Errorf("IdleTimeout = %v; want 0", config.IdleTimeout)
+	}
+	if config.AllowChown {
+		t.Error("AllowChown is true; want false")
+	}
 
 	other := DefaultIronportConfig()
 	if config == other {
@@ -601,8 +599,10 @@ func TestSSHServerConfig_AppliesAlgorithmPins(t *testing.T) {
 	config.SSHCiphers = []string{ssh.CipherAES256CTR}
 	config.SSHMACs = []string{ssh.HMACSHA256}
 	config.SSHPublicKeyAuthAlgorithms = []string{ssh.KeyAlgoRSASHA256}
+	config.TempExtensions = []string{".tmp"}
 	srv := NewServer(config)
 	config.SSHCiphers[0] = ssh.CipherAES128CTR
+	config.TempExtensions[0] = ".writing"
 
 	cfg := srv.sshServerConfig()
 	if !reflect.DeepEqual(cfg.KeyExchanges, []string{ssh.KeyExchangeCurve25519}) {
@@ -621,6 +621,9 @@ func TestSSHServerConfig_AppliesAlgorithmPins(t *testing.T) {
 	srv.sshCiphers[0] = ssh.CipherAES128CTR
 	if got := cfg.Ciphers[0]; got != ssh.CipherAES256CTR {
 		t.Fatalf("sshServerConfig aliased server SSHCiphers; Ciphers[0] = %q", got)
+	}
+	if got := srv.tempExtensions()[0]; got != ".tmp" {
+		t.Fatalf("NewServer aliased config TempExtensions; tempExtensions()[0] = %q", got)
 	}
 }
 
@@ -2326,7 +2329,9 @@ func TestSFTPServer_Chown(t *testing.T) {
 	users := map[string]UserInfo{
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
-	_, addr, stop := startTestServer(t, users, func(s *server) { s.AllowChown = true })
+	config := newTestConfig("", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+	config.AllowChown = true
+	_, addr, stop := startTestServerWithConfig(t, config)
 	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
@@ -2367,7 +2372,9 @@ func TestSFTPServer_Chgrp(t *testing.T) {
 	users := map[string]UserInfo{
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
-	_, addr, stop := startTestServer(t, users, func(s *server) { s.AllowChown = true })
+	config := newTestConfig("", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+	config.AllowChown = true
+	_, addr, stop := startTestServerWithConfig(t, config)
 	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
@@ -3105,7 +3112,7 @@ func TestCleanSFTPClientPath(t *testing.T) {
 // TestServer_TempExtensionsNormalisation verifies that TempExtensions are
 // normalised (lower-cased, dot-prefixed, empty entries stripped) before use.
 func TestServer_TempExtensionsNormalisation(t *testing.T) {
-	srv := &server{TempExtensions: []string{"TMP", ".Writing", "  ", ".part"}}
+	srv := &server{tempExtensionsConfig: []string{"TMP", ".Writing", "  ", ".part"}}
 	got := srv.tempExtensions()
 	want := []string{".tmp", ".writing", ".part"}
 	if len(got) != len(want) {
@@ -3126,9 +3133,9 @@ func TestSFTPServer_TempExtensions_SuppressesUploadAndAnnouncesOnRename(t *testi
 	users := map[string]UserInfo{
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
-	srv, addr, stop := startTestServer(t, users, func(s *server) {
-		s.TempExtensions = []string{".tmp", ".writing"}
-	})
+	config := newTestConfig("", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+	config.TempExtensions = []string{".tmp", ".writing"}
+	srv, addr, stop := startTestServerWithConfig(t, config)
 	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
@@ -3187,9 +3194,9 @@ func TestSFTPServer_TempExtensions_RenameBetweenTempNamesDoesNotAnnounce(t *test
 	users := map[string]UserInfo{
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
-	srv, addr, stop := startTestServer(t, users, func(s *server) {
-		s.TempExtensions = []string{".tmp", ".writing"}
-	})
+	config := newTestConfig("", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+	config.TempExtensions = []string{".tmp", ".writing"}
+	srv, addr, stop := startTestServerWithConfig(t, config)
 	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
@@ -3220,9 +3227,9 @@ func TestSFTPServer_TempExtensions_PlainUploadStillAnnounced(t *testing.T) {
 	users := map[string]UserInfo{
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
-	srv, addr, stop := startTestServer(t, users, func(s *server) {
-		s.TempExtensions = []string{".tmp", ".writing"}
-	})
+	config := newTestConfig("", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+	config.TempExtensions = []string{".tmp", ".writing"}
+	srv, addr, stop := startTestServerWithConfig(t, config)
 	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
@@ -3500,11 +3507,11 @@ func TestServer_IdleTimeout(t *testing.T) {
 	if got := s.idleTimeout(); got != defaultSFTPIdleTimeout {
 		t.Errorf("default idleTimeout = %v; want %v", got, defaultSFTPIdleTimeout)
 	}
-	s.IdleTimeout = 7 * time.Second
+	s.idleTimeoutConfig = 7 * time.Second
 	if got := s.idleTimeout(); got != 7*time.Second {
 		t.Errorf("custom idleTimeout = %v; want 7s", got)
 	}
-	s.IdleTimeout = -1
+	s.idleTimeoutConfig = -1
 	if got := s.idleTimeout(); got != 0 {
 		t.Errorf("negative idleTimeout = %v; want 0", got)
 	}
@@ -3740,7 +3747,7 @@ func TestNextAcceptBackoff(t *testing.T) {
 }
 
 // TestSFTPServer_Chown_DefaultDenied verifies that a chown request is
-// rejected with a permission error when server.AllowChown is left at its
+// rejected with a permission error when config.AllowChown is left at its
 // default (false). This is the opt-in flag that hardens deployments where
 // the server runs with enough privilege (e.g. as root) to actually change
 // ownership: clients must not be able to chown jailed files unless the
@@ -3752,7 +3759,7 @@ func TestSFTPServer_Chown_DefaultDenied(t *testing.T) {
 	}
 	srv, addr, stop := startTestServer(t, users)
 	t.Cleanup(stop)
-	if srv.AllowChown {
+	if srv.allowChown() {
 		t.Fatalf("AllowChown should default to false")
 	}
 
@@ -3776,7 +3783,7 @@ func TestSFTPServer_Chown_DefaultDenied(t *testing.T) {
 		t.Skip("cannot read uid/gid on this platform")
 	}
 	// Chown to the current uid/gid: this would succeed on disk (same owner),
-	// so the only thing that can fail this call is the server's AllowChown
+	// so the only thing that can fail this call is the configured AllowChown
 	// gate. If the gate is wired up correctly we get a permission error
 	// regardless of the underlying filesystem semantics.
 	err = client.Chown("/chown_denied.txt", int(stat.Uid), int(stat.Gid))

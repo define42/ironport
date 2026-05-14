@@ -9,14 +9,14 @@ A production-ready, embeddable SFTP server and FTP server library for Go with a 
 - **Fine-grained permissions** — independent `CanRead` / `CanWrite` flags per user
 - **Dynamic user management** — add, remove, and update users and their authorized keys at runtime without restarting the server
 - **Upload notifications** — a buffered `CompletedUploads()` stream delivers a `CompletedUpload` struct (username, full on-disk path, jail-relative path, and client IP) for every successfully closed upload
-- **Temp-file aware completion** — optionally set `TempExtensions` on the server returned by `NewServer` (for example, `.tmp`, `.writing`) to suppress completion notifications for temporary upload names and emit the notification when the file is renamed to a non-temp name
+- **Temp-file aware completion** — optionally set `TempExtensions` on the config (for example, `.tmp`, `.writing`) to suppress completion notifications for temporary upload names and emit the notification when the file is renamed to a non-temp name
 - **Graceful shutdown** — `Close()` stops the listener immediately and lets in-flight sessions finish on their own. `Shutdown(ctx)` stops the listener AND waits for in-flight sessions to finish, force-closing any that remain when `ctx` expires
 - **Thread-safe runtime APIs** — user-management helpers and listener lifecycle methods are safe to call while the server is running
 - **Handshake timeout** — connections that do not complete the SSH handshake within 30 seconds are dropped
 - **SSH algorithm pinning** — optionally constrain SSH key exchange, ciphers, MACs, and public-key auth signature algorithms
-- **Idle-session timeout** — configurable via `IdleTimeout` on the server returned by `NewServer` (default 15 minutes); inactive authenticated SFTP sessions are reaped
+- **Idle-session timeout** — configurable via `IdleTimeout` on the config (default 15 minutes); inactive authenticated SFTP sessions are reaped
 - **Empty-password protection** — users whose stored `Password` is empty cannot authenticate via password, and empty supplied passwords are always rejected
-- **Chown opt-in** — `Setstat`/`Fsetstat` requests that try to change file ownership (uid/gid) are rejected with a permission error unless `AllowChown` is explicitly set to `true` on the server returned by `NewServer`. Symlink creation by clients is always refused, and `Setstat`/`Fsetstat` requests that try to change access/modification times (`Chtimes`) are likewise rejected.
+- **Chown opt-in** — `Setstat`/`Fsetstat` requests that try to change file ownership (uid/gid) are rejected with a permission error unless `AllowChown` is explicitly set to `true` on the config. Symlink creation by clients is always refused, and `Setstat`/`Fsetstat` requests that try to change access/modification times (`Chtimes`) are likewise rejected.
 
 ## Platform support
 
@@ -104,8 +104,8 @@ rename boundary:
 config := ironport.DefaultIronportConfig()
 config.Users = users
 config.Signer = signer
+config.TempExtensions = []string{".tmp", ".writing"}
 srv := ironport.NewServer(config)
-srv.TempExtensions = []string{".tmp", ".writing"}
 ```
 
 With this setting:

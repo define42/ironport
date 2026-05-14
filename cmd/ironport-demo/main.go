@@ -50,12 +50,11 @@ func main() {
 	config.SSHCiphers = splitCSV(*sshCiphers)
 	config.SSHMACs = splitCSV(*sshMACs)
 	config.SSHPublicKeyAuthAlgorithms = splitCSV(*sshPublicKeyAuthAlgorithms)
-	srv := ironport.NewServer(config)
-
 	// Files written with one of these extensions are considered "still being
 	// written" and won't be announced on CompletedUploads until the client
 	// renames them to a final (non-temp) name.
-	srv.TempExtensions = []string{".tmp", ".writing"}
+	config.TempExtensions = []string{".tmp", ".writing"}
+	srv := ironport.NewServer(config)
 
 	go func() {
 		for ev := range srv.CompletedUploads() {
