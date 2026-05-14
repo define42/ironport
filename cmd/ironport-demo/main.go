@@ -44,7 +44,7 @@ func main() {
 	config.FtpAddr = *ftpAddr
 	config.FtpPassivePortRange = *ftpPassive
 	config.Users = users
-	config.Signer = signer
+	config.SftpSigner = signer
 	config.CompletedUploadSize = 64
 	config.AuthEventSize = 64
 	config.SSHKeyExchanges = splitCSV(*sshKex)

@@ -66,7 +66,7 @@ func main() {
     config.SftpAddr = ":2022"
     config.Users = users
     if signer != nil {
-        config.Signer = signer
+        config.SftpSigner = signer
     }
     srv := ironport.NewServer(config)
 
@@ -97,7 +97,7 @@ Set `CompletedUploadSize` on the server config:
 ```go
 config := ironport.DefaultConfig()
 config.Users = users
-config.Signer = signer
+config.SftpSigner = signer
 config.CompletedUploadSize = 256
 srv := ironport.NewServer(config)
 ```
@@ -114,7 +114,7 @@ Set `AuthEventSize` on the server config:
 ```go
 config := ironport.DefaultConfig()
 config.Users = users
-config.Signer = signer
+config.SftpSigner = signer
 config.AuthEventSize = 256
 srv := ironport.NewServer(config)
 ```
@@ -133,7 +133,7 @@ rename boundary:
 ```go
 config := ironport.DefaultConfig()
 config.Users = users
-config.Signer = signer
+config.SftpSigner = signer
 config.TempExtensions = []string{".tmp", ".writing"}
 srv := ironport.NewServer(config)
 ```
@@ -153,7 +153,7 @@ supplied:
 ```go
 config := ironport.DefaultConfig()
 config.Users = users
-config.Signer = signer
+config.SftpSigner = signer
 config.SSHKeyExchanges = []string{ssh.KeyExchangeCurve25519}
 config.SSHCiphers = []string{ssh.CipherAES256CTR}
 config.SSHMACs = []string{ssh.HMACSHA256}
@@ -178,7 +178,7 @@ control all clients and intermediate hops:
 ```go
 config := ironport.DefaultConfig()
 config.Users = users
-config.Signer = signer
+config.SftpSigner = signer
 config.FtpAddr = ":2121"
 config.FtpPassivePortRange = "5000-5010"
 config.FtpDataAcceptTimeout = 30 * time.Second // zero selects this default
@@ -256,7 +256,7 @@ Use `NewSignerFromFile` to load a PEM-encoded RSA, ECDSA, or Ed25519 private key
 signer, err := ironport.NewSignerFromFile("/etc/ssh/sftp_host_key")
 ```
 
-If `config.Signer` is nil, `ListenAndServe` generates an ephemeral in-memory
+If `config.SftpSigner` is nil, `ListenAndServe` generates an ephemeral in-memory
 RSA-3072 host key and stores it on the server. This is convenient for demos, but
 not suitable for production because clients will see a different host key after
 each process restart.

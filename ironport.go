@@ -20,7 +20,7 @@
 //	cfg.SftpAddr = ":2022"
 //	cfg.FtpAddr = ":2121"
 //	cfg.Users = users
-//	cfg.Signer = signer
+//	cfg.SftpSigner = signer
 //	srv := ironport.NewServer(cfg)
 //	log.Fatal(srv.ListenAndServe())
 package ironport
@@ -393,8 +393,8 @@ type Server struct {
 	// active listeners. Close clears it after closing the current listeners,
 	// allowing a new ListenAndServe call while older in-flight sessions drain.
 	serving bool
-	// signer is the host key used for the SSH handshake.
-	signer ssh.Signer
+	// sftpSigner is the host key used for the SSH handshake.
+	sftpSigner ssh.Signer
 	// SSH algorithm allow-lists. Nil slices use golang.org/x/crypto/ssh
 	// defaults.
 	sshKeyExchanges            []string
@@ -468,7 +468,7 @@ type Config struct {
 	// default (30 seconds); negative disables the deadline.
 	FtpDataAcceptTimeout time.Duration
 	Users                map[string]UserInfo
-	Signer               ssh.Signer
+	SftpSigner           ssh.Signer
 	CompletedUploadSize  int
 	AuthEventSize        int
 	// SSHKeyExchanges, SSHCiphers, SSHMACs, and
@@ -583,8 +583,8 @@ func (s *Server) RemoveUserKey(username string, key ssh.PublicKey) {
 
 // DefaultConfig returns a fresh server configuration with package
 // defaults applied. Callers should set Users before starting the server. Set
-// Signer to use a stable host key; when Signer is nil, ListenAndServe generates
-// an ephemeral in-memory host key.
+// SftpSigner to use a stable host key; when SftpSigner is nil, ListenAndServe
+// generates an ephemeral in-memory host key.
 func DefaultConfig() *Config {
 	return &Config{
 		SftpAddr:            ":2022",
@@ -604,7 +604,7 @@ func DefaultConfig() *Config {
 //
 //	cfg := ironport.DefaultConfig()
 //	cfg.Users = users
-//	cfg.Signer = signer
+//	cfg.SftpSigner = signer
 //	cfg.CompletedUploadSize = 256
 //	cfg.AuthEventSize = 256
 //	srv := ironport.NewServer(cfg)
@@ -618,7 +618,7 @@ func NewServer(config *Config) *Server {
 		ftpPassivePortRange:        config.FtpPassivePortRange,
 		ftpDataAcceptTimeout:       config.FtpDataAcceptTimeout,
 		users:                      cloneUsers(config.Users),
-		signer:                     config.Signer,
+		sftpSigner:                 config.SftpSigner,
 		completedUploads:           newCompletedUploadsChannel(config.CompletedUploadSize),
 		authEvents:                 newAuthEventsChannel(config.AuthEventSize),
 		sshKeyExchanges:            slices.Clone(config.SSHKeyExchanges),
@@ -645,14 +645,14 @@ func generateEphemeralSigner() (ssh.Signer, error) {
 func (s *Server) ensureSigner() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.signer != nil {
+	if s.sftpSigner != nil {
 		return nil
 	}
 	signer, err := generateEphemeralSigner()
 	if err != nil {
 		return fmt.Errorf("generate ephemeral host key: %w", err)
 	}
-	s.signer = signer
+	s.sftpSigner = signer
 	return nil
 }
 
@@ -1445,7 +1445,7 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 			return permissionsFor(u, c.User(), jailRoot), nil
 		},
 	}
-	cfg.AddHostKey(s.signer)
+	cfg.AddHostKey(s.sftpSigner)
 	return cfg
 }
 

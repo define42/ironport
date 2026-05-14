@@ -212,7 +212,7 @@ func newTestConfig(addr, ftpAddr, ftpPassivePortRange string, users map[string]U
 	config.FtpAddr = ftpAddr
 	config.FtpPassivePortRange = ftpPassivePortRange
 	config.Users = users
-	config.Signer = signer
+	config.SftpSigner = signer
 	config.CompletedUploadSize = completedUploadsSize
 	return config
 }
@@ -628,7 +628,7 @@ func TestNewServer(t *testing.T) {
 	config.FtpPassivePortRange = "5000-5010"
 	config.FtpDataAcceptTimeout = 17 * time.Second
 	config.Users = users
-	config.Signer = signer
+	config.SftpSigner = signer
 	config.CompletedUploadSize = defaultCompletedUploadsSize
 	config.AuthEventSize = defaultAuthEventsSize
 	srv := NewServer(config)
@@ -651,8 +651,8 @@ func TestNewServer(t *testing.T) {
 	if got := srv.users["alice"].Password; got != "pw" {
 		t.Errorf("users map was not cloned; password = %q; want pw", got)
 	}
-	if srv.signer != signer {
-		t.Error("signer not set correctly")
+	if srv.sftpSigner != signer {
+		t.Error("sftpSigner not set correctly")
 	}
 	if cap(srv.AuthEvents()) != defaultAuthEventsSize {
 		t.Errorf("AuthEvents cap = %d; want %d", cap(srv.AuthEvents()), defaultAuthEventsSize)
@@ -682,8 +682,8 @@ func TestDefaultConfig(t *testing.T) {
 	if config.Users != nil {
 		t.Error("Users is non-nil; want nil")
 	}
-	if config.Signer != nil {
-		t.Error("Signer is non-nil; want nil")
+	if config.SftpSigner != nil {
+		t.Error("SftpSigner is non-nil; want nil")
 	}
 	if config.SSHKeyExchanges != nil {
 		t.Error("SSHKeyExchanges is non-nil; want nil")
@@ -839,7 +839,7 @@ func TestCompletedUploadsBufferSize(t *testing.T) {
 	config.SftpAddr = ":0"
 	config.FtpPassivePortRange = ""
 	config.Users = users
-	config.Signer = signer
+	config.SftpSigner = signer
 	config.CompletedUploadSize = 0
 	srv := NewServer(config)
 	if cap(srv.CompletedUploads()) != defaultCompletedUploadsSize {
@@ -851,7 +851,7 @@ func TestCompletedUploadsBufferSize(t *testing.T) {
 	config2.SftpAddr = ":0"
 	config2.FtpPassivePortRange = ""
 	config2.Users = users
-	config2.Signer = signer
+	config2.SftpSigner = signer
 	config2.CompletedUploadSize = 256
 	srv2 := NewServer(config2)
 	if cap(srv2.CompletedUploads()) != 256 {
@@ -876,7 +876,7 @@ func TestAuthEventsBufferSize(t *testing.T) {
 	config.SftpAddr = ":0"
 	config.FtpPassivePortRange = ""
 	config.Users = users
-	config.Signer = signer
+	config.SftpSigner = signer
 	config.AuthEventSize = 0
 	srv := NewServer(config)
 	if cap(srv.AuthEvents()) != defaultAuthEventsSize {
@@ -888,7 +888,7 @@ func TestAuthEventsBufferSize(t *testing.T) {
 	config2.SftpAddr = ":0"
 	config2.FtpPassivePortRange = ""
 	config2.Users = users
-	config2.Signer = signer
+	config2.SftpSigner = signer
 	config2.AuthEventSize = 256
 	srv2 := NewServer(config2)
 	if cap(srv2.AuthEvents()) != 256 {
@@ -3929,7 +3929,7 @@ func TestServer_ListenAndServe_AfterShutdown(t *testing.T) {
 // error immediately when SftpAddr is empty or blank without opening any listener.
 func TestServer_ListenAndServe_EmptySftpAddr(t *testing.T) {
 	for _, addr := range []string{"", "   ", "\t"} {
-		srv := &Server{addr: addr, signer: testSigner(t)}
+		srv := &Server{addr: addr, sftpSigner: testSigner(t)}
 		err := srv.ListenAndServe()
 		if err == nil {
 			t.Errorf("addr=%q: expected error, got nil", addr)
@@ -3943,14 +3943,14 @@ func TestServer_ListenAndServe_EmptySftpAddr(t *testing.T) {
 }
 
 // TestServer_ListenAndServe_NilSignerGeneratesHostKey verifies that
-// ListenAndServe generates an ephemeral host key when signer is nil.
+// ListenAndServe generates an ephemeral host key when sftpSigner is nil.
 func TestServer_ListenAndServe_NilSignerGeneratesHostKey(t *testing.T) {
 	config := DefaultConfig()
 	config.SftpAddr = "127.0.0.1:0"
 	config.FtpPassivePortRange = ""
 	srv := NewServer(config)
-	if srv.signer != nil {
-		t.Fatal("expected nil signer before ListenAndServe")
+	if srv.sftpSigner != nil {
+		t.Fatal("expected nil sftpSigner before ListenAndServe")
 	}
 
 	errCh := make(chan error, 1)
@@ -3959,8 +3959,8 @@ func TestServer_ListenAndServe_NilSignerGeneratesHostKey(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if a := srv.ListeningAddr(); a != nil {
-			if srv.signer == nil {
-				t.Fatal("signer was not generated")
+			if srv.sftpSigner == nil {
+				t.Fatal("sftpSigner was not generated")
 			}
 			if err := srv.Close(); err != nil {
 				t.Fatalf("Close: %v", err)
