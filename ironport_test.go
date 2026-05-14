@@ -217,19 +217,19 @@ func newTestConfig(addr, ftpAddr, ftpPassivePortRange string, users map[string]U
 	return config
 }
 
-func newTestServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserInfo, signer ssh.Signer, completedUploadsSize int) *server {
+func newTestServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserInfo, signer ssh.Signer, completedUploadsSize int) *Server {
 	return NewServer(newTestConfig(addr, ftpAddr, ftpPassivePortRange, users, signer, completedUploadsSize))
 }
 
 // startTestServer launches a server on a random OS-assigned port and returns
 // the address and a cancel function that closes the listener.
-func startTestServer(t *testing.T, users map[string]UserInfo) (srv *server, addr string, stop func()) {
+func startTestServer(t *testing.T, users map[string]UserInfo) (srv *Server, addr string, stop func()) {
 	t.Helper()
 	config := newTestConfig("", "", "", users, testSigner(t), defaultCompletedUploadsSize)
 	return startTestServerWithConfig(t, config)
 }
 
-func startTestServerWithConfig(t *testing.T, config *Config) (srv *server, addr string, stop func()) {
+func startTestServerWithConfig(t *testing.T, config *Config) (srv *Server, addr string, stop func()) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -283,7 +283,7 @@ func dialSFTP(t *testing.T, addr, user, pass string) *sftp.Client {
 	return client
 }
 
-func startTestFTPServer(t *testing.T, users map[string]UserInfo, ftpPassivePortRange string) (srv *server, addr string, stop func()) {
+func startTestFTPServer(t *testing.T, users map[string]UserInfo, ftpPassivePortRange string) (srv *Server, addr string, stop func()) {
 	t.Helper()
 
 	srv = newTestServer("127.0.0.1:0", "127.0.0.1:0", ftpPassivePortRange, users, testSigner(t), defaultCompletedUploadsSize)
@@ -897,7 +897,7 @@ func TestFTPSessionAnnounceUploadUsesCapturedCompletedUploads(t *testing.T) {
 	serverUploads := make(chan CompletedUpload, 1)
 	sessionUploads := make(chan CompletedUpload, 1)
 	fs := &ftpSession{
-		server: &server{
+		server: &Server{
 			completedUploads: serverUploads,
 		},
 		username: "alice",
@@ -936,7 +936,7 @@ func TestFTPSessionAnnounceAuthEventUsesCapturedAuthEvents(t *testing.T) {
 	serverEvents := make(chan AuthEvent, 1)
 	sessionEvents := make(chan AuthEvent, 1)
 	fs := &ftpSession{
-		server: &server{
+		server: &Server{
 			authEvents: serverEvents,
 		},
 		username:   "alice",
@@ -1118,7 +1118,7 @@ func TestParseFTPPassivePortRange(t *testing.T) {
 
 func TestServerListenFTPData(t *testing.T) {
 	t.Run("os assigned port", func(t *testing.T) {
-		srv := &server{}
+		srv := &Server{}
 		ln, err := srv.listenFTPData("127.0.0.1")
 		if err != nil {
 			t.Fatalf("listenFTPData: %v", err)
@@ -1139,7 +1139,7 @@ func TestServerListenFTPData(t *testing.T) {
 		t.Cleanup(func() { _ = busyLn.Close() })
 
 		port := busyLn.Addr().(*net.TCPAddr).Port
-		srv := &server{ftpPassivePortRange: strconv.Itoa(port)}
+		srv := &Server{ftpPassivePortRange: strconv.Itoa(port)}
 		if _, err := srv.listenFTPData("127.0.0.1"); err == nil {
 			t.Fatal("listenFTPData error = nil; want non-nil when configured port is already in use")
 		}
@@ -3600,7 +3600,7 @@ func TestServer_Close_BeforeListenAndServe(t *testing.T) {
 // startListenAndServe boots a server via ListenAndServe on
 // 127.0.0.1:0 and returns it once it is accepting. The caller must drain
 // errCh and call Shutdown/Close to stop the server.
-func startListenAndServe(t *testing.T, users map[string]UserInfo) (srv *server, addr string, errCh chan error) {
+func startListenAndServe(t *testing.T, users map[string]UserInfo) (srv *Server, addr string, errCh chan error) {
 	t.Helper()
 	srv = newTestServer("127.0.0.1:0", "", "", users, testSigner(t), defaultCompletedUploadsSize)
 	errCh = make(chan error, 1)
@@ -3766,7 +3766,7 @@ func TestServer_ListenAndServe_AfterShutdown(t *testing.T) {
 // error immediately when Addr is empty or blank without opening any listener.
 func TestServer_ListenAndServe_EmptyAddr(t *testing.T) {
 	for _, addr := range []string{"", "   ", "\t"} {
-		srv := &server{addr: addr, signer: testSigner(t)}
+		srv := &Server{addr: addr, signer: testSigner(t)}
 		err := srv.ListenAndServe()
 		if err == nil {
 			t.Errorf("addr=%q: expected error, got nil", addr)
@@ -4342,7 +4342,7 @@ func TestFTPSessionAuthenticate_ValidatesJailRoot(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := &ftpSession{
-				server: &server{
+				server: &Server{
 					users: map[string]UserInfo{
 						"alice": {Password: "alicepw", Root: tc.root, CanRead: true, CanWrite: true},
 					},
@@ -4492,9 +4492,9 @@ func TestSFTPServer_Setstat_PermissionDeniedForReadOnly(t *testing.T) {
 	}
 }
 
-// TestServer_EffectiveIdleTimeout verifies the resolution rules of server.effectiveIdleTimeout.
+// TestServer_EffectiveIdleTimeout verifies the resolution rules of Server.effectiveIdleTimeout.
 func TestServer_EffectiveIdleTimeout(t *testing.T) {
-	s := &server{}
+	s := &Server{}
 	if got := s.effectiveIdleTimeout(); got != defaultSFTPIdleTimeout {
 		t.Errorf("default idleTimeout = %v; want %v", got, defaultSFTPIdleTimeout)
 	}
@@ -4509,9 +4509,9 @@ func TestServer_EffectiveIdleTimeout(t *testing.T) {
 }
 
 // TestServer_EffectiveTCPKeepAlivePeriod verifies the resolution rules of
-// server.effectiveTCPKeepAlivePeriod.
+// Server.effectiveTCPKeepAlivePeriod.
 func TestServer_EffectiveTCPKeepAlivePeriod(t *testing.T) {
-	s := &server{}
+	s := &Server{}
 	if got := s.effectiveTCPKeepAlivePeriod(); got != defaultTCPKeepAlivePeriod {
 		t.Errorf("default tcpKeepAlivePeriod = %v; want %v", got, defaultTCPKeepAlivePeriod)
 	}
@@ -4761,7 +4761,7 @@ func TestFTPServer_CmdStorSanitizesCopyErrors(t *testing.T) {
 	dataConn := &stubConn{readErr: copyErr}
 
 	fs := &ftpSession{
-		server: &server{
+		server: &Server{
 			completedUploads: make(chan CompletedUpload, 1),
 		},
 		conn:   controlConn,

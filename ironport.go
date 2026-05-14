@@ -350,9 +350,8 @@ type AuthEvent struct {
 	Protocol string
 }
 
-// server is a self-contained SFTP server with optional FTP support.
-// It is unexported so external callers construct servers through NewServer.
-type server struct {
+// Server is a self-contained SFTP server with optional FTP support.
+type Server struct {
 	// addr is the TCP address to listen on for SFTP, e.g. ":2022".
 	addr string
 	// ftpAddr is the TCP address to listen on for FTP, e.g. ":2121".
@@ -469,7 +468,7 @@ type Config struct {
 
 // AddUser adds or replaces a user entry in the server's user map.
 // It is safe to call concurrently with active connections.
-func (s *server) AddUser(username string, info UserInfo) {
+func (s *Server) AddUser(username string, info UserInfo) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.users == nil {
@@ -481,7 +480,7 @@ func (s *server) AddUser(username string, info UserInfo) {
 // RemoveUser removes a user entry from the server's user map.
 // Active connections for that user are not terminated.
 // It is safe to call concurrently with active connections.
-func (s *server) RemoveUser(username string) {
+func (s *Server) RemoveUser(username string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.users, username)
@@ -490,7 +489,7 @@ func (s *server) RemoveUser(username string) {
 // RemoveAllUsers removes every user entry from the server's user map.
 // Active connections are not terminated, and no on-disk user data is removed.
 // It is safe to call concurrently with active connections.
-func (s *server) RemoveAllUsers() {
+func (s *Server) RemoveAllUsers() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	clear(s.users)
@@ -500,7 +499,7 @@ func (s *server) RemoveAllUsers() {
 // If the key is already present (by wire-format equality) it is not added again.
 // It is a no-op when username does not exist or key is nil.
 // It is safe to call concurrently with active connections.
-func (s *server) AddUserKey(username string, key ssh.PublicKey) {
+func (s *Server) AddUserKey(username string, key ssh.PublicKey) {
 	if key == nil {
 		return
 	}
@@ -526,7 +525,7 @@ func (s *server) AddUserKey(username string, key ssh.PublicKey) {
 // RemoveUserKey removes key from the AuthorizedKeys of an existing user.
 // It is a no-op when username does not exist, the key is not found, or key is nil.
 // It is safe to call concurrently with active connections.
-func (s *server) RemoveUserKey(username string, key ssh.PublicKey) {
+func (s *Server) RemoveUserKey(username string, key ssh.PublicKey) {
 	if key == nil {
 		return
 	}
@@ -564,7 +563,7 @@ func DefaultConfig() *Config {
 	}
 }
 
-// NewServer creates a new server from config. Pass FtpAddr as "" to disable
+// NewServer creates a new Server from config. Pass FtpAddr as "" to disable
 // FTP. Leave FtpPassivePortRange empty to use OS-assigned passive data ports.
 //
 // CompletedUploadSize sets the buffer capacity of the CompletedUploads channel.
@@ -577,11 +576,11 @@ func DefaultConfig() *Config {
 //	cfg.CompletedUploadSize = 256
 //	cfg.AuthEventSize = 256
 //	srv := ironport.NewServer(cfg)
-func NewServer(config *Config) *server {
+func NewServer(config *Config) *Server {
 	if config == nil {
 		config = DefaultConfig()
 	}
-	s := &server{
+	s := &Server{
 		addr:                       config.Addr,
 		ftpAddr:                    config.FtpAddr,
 		ftpPassivePortRange:        config.FtpPassivePortRange,
@@ -610,7 +609,7 @@ func generateEphemeralSigner() (ssh.Signer, error) {
 	return ssh.NewSignerFromKey(priv)
 }
 
-func (s *server) ensureSigner() error {
+func (s *Server) ensureSigner() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.signer != nil {
@@ -629,7 +628,7 @@ func (s *server) ensureSigner() error {
 // caller must not spawn a handler for nc and is responsible for closing it.
 // On success the caller must call untrackConn(nc) and connWG.Done() exactly
 // once before its handler goroutine returns.
-func (s *server) trackConn(nc net.Conn) bool {
+func (s *Server) trackConn(nc net.Conn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.shuttingDown {
@@ -646,7 +645,7 @@ func (s *server) trackConn(nc net.Conn) bool {
 // untrackConn removes nc from the in-flight set. The corresponding
 // connWG.Done() call is the caller's responsibility so that ordering between
 // "stop tracking" and "decrement waitgroup" is explicit at each call site.
-func (s *server) untrackConn(nc net.Conn) {
+func (s *Server) untrackConn(nc net.Conn) {
 	s.mu.Lock()
 	delete(s.activeConns, nc)
 	s.mu.Unlock()
@@ -656,7 +655,7 @@ func (s *server) untrackConn(nc net.Conn) {
 // Returns the number of connections it closed. Used by Shutdown to evict
 // stragglers when the caller's context deadline fires before handlers have
 // finished on their own.
-func (s *server) forceCloseActiveConns() int {
+func (s *Server) forceCloseActiveConns() int {
 	s.mu.Lock()
 	conns := make([]net.Conn, 0, len(s.activeConns))
 	for c := range s.activeConns {
@@ -683,13 +682,13 @@ func newAuthEventsChannel(size int) chan AuthEvent {
 	return make(chan AuthEvent, size)
 }
 
-func (s *server) completedUploadsChan() chan CompletedUpload {
+func (s *Server) completedUploadsChan() chan CompletedUpload {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.completedUploads
 }
 
-func (s *server) authEventsChan() chan AuthEvent {
+func (s *Server) authEventsChan() chan AuthEvent {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.authEvents
@@ -702,7 +701,7 @@ func (s *server) authEventsChan() chan AuthEvent {
 //
 // The buffer capacity is set by Config.CompletedUploadSize. A
 // non-positive value falls back to the package default (64).
-func (s *server) CompletedUploads() <-chan CompletedUpload {
+func (s *Server) CompletedUploads() <-chan CompletedUpload {
 	return s.completedUploadsChan()
 }
 
@@ -714,7 +713,7 @@ func (s *server) CompletedUploads() <-chan CompletedUpload {
 //
 // The buffer capacity is set by Config.AuthEventSize. A non-positive
 // value falls back to the package default (64).
-func (s *server) AuthEvents() <-chan AuthEvent {
+func (s *Server) AuthEvents() <-chan AuthEvent {
 	return s.authEventsChan()
 }
 
@@ -761,7 +760,7 @@ func parseFTPPassivePortRange(portRange string) (start, end int, err error) {
 	return start, end, nil
 }
 
-func (s *server) listenFTPData(host string) (net.Listener, error) {
+func (s *Server) listenFTPData(host string) (net.Listener, error) {
 	portRange := strings.TrimSpace(s.ftpPassivePortRange)
 	if portRange == "" {
 		return net.Listen("tcp", net.JoinHostPort(host, "0"))
@@ -789,7 +788,7 @@ func (s *server) listenFTPData(host string) (net.Listener, error) {
 //
 // A server that has been Shutdown cannot be reused; ListenAndServe returns
 // an error in that case. Construct a fresh server instead.
-func (s *server) ListenAndServe() error {
+func (s *Server) ListenAndServe() error {
 	if strings.TrimSpace(s.addr) == "" {
 		return errors.New("ironport: Addr is required")
 	}
@@ -860,7 +859,7 @@ func (s *server) ListenAndServe() error {
 	return ret
 }
 
-func (s *server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) error {
+func (s *Server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) error {
 	var backoff time.Duration
 	for {
 		nc, err := ln.Accept()
@@ -898,7 +897,7 @@ func (s *server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig, uploads chan<
 	}
 }
 
-func (s *server) serveFTP(ln net.Listener, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) error {
+func (s *Server) serveFTP(ln net.Listener, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) error {
 	var backoff time.Duration
 	for {
 		nc, err := ln.Accept()
@@ -946,14 +945,14 @@ func nextAcceptBackoff(prev time.Duration) time.Duration {
 
 // configuredTempExtensions returns a copy of the normalised temp extensions
 // configured at construction.
-func (s *server) configuredTempExtensions() []string {
+func (s *Server) configuredTempExtensions() []string {
 	return slices.Clone(s.tempExtensions)
 }
 
 // effectiveIdleTimeout returns the effective idle timeout for SFTP connections.
 // A zero configured timeout selects the package default; a negative timeout
 // disables the deadline.
-func (s *server) effectiveIdleTimeout() time.Duration {
+func (s *Server) effectiveIdleTimeout() time.Duration {
 	d := s.idleTimeout
 	switch {
 	case d == 0:
@@ -965,14 +964,14 @@ func (s *server) effectiveIdleTimeout() time.Duration {
 }
 
 // chownAllowed returns the configured chown permission.
-func (s *server) chownAllowed() bool {
+func (s *Server) chownAllowed() bool {
 	return s.allowChown
 }
 
 // effectiveTCPKeepAlivePeriod returns the effective SO_KEEPALIVE probe interval for
 // accepted control connections. A zero configured value selects the package
 // default; a negative value disables keepalive (returns 0).
-func (s *server) effectiveTCPKeepAlivePeriod() time.Duration {
+func (s *Server) effectiveTCPKeepAlivePeriod() time.Duration {
 	d := s.tcpKeepAlivePeriod
 	switch {
 	case d == 0:
@@ -1087,7 +1086,7 @@ func hasTempExt(name string, tempExts []string) bool {
 // to call concurrently with active connections; in-flight connections are not
 // terminated. Calling Close before ListenAndServe has been called, or after it
 // has already returned, is a no-op.
-func (s *server) Close() error {
+func (s *Server) Close() error {
 	return s.closeListeners()
 }
 
@@ -1106,7 +1105,7 @@ func (s *server) Close() error {
 // nil. Calling Shutdown before ListenAndServe has been started, or after it
 // has already returned and all handlers have exited, returns immediately
 // with nil.
-func (s *server) Shutdown(ctx context.Context) error {
+func (s *Server) Shutdown(ctx context.Context) error {
 	// Mark the server as shutting down so any accept that races with the
 	// listener close refuses the connection rather than starting a handler
 	// we would then have to drain. Setting this under mu serialises with
@@ -1138,7 +1137,7 @@ func (s *server) Shutdown(ctx context.Context) error {
 	}
 }
 
-func (s *server) closeListeners() error {
+func (s *Server) closeListeners() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1159,7 +1158,7 @@ func (s *server) closeListeners() error {
 // ListeningAddr returns the actual SFTP network address the server is listening
 // on, or nil if the SFTP listener is not currently listening. It is useful when
 // the server was started with port 0 (OS-assigned port).
-func (s *server) ListeningAddr() net.Addr {
+func (s *Server) ListeningAddr() net.Addr {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.ln == nil {
@@ -1170,7 +1169,7 @@ func (s *server) ListeningAddr() net.Addr {
 
 // FTPListeningAddr returns the actual FTP network address the server is
 // listening on, or nil if FTP is disabled or not currently listening.
-func (s *server) FTPListeningAddr() net.Addr {
+func (s *Server) FTPListeningAddr() net.Addr {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.ftpLn == nil {
@@ -1237,7 +1236,7 @@ func checkPassword(storedPw, suppliedPw string) bool {
 // Public-key authentication succeeds when the presented key matches any entry
 // in the user's AuthorizedKeys slice (constant-time comparison of wire-format
 // bytes).
-func (s *server) sshServerConfig() *ssh.ServerConfig {
+func (s *Server) sshServerConfig() *ssh.ServerConfig {
 	authEvents := s.authEventsChan()
 	announceFailure := func(c ssh.ConnMetadata) {
 		announceAuthEvent(authEvents, AuthEvent{
@@ -1862,7 +1861,7 @@ type ftpCtlMsg struct {
 }
 
 type ftpSession struct {
-	server        *server
+	server        *Server
 	conn          net.Conn
 	r             *bufio.Reader
 	w             *bufio.Writer
@@ -1896,7 +1895,7 @@ type ftpSession struct {
 	fs *jailFS
 }
 
-func (s *server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) {
+func (s *Server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) {
 	sess := &ftpSession{
 		server:     s,
 		conn:       nc,
