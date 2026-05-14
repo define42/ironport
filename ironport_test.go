@@ -206,8 +206,8 @@ func testSigner(t *testing.T) ssh.Signer {
 	return signer
 }
 
-func newTestConfig(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserInfo, signer ssh.Signer, completedUploadsSize int) *ironportConfig {
-	config := DefaultIronportConfig()
+func newTestConfig(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserInfo, signer ssh.Signer, completedUploadsSize int) *Config {
+	config := DefaultConfig()
 	config.Addr = addr
 	config.FtpAddr = ftpAddr
 	config.FtpPassivePortRange = ftpPassivePortRange
@@ -229,7 +229,7 @@ func startTestServer(t *testing.T, users map[string]UserInfo) (srv *server, addr
 	return startTestServerWithConfig(t, config)
 }
 
-func startTestServerWithConfig(t *testing.T, config *ironportConfig) (srv *server, addr string, stop func()) {
+func startTestServerWithConfig(t *testing.T, config *Config) (srv *server, addr string, stop func()) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -238,7 +238,7 @@ func startTestServerWithConfig(t *testing.T, config *ironportConfig) (srv *serve
 	addr = ln.Addr().String()
 
 	if config == nil {
-		config = DefaultIronportConfig()
+		config = DefaultConfig()
 	}
 	serverConfig := *config
 	serverConfig.Addr = addr
@@ -251,7 +251,7 @@ func startTestServerWithConfig(t *testing.T, config *ironportConfig) (srv *serve
 			if err != nil {
 				return // listener closed
 			}
-			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.tempExtensions(), srv.idleTimeout(), srv.allowChown())
+			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.chownAllowed())
 		}
 	}()
 
@@ -622,7 +622,7 @@ func TestNewServer(t *testing.T) {
 		"alice": {Password: "pw", Root: "/tmp/alice", CanRead: true, CanWrite: true},
 	}
 	signer := testSigner(t)
-	config := DefaultIronportConfig()
+	config := DefaultConfig()
 	config.Addr = ":0"
 	config.FtpAddr = ":0"
 	config.FtpPassivePortRange = "5000-5010"
@@ -655,8 +655,8 @@ func TestNewServer(t *testing.T) {
 	}
 }
 
-func TestDefaultIronportConfig(t *testing.T) {
-	config := DefaultIronportConfig()
+func TestDefaultConfig(t *testing.T) {
+	config := DefaultConfig()
 	if config.Addr != ":2022" {
 		t.Errorf("Addr = %q; want :2022", config.Addr)
 	}
@@ -703,9 +703,9 @@ func TestDefaultIronportConfig(t *testing.T) {
 		t.Error("AllowChown is true; want false")
 	}
 
-	other := DefaultIronportConfig()
+	other := DefaultConfig()
 	if config == other {
-		t.Fatal("DefaultIronportConfig returned the same pointer twice")
+		t.Fatal("DefaultConfig returned the same pointer twice")
 	}
 	config.Addr = ":9999"
 	if other.Addr != ":2022" {
@@ -745,8 +745,8 @@ func TestSSHServerConfig_AppliesAlgorithmPins(t *testing.T) {
 	if got := cfg.Ciphers[0]; got != ssh.CipherAES256CTR {
 		t.Fatalf("sshServerConfig aliased server SSHCiphers; Ciphers[0] = %q", got)
 	}
-	if got := srv.tempExtensions()[0]; got != ".tmp" {
-		t.Fatalf("NewServer aliased config TempExtensions; tempExtensions()[0] = %q", got)
+	if got := srv.configuredTempExtensions()[0]; got != ".tmp" {
+		t.Fatalf("NewServer aliased config TempExtensions; configuredTempExtensions()[0] = %q", got)
 	}
 }
 
@@ -828,7 +828,7 @@ func TestCompletedUploadsBufferSize(t *testing.T) {
 	}
 
 	// Default capacity: a non-positive config value selects defaultCompletedUploadsSize.
-	config := DefaultIronportConfig()
+	config := DefaultConfig()
 	config.Addr = ":0"
 	config.FtpPassivePortRange = ""
 	config.Users = users
@@ -840,7 +840,7 @@ func TestCompletedUploadsBufferSize(t *testing.T) {
 	}
 
 	// Custom capacity via NewServer config.
-	config2 := DefaultIronportConfig()
+	config2 := DefaultConfig()
 	config2.Addr = ":0"
 	config2.FtpPassivePortRange = ""
 	config2.Users = users
@@ -865,7 +865,7 @@ func TestAuthEventsBufferSize(t *testing.T) {
 	}
 
 	// Default capacity: a non-positive config value selects defaultAuthEventsSize.
-	config := DefaultIronportConfig()
+	config := DefaultConfig()
 	config.Addr = ":0"
 	config.FtpPassivePortRange = ""
 	config.Users = users
@@ -877,7 +877,7 @@ func TestAuthEventsBufferSize(t *testing.T) {
 	}
 
 	// Custom capacity via NewServer config.
-	config2 := DefaultIronportConfig()
+	config2 := DefaultConfig()
 	config2.Addr = ":0"
 	config2.FtpPassivePortRange = ""
 	config2.Users = users
@@ -2227,7 +2227,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.tempExtensions(), srv.idleTimeout(), srv.allowChown())
+			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.chownAllowed())
 		}
 	}()
 	t.Cleanup(func() { _ = ln.Close() })
@@ -3782,7 +3782,7 @@ func TestServer_ListenAndServe_EmptyAddr(t *testing.T) {
 // TestServer_ListenAndServe_NilSignerGeneratesHostKey verifies that
 // ListenAndServe generates an ephemeral host key when signer is nil.
 func TestServer_ListenAndServe_NilSignerGeneratesHostKey(t *testing.T) {
-	config := DefaultIronportConfig()
+	config := DefaultConfig()
 	config.Addr = "127.0.0.1:0"
 	config.FtpPassivePortRange = ""
 	srv := NewServer(config)
@@ -3908,7 +3908,7 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.tempExtensions(), srv.idleTimeout(), srv.allowChown())
+			go handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.chownAllowed())
 		}
 	}()
 
@@ -4095,17 +4095,17 @@ func TestCleanSFTPClientPath(t *testing.T) {
 // normalised (lower-cased, dot-prefixed, empty entries stripped) at
 // construction.
 func TestServer_TempExtensionsNormalisation(t *testing.T) {
-	config := DefaultIronportConfig()
+	config := DefaultConfig()
 	config.TempExtensions = []string{"TMP", ".Writing", "  ", ".part"}
 	srv := NewServer(config)
-	got := srv.tempExtensions()
+	got := srv.configuredTempExtensions()
 	want := []string{".tmp", ".writing", ".part"}
 	if len(got) != len(want) {
-		t.Fatalf("tempExtensions() = %v; want %v", got, want)
+		t.Fatalf("configuredTempExtensions() = %v; want %v", got, want)
 	}
 	for i, w := range want {
 		if got[i] != w {
-			t.Errorf("tempExtensions()[%d] = %q; want %q", i, got[i], w)
+			t.Errorf("configuredTempExtensions()[%d] = %q; want %q", i, got[i], w)
 		}
 	}
 }
@@ -4492,35 +4492,35 @@ func TestSFTPServer_Setstat_PermissionDeniedForReadOnly(t *testing.T) {
 	}
 }
 
-// TestServer_IdleTimeout verifies the resolution rules of server.idleTimeout.
-func TestServer_IdleTimeout(t *testing.T) {
+// TestServer_EffectiveIdleTimeout verifies the resolution rules of server.effectiveIdleTimeout.
+func TestServer_EffectiveIdleTimeout(t *testing.T) {
 	s := &server{}
-	if got := s.idleTimeout(); got != defaultSFTPIdleTimeout {
+	if got := s.effectiveIdleTimeout(); got != defaultSFTPIdleTimeout {
 		t.Errorf("default idleTimeout = %v; want %v", got, defaultSFTPIdleTimeout)
 	}
-	s.idleTimeoutConfig = 7 * time.Second
-	if got := s.idleTimeout(); got != 7*time.Second {
+	s.idleTimeout = 7 * time.Second
+	if got := s.effectiveIdleTimeout(); got != 7*time.Second {
 		t.Errorf("custom idleTimeout = %v; want 7s", got)
 	}
-	s.idleTimeoutConfig = -1
-	if got := s.idleTimeout(); got != 0 {
+	s.idleTimeout = -1
+	if got := s.effectiveIdleTimeout(); got != 0 {
 		t.Errorf("negative idleTimeout = %v; want 0", got)
 	}
 }
 
-// TestServer_TCPKeepAlivePeriod verifies the resolution rules of
-// server.tcpKeepAlivePeriod.
-func TestServer_TCPKeepAlivePeriod(t *testing.T) {
+// TestServer_EffectiveTCPKeepAlivePeriod verifies the resolution rules of
+// server.effectiveTCPKeepAlivePeriod.
+func TestServer_EffectiveTCPKeepAlivePeriod(t *testing.T) {
 	s := &server{}
-	if got := s.tcpKeepAlivePeriod(); got != defaultTCPKeepAlivePeriod {
+	if got := s.effectiveTCPKeepAlivePeriod(); got != defaultTCPKeepAlivePeriod {
 		t.Errorf("default tcpKeepAlivePeriod = %v; want %v", got, defaultTCPKeepAlivePeriod)
 	}
-	s.tcpKeepAlivePeriodConfig = 90 * time.Second
-	if got := s.tcpKeepAlivePeriod(); got != 90*time.Second {
+	s.tcpKeepAlivePeriod = 90 * time.Second
+	if got := s.effectiveTCPKeepAlivePeriod(); got != 90*time.Second {
 		t.Errorf("custom tcpKeepAlivePeriod = %v; want 90s", got)
 	}
-	s.tcpKeepAlivePeriodConfig = -1
-	if got := s.tcpKeepAlivePeriod(); got != 0 {
+	s.tcpKeepAlivePeriod = -1
+	if got := s.effectiveTCPKeepAlivePeriod(); got != 0 {
 		t.Errorf("negative tcpKeepAlivePeriod = %v; want 0", got)
 	}
 }
@@ -4812,7 +4812,7 @@ func TestSFTPServer_Chown_DefaultDenied(t *testing.T) {
 	}
 	srv, addr, stop := startTestServer(t, users)
 	t.Cleanup(stop)
-	if srv.allowChown() {
+	if srv.chownAllowed() {
 		t.Fatalf("AllowChown should default to false")
 	}
 
@@ -5226,4 +5226,517 @@ func TestSFTPServer_RejectsCRLFInFilenames(t *testing.T) {
 			t.Errorf("CR/LF-named entry %q exists on disk; write-time guard bypassed", n)
 		}
 	}
+}
+
+// TestFTPServer_PASVExhaustsPortRange verifies that when every port in the
+// configured passive range is already held by another in-flight session,
+// a new PASV request fails fast with 425 rather than hanging or silently
+// drifting outside the range — and that the session pool recovers when a
+// holder releases its listener.
+func TestFTPServer_PASVExhaustsPortRange(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"u": {Password: "p", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestFTPServer(t, users, "5500-5502")
+	t.Cleanup(stop)
+
+	holders := make([]*ftpTestClient, 0, 3)
+	seen := make(map[int]struct{}, 3)
+	for i := 0; i < 3; i++ {
+		c := dialFTP(t, addr)
+		c.login("u", "p")
+		_, port, err := parseFTPPASVResponse(c.command(227, "PASV"))
+		if err != nil {
+			t.Fatalf("session %d parse PASV: %v", i, err)
+		}
+		if port < 5500 || port > 5502 {
+			t.Fatalf("session %d PASV port = %d; want within 5500-5502", i, port)
+		}
+		if _, dup := seen[port]; dup {
+			t.Fatalf("session %d reused port %d", i, port)
+		}
+		seen[port] = struct{}{}
+		holders = append(holders, c)
+	}
+
+	extra := dialFTP(t, addr)
+	extra.login("u", "p")
+	extra.command(425, "PASV")
+
+	// Release one port and confirm PASV recovers. Closing the textproto
+	// connection EOFs the server's control reader, which unwinds the session
+	// and triggers the deferred closeDataListener.
+	_ = holders[0].tp.Close()
+	holders = holders[1:]
+
+	deadline := time.Now().Add(2 * time.Second)
+	recoveredPort := 0
+	for time.Now().Before(deadline) {
+		_, p, err := parseFTPPASVResponse(extra.command(227, "PASV"))
+		if err != nil {
+			t.Fatalf("recovery parse PASV: %v", err)
+		}
+		if p >= 5500 && p <= 5502 {
+			recoveredPort = p
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if recoveredPort == 0 {
+		t.Fatalf("PASV did not recover a port in range after holder closed")
+	}
+
+	for _, c := range holders {
+		_ = c.tp.Close()
+	}
+	_ = extra.tp.Close()
+}
+
+// FuzzReadFTPControlLine exercises the control-line reader with arbitrary
+// byte streams to confirm it never panics and that the line cap is honored
+// regardless of how the input is framed.
+func FuzzReadFTPControlLine(f *testing.F) {
+	f.Add([]byte("USER alice\r\n"))
+	f.Add([]byte("\r\n"))
+	f.Add([]byte("\n"))
+	f.Add([]byte(""))
+	f.Add([]byte("partial without terminator"))
+	f.Add([]byte("\x00\x01\x02\n"))
+	f.Add(append(bytes.Repeat([]byte("A"), ftpMaxControlLineLen+10), '\n'))
+	f.Add([]byte("USER a\r\nPASS b\r\nNOOP\r\n"))
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		r := bufio.NewReader(bytes.NewReader(data))
+		for i := 0; i < 16; i++ {
+			line, err := readFTPControlLine(r, ftpMaxControlLineLen)
+			if err != nil {
+				return
+			}
+			if len(line) > ftpMaxControlLineLen {
+				t.Fatalf("readFTPControlLine returned line of length %d > cap %d", len(line), ftpMaxControlLineLen)
+			}
+		}
+	})
+}
+
+// FuzzParseFTPCommand verifies that parseFTPCommand never panics on
+// arbitrary input and always preserves its documented invariants: the
+// returned command is uppercased and never carries leading whitespace.
+func FuzzParseFTPCommand(f *testing.F) {
+	f.Add("USER alice")
+	f.Add("noop")
+	f.Add("   STOR   /path with spaces  ")
+	f.Add("")
+	f.Add("\t\t\tcmd\targ")
+	f.Add("PASS \x00secret")
+	f.Add("\r\n")
+	f.Add(" \t ")
+
+	f.Fuzz(func(t *testing.T, line string) {
+		cmd, _ := parseFTPCommand(line)
+		if cmd != strings.ToUpper(cmd) {
+			t.Fatalf("parseFTPCommand(%q) cmd=%q not uppercased", line, cmd)
+		}
+		if strings.HasPrefix(cmd, " ") || strings.HasPrefix(cmd, "\t") {
+			t.Fatalf("parseFTPCommand(%q) cmd=%q has leading whitespace", line, cmd)
+		}
+	})
+}
+
+// FuzzUnquoteFTPPath confirms the path-unquoter is panic-safe across
+// arbitrary inputs (well-formed, unterminated, embedded quotes).
+func FuzzUnquoteFTPPath(f *testing.F) {
+	f.Add(`plain.txt`)
+	f.Add(`"quoted"`)
+	f.Add(`"with""quote"`)
+	f.Add(`"unterminated`)
+	f.Add(`""`)
+	f.Add(``)
+	f.Add(` "leading space" `)
+	f.Add("\"\r\n\"")
+
+	f.Fuzz(func(t *testing.T, p string) {
+		_ = unquoteFTPPath(p)
+	})
+}
+
+// FuzzListPathArg confirms that listPathArg never returns a value beginning
+// with '-' — flag tokens must always be skipped, regardless of input shape.
+func FuzzListPathArg(f *testing.F) {
+	f.Add("-la /tmp")
+	f.Add("")
+	f.Add("---")
+	f.Add("-")
+	f.Add("file with spaces")
+	f.Add("-x -y -z")
+	f.Add("\t-la\t/incoming\t")
+
+	f.Fuzz(func(t *testing.T, arg string) {
+		got := listPathArg(arg)
+		if strings.HasPrefix(got, "-") {
+			t.Fatalf("listPathArg(%q) = %q; result must not start with '-'", arg, got)
+		}
+	})
+}
+
+// FuzzFtpListLine confirms that ftpListLine never emits raw CR or LF bytes
+// regardless of the supplied filename, so the formatter cannot be used to
+// inject extra control lines into the LIST data channel.
+func FuzzFtpListLine(f *testing.F) {
+	dir := f.TempDir()
+	stub := filepath.Join(dir, "stub")
+	if err := os.WriteFile(stub, []byte("x"), 0644); err != nil {
+		f.Fatal(err)
+	}
+	info, err := os.Stat(stub)
+	if err != nil {
+		f.Fatal(err)
+	}
+
+	f.Add("plain.txt")
+	f.Add("name\r\nFAKE 200 injected")
+	f.Add("")
+	f.Add("\x00\x01\x02")
+	f.Add(strings.Repeat("A", 8192))
+	f.Add("name\twith\ttabs")
+
+	f.Fuzz(func(t *testing.T, name string) {
+		line := ftpListLine(info, name)
+		if strings.ContainsAny(line, "\r\n") {
+			t.Fatalf("ftpListLine(%q) emitted raw CR/LF: %q", name, line)
+		}
+	})
+}
+
+// TestFTPServer_PipelinedCommands writes five commands in a single Write
+// before reading any reply and verifies the server processes them in order
+// without losing or merging any of them. Pipelining is not allowed by RFC
+// 959 but is harmless when commands are framed correctly, so the server
+// should still answer each one.
+func TestFTPServer_PipelinedCommands(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"u": {Password: "p", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestFTPServer(t, users, "")
+	t.Cleanup(stop)
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	br := bufio.NewReader(conn)
+
+	readCode := func(want int) {
+		t.Helper()
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if len(line) >= 4 && line[3] == '-' {
+			code := line[:3]
+			for {
+				next, err := br.ReadString('\n')
+				if err != nil {
+					t.Fatalf("read continuation: %v", err)
+				}
+				if strings.HasPrefix(next, code+" ") {
+					break
+				}
+			}
+		}
+		if !strings.HasPrefix(line, fmt.Sprintf("%d ", want)) && !strings.HasPrefix(line, fmt.Sprintf("%d-", want)) {
+			t.Fatalf("got %q; want reply with code %d", line, want)
+		}
+	}
+
+	readCode(220)
+
+	if _, err := conn.Write([]byte("USER u\r\nPASS p\r\nNOOP\r\nSYST\r\nQUIT\r\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	readCode(331)
+	readCode(230)
+	readCode(200)
+	readCode(215)
+	readCode(221)
+}
+
+// TestFTPServer_BareCRDoesNotSmuggleCommands verifies that a bare CR in the
+// middle of a control line is not treated as a line terminator: it becomes
+// part of the command token after the trailing CRLF is trimmed, the
+// resulting token matches no known command, and the session stays alive.
+// If CR were ever treated as a terminator, an attacker could smuggle a
+// QUIT (or any other command) through a single "logged" line.
+func TestFTPServer_BareCRDoesNotSmuggleCommands(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"u": {Password: "p", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestFTPServer(t, users, "")
+	t.Cleanup(stop)
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	br := bufio.NewReader(conn)
+
+	readPrefix := func(want string) string {
+		t.Helper()
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if !strings.HasPrefix(line, want) {
+			t.Fatalf("got %q; want reply starting with %q", line, want)
+		}
+		return line
+	}
+
+	readPrefix("220")
+	if _, err := conn.Write([]byte("USER u\r\nPASS p\r\n")); err != nil {
+		t.Fatalf("login write: %v", err)
+	}
+	readPrefix("331")
+	readPrefix("230")
+
+	if _, err := conn.Write([]byte("NOOP\rQUIT\r\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Authenticated session: unknown commands return 502, not 530. If CR
+	// were treated as a terminator, this would have been answered as two
+	// commands (200 NOOP, then 221 QUIT and connection close).
+	readPrefix("502")
+
+	if _, err := conn.Write([]byte("NOOP\r\n")); err != nil {
+		t.Fatalf("write NOOP: %v", err)
+	}
+	readPrefix("200")
+}
+
+// TestFTPServer_EPSVAllRejectsActiveMode documents the EPSV ALL contract
+// from RFC 2428: once a client sends EPSV ALL, the server must refuse
+// active-mode commands for the rest of the session. The server currently
+// does not track the EPSV-ALL state per-session, but PORT and EPRT are
+// rejected unconditionally — which means the user-visible contract holds
+// even without explicit state. EPSV must still work afterward.
+func TestFTPServer_EPSVAllRejectsActiveMode(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"u": {Password: "p", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestFTPServer(t, users, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("u", "p")
+
+	client.send("EPSV ALL")
+	code, _, err := client.tp.ReadResponse(0)
+	if err != nil {
+		t.Fatalf("ReadResponse(EPSV ALL): %v", err)
+	}
+	if code != 200 && code != 229 {
+		t.Fatalf("EPSV ALL got %d; want 200 (RFC 2428) or 229 (current behavior)", code)
+	}
+
+	client.command(502, "PORT 127,0,0,1,4,210")
+	client.command(502, "EPRT |1|127.0.0.1|4000|")
+
+	client.command(229, "EPSV")
+}
+
+// TestFTPServer_STORWithoutPassiveModeFails verifies that data-transfer
+// commands fail cleanly (150 then 425) when the client never opened a
+// passive listener. The control session must remain usable after each
+// failure so a confused client can recover by issuing PASV.
+func TestFTPServer_STORWithoutPassiveModeFails(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "exists.txt"), []byte("y"), 0644); err != nil {
+		t.Fatalf("os.WriteFile: %v", err)
+	}
+	users := map[string]UserInfo{
+		"u": {Password: "p", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestFTPServer(t, users, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("u", "p")
+	client.command(200, "TYPE I")
+
+	client.send("STOR new.txt")
+	client.read(150)
+	client.read(425)
+
+	client.send("RETR exists.txt")
+	client.read(150)
+	client.read(425)
+
+	client.send("LIST")
+	client.read(150)
+	client.read(425)
+
+	// Session still works for a legitimate transfer after the failed ones.
+	dc, _ := client.passiveConn()
+	client.send("STOR after.txt")
+	client.read(150)
+	if _, err := dc.Write([]byte("ok")); err != nil {
+		t.Fatalf("dc.Write: %v", err)
+	}
+	_ = dc.Close()
+	client.read(226)
+
+	if got, err := os.ReadFile(filepath.Join(root, "after.txt")); err != nil {
+		t.Fatalf("os.ReadFile(after.txt): %v", err)
+	} else if !bytes.Equal(got, []byte("ok")) {
+		t.Fatalf("after.txt = %q; want %q", got, "ok")
+	}
+}
+
+// TestFTPServer_RestPastEOFThenRETR pins the current behavior of REST N
+// followed by RETR when N is past the end of file: the seek succeeds, the
+// io.Copy returns zero bytes, and the server replies 226 with an empty
+// data stream. STOR rejects the same situation with 554 (covered by
+// TestFTPServer_RestBeyondFileSizeRejected) — this asymmetry is
+// documented here, and the test will fail loudly if RETR's handling
+// changes (for example, to 554) so the surrounding contract can be
+// updated in one place.
+func TestFTPServer_RestPastEOFThenRETR(t *testing.T) {
+	root := t.TempDir()
+	existing := []byte("abcde")
+	if err := os.WriteFile(filepath.Join(root, "existing.txt"), existing, 0o644); err != nil {
+		t.Fatalf("os.WriteFile: %v", err)
+	}
+	_, addr, stop := startTestFTPServer(t, map[string]UserInfo{
+		"u": {Password: "p", Root: root, CanRead: true, CanWrite: true},
+	}, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("u", "p")
+	client.command(200, "TYPE I")
+
+	client.command(350, "REST 99")
+	dc, _ := client.passiveConn()
+	client.send("RETR existing.txt")
+	client.read(150)
+	body, err := io.ReadAll(dc)
+	if err != nil {
+		t.Fatalf("io.ReadAll(RETR): %v", err)
+	}
+	_ = dc.Close()
+	client.read(226)
+	if len(body) != 0 {
+		t.Fatalf("REST past EOF + RETR returned %d bytes; want 0 (current behavior)", len(body))
+	}
+
+	// The restart offset must be cleared after use: a follow-up RETR with
+	// no preceding REST should return the full file.
+	dc2, _ := client.passiveConn()
+	client.send("RETR existing.txt")
+	client.read(150)
+	got, err := io.ReadAll(dc2)
+	if err != nil {
+		t.Fatalf("io.ReadAll(post-REST RETR): %v", err)
+	}
+	_ = dc2.Close()
+	client.read(226)
+	if !bytes.Equal(got, existing) {
+		t.Fatalf("follow-up RETR = %q; want %q (restart offset leaked between commands)", got, existing)
+	}
+}
+
+// TestFTPServer_AborMidTransferRace exercises the runTransfer select
+// window with many ABOR/transfer interleavings so the race detector
+// (go test -race) can catch a regression in the abort handshake. Two
+// orderings are tried per iteration: ABOR-before-client-close and
+// client-close-before-ABOR. The first produces a 426/226 sequence; the
+// second usually produces 226/226 because io.Copy finishes before the
+// ABOR control message is observed. Either is acceptable — the test
+// just requires that two well-formed replies arrive and that the
+// session survives.
+func TestFTPServer_AborMidTransferRace(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping race iterations in -short mode")
+	}
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"u": {Password: "p", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestFTPServer(t, users, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("u", "p")
+	client.command(200, "TYPE I")
+
+	chunk := bytes.Repeat([]byte("abcdefgh"), 1024) // 8 KiB
+	const iterations = 30
+
+	drainUploads := func() {
+		for {
+			select {
+			case <-srv.CompletedUploads():
+				continue
+			default:
+				return
+			}
+		}
+	}
+
+	for i := 0; i < iterations; i++ {
+		dc, _ := client.passiveConn()
+		client.send("STOR race.txt")
+		client.read(150)
+
+		writes := 1 + (i % 8)
+		for j := 0; j < writes; j++ {
+			if _, err := dc.Write(chunk); err != nil {
+				break
+			}
+		}
+
+		if i%2 == 0 {
+			client.send("ABOR")
+			_ = dc.Close()
+		} else {
+			_ = dc.Close()
+			client.send("ABOR")
+		}
+
+		first, _, err := client.tp.ReadResponse(0)
+		if err != nil {
+			t.Fatalf("iter %d: read first response: %v", i, err)
+		}
+		second, _, err := client.tp.ReadResponse(0)
+		if err != nil {
+			t.Fatalf("iter %d: read second response: %v", i, err)
+		}
+		switch {
+		case first == 426 && second == 226:
+		case first == 226 && second == 226:
+		default:
+			t.Fatalf("iter %d: responses %d then %d; want 426/226 (aborted) or 226/226 (transfer raced ABOR)", i, first, second)
+		}
+
+		drainUploads()
+	}
+
+	// Session is still usable after the storm.
+	dc, _ := client.passiveConn()
+	client.send("STOR final.txt")
+	client.read(150)
+	if _, err := dc.Write([]byte("done")); err != nil {
+		t.Fatalf("final write: %v", err)
+	}
+	_ = dc.Close()
+	client.read(226)
 }

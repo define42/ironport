@@ -7,17 +7,17 @@ changes are tracked under `Unreleased`.
 
 ## Unreleased
 
-- Added config-based server construction with `DefaultIronportConfig`.
+- Added config-based server construction with `DefaultConfig`.
 - Added ephemeral host-key generation when `config.Signer` is nil.
 - Renamed the runnable example command to `cmd/ironport-demo` and clarified
   that it is not an operator-ready production binary.
 - Added project security and contribution documentation.
 - Added a main-branch release workflow that bumps the next SemVer tag and
   creates a GitHub Release.
-- Moved SSH algorithm pinning onto `ironportConfig` fields.
+- Moved SSH algorithm pinning onto `Config` fields.
 - Moved temp-extension handling and idle timeout configuration onto
-  `ironportConfig`.
-- Moved chown opt-in configuration onto `ironportConfig`.
+  `Config`.
+- Moved chown opt-in configuration onto `Config`.
 - Added `CompletedUpload.Protocol` to distinguish SFTP and FTP uploads.
 
 ## Releases

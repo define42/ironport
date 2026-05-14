@@ -39,7 +39,7 @@ func main() {
 		}
 	}
 
-	config := ironport.DefaultIronportConfig()
+	config := ironport.DefaultConfig()
 	config.Addr = *sftpAddr
 	config.FtpAddr = *ftpAddr
 	config.FtpPassivePortRange = *ftpPassive

@@ -61,7 +61,7 @@ func main() {
     }
 
     // FtpAddr is "" by default, disabling the (plaintext) FTP listener.
-    config := ironport.DefaultIronportConfig()
+    config := ironport.DefaultConfig()
     config.Addr = ":2022"
     config.Users = users
     if signer != nil {
@@ -94,7 +94,7 @@ func main() {
 Set `CompletedUploadSize` on the server config:
 
 ```go
-config := ironport.DefaultIronportConfig()
+config := ironport.DefaultConfig()
 config.Users = users
 config.Signer = signer
 config.CompletedUploadSize = 256
@@ -111,7 +111,7 @@ different `CompletedUploadSize` before calling `NewServer`.
 Set `AuthEventSize` on the server config:
 
 ```go
-config := ironport.DefaultIronportConfig()
+config := ironport.DefaultConfig()
 config.Users = users
 config.Signer = signer
 config.AuthEventSize = 256
@@ -130,7 +130,7 @@ Configure `TempExtensions` to emit `CompletedUploads()` events at that final
 rename boundary:
 
 ```go
-config := ironport.DefaultIronportConfig()
+config := ironport.DefaultConfig()
 config.Users = users
 config.Signer = signer
 config.TempExtensions = []string{".tmp", ".writing"}
@@ -150,7 +150,7 @@ restrict SSH negotiation. Nil fields keep the defaults from
 supplied:
 
 ```go
-config := ironport.DefaultIronportConfig()
+config := ironport.DefaultConfig()
 config.Users = users
 config.Signer = signer
 config.SSHKeyExchanges = []string{ssh.KeyExchangeCurve25519}
@@ -175,7 +175,7 @@ disabled by default; enable it only on a trusted network segment where you
 control all clients and intermediate hops:
 
 ```go
-config := ironport.DefaultIronportConfig()
+config := ironport.DefaultConfig()
 config.Users = users
 config.Signer = signer
 config.FtpAddr = ":2121"

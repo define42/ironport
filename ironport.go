@@ -16,7 +16,7 @@
 //
 // Typical usage:
 //
-//	cfg := ironport.DefaultIronportConfig()
+//	cfg := ironport.DefaultConfig()
 //	cfg.Addr = ":2022"
 //	cfg.FtpAddr = ":2121"
 //	cfg.Users = users
@@ -58,7 +58,7 @@ import (
 // Default timeouts and limits applied unless callers override them.
 const (
 	// defaultSFTPIdleTimeout is the default per-connection inactivity timeout
-	// applied to SFTP sessions when ironportConfig.IdleTimeout is zero. A client that
+	// applied to SFTP sessions when Config.IdleTimeout is zero. A client that
 	// sends no data for this duration has its connection closed.
 	defaultSFTPIdleTimeout = 15 * time.Minute
 	// sshHandshakeTimeout bounds the time the raw TCP connection has to
@@ -91,7 +91,7 @@ const (
 	// longer; tune upward if a deployment routinely exceeds it.
 	authorizedKeyTimingPad = 32
 	// defaultTCPKeepAlivePeriod is the SO_KEEPALIVE probe interval applied
-	// to accepted control connections when ironportConfig.TCPKeepAlivePeriod
+	// to accepted control connections when Config.TCPKeepAlivePeriod
 	// is zero. Keepalive probes prevent stateful firewalls and NAT devices
 	// from silently dropping long-idle control connections, and surface
 	// half-open connections (e.g. peer reboot, route loss) as read errors
@@ -384,7 +384,7 @@ type server struct {
 	// authEvents receives authentication/session notifications. Use AuthEvents
 	// to access it as a receive-only stream.
 	authEvents chan AuthEvent
-	// tempExtensionsConfig is an optional list of file extensions (each beginning
+	// tempExtensions is an optional list of file extensions (each beginning
 	// with a leading dot, e.g. ".tmp", ".writing") that mark files as still
 	// being written and therefore not yet "complete".
 	//
@@ -397,23 +397,23 @@ type server struct {
 	//     is finally complete.
 	//
 	// Matching is case-insensitive.
-	tempExtensionsConfig []string
-	// idleTimeoutConfig bounds how long an authenticated SFTP connection may sit
+	tempExtensions []string
+	// idleTimeout bounds how long an authenticated SFTP connection may sit
 	// without receiving any data before being closed. A zero value selects
 	// the package default (15 minutes); a negative value disables the idle
 	// timeout entirely.
-	idleTimeoutConfig time.Duration
-	// tcpKeepAlivePeriodConfig is the SO_KEEPALIVE probe interval applied to
+	idleTimeout time.Duration
+	// tcpKeepAlivePeriod is the SO_KEEPALIVE probe interval applied to
 	// accepted SFTP and FTP control connections. A zero value selects the
 	// package default; a negative value disables keepalive entirely.
-	tcpKeepAlivePeriodConfig time.Duration
-	// allowChownConfig controls whether SFTP clients may change the ownership
+	tcpKeepAlivePeriod time.Duration
+	// allowChown controls whether SFTP clients may change the ownership
 	// (uid/gid) of files in their jail via Setstat/Fsetstat requests.
 	// It defaults to false: chown requests are rejected with a permission
 	// error. Enable it only when the server runs with sufficient privilege
 	// (typically as root with CAP_CHOWN) AND the deployment trusts
 	// authenticated users not to chown their files to other UIDs.
-	allowChownConfig bool
+	allowChown bool
 	// connWG tracks in-flight per-connection handler goroutines so that
 	// Shutdown can wait for them to finish. Each accepted connection adds
 	// one before its goroutine starts and decrements on goroutine exit.
@@ -432,8 +432,8 @@ type server struct {
 	shuttingDown bool
 }
 
-// ironportConfig holds the values used to construct a server.
-type ironportConfig struct {
+// Config holds the values used to construct a server.
+type Config struct {
 	Addr                string
 	FtpAddr             string
 	FtpPassivePortRange string
@@ -550,12 +550,12 @@ func (s *server) RemoveUserKey(username string, key ssh.PublicKey) {
 	s.users[username] = u
 }
 
-// DefaultIronportConfig returns a fresh server configuration with package
+// DefaultConfig returns a fresh server configuration with package
 // defaults applied. Callers should set Users before starting the server. Set
 // Signer to use a stable host key; when Signer is nil, ListenAndServe generates
 // an ephemeral in-memory host key.
-func DefaultIronportConfig() *ironportConfig {
-	return &ironportConfig{
+func DefaultConfig() *Config {
+	return &Config{
 		Addr:                ":2022",
 		FtpAddr:             "",
 		FtpPassivePortRange: "5000-5010",
@@ -571,15 +571,15 @@ func DefaultIronportConfig() *ironportConfig {
 // AuthEventSize sets the buffer capacity of the AuthEvents channel. A
 // non-positive value falls back to the package default (64) for either stream:
 //
-//	cfg := ironport.DefaultIronportConfig()
+//	cfg := ironport.DefaultConfig()
 //	cfg.Users = users
 //	cfg.Signer = signer
 //	cfg.CompletedUploadSize = 256
 //	cfg.AuthEventSize = 256
 //	srv := ironport.NewServer(cfg)
-func NewServer(config *ironportConfig) *server {
+func NewServer(config *Config) *server {
 	if config == nil {
-		config = DefaultIronportConfig()
+		config = DefaultConfig()
 	}
 	s := &server{
 		addr:                       config.Addr,
@@ -593,10 +593,10 @@ func NewServer(config *ironportConfig) *server {
 		sshCiphers:                 slices.Clone(config.SSHCiphers),
 		sshMACs:                    slices.Clone(config.SSHMACs),
 		sshPublicKeyAuthAlgorithms: slices.Clone(config.SSHPublicKeyAuthAlgorithms),
-		tempExtensionsConfig:       normalizeTempExtensions(config.TempExtensions),
-		idleTimeoutConfig:          config.IdleTimeout,
-		tcpKeepAlivePeriodConfig:   config.TCPKeepAlivePeriod,
-		allowChownConfig:           config.AllowChown,
+		tempExtensions:             normalizeTempExtensions(config.TempExtensions),
+		idleTimeout:                config.IdleTimeout,
+		tcpKeepAlivePeriod:         config.TCPKeepAlivePeriod,
+		allowChown:                 config.AllowChown,
 		activeConns:                make(map[net.Conn]struct{}),
 	}
 	return s
@@ -700,7 +700,7 @@ func (s *server) authEventsChan() chan AuthEvent {
 // The channel is buffered; sends are non-blocking so a slow consumer never
 // stalls an upload. Callers should drain the stream continuously.
 //
-// The buffer capacity is set by ironportConfig.CompletedUploadSize. A
+// The buffer capacity is set by Config.CompletedUploadSize. A
 // non-positive value falls back to the package default (64).
 func (s *server) CompletedUploads() <-chan CompletedUpload {
 	return s.completedUploadsChan()
@@ -712,7 +712,7 @@ func (s *server) CompletedUploads() <-chan CompletedUpload {
 // stalls authentication or logout handling. Callers should drain the stream
 // continuously.
 //
-// The buffer capacity is set by ironportConfig.AuthEventSize. A non-positive
+// The buffer capacity is set by Config.AuthEventSize. A non-positive
 // value falls back to the package default (64).
 func (s *server) AuthEvents() <-chan AuthEvent {
 	return s.authEventsChan()
@@ -877,7 +877,7 @@ func (s *server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig, uploads chan<
 			continue
 		}
 		backoff = 0
-		applyTCPKeepAlive(nc, s.tcpKeepAlivePeriod())
+		applyTCPKeepAlive(nc, s.effectiveTCPKeepAlivePeriod())
 		if !s.trackConn(nc) {
 			// Shutdown began between Accept returning and tracking; refuse
 			// the connection rather than spawning an untrackable handler.
@@ -893,7 +893,7 @@ func (s *server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig, uploads chan<
 					_ = nc.Close()
 				}
 			}()
-			handleConn(nc, cfg, uploads, authEvents, s.tempExtensions(), s.idleTimeout(), s.allowChown())
+			handleConn(nc, cfg, uploads, authEvents, s.configuredTempExtensions(), s.effectiveIdleTimeout(), s.chownAllowed())
 		}()
 	}
 }
@@ -912,7 +912,7 @@ func (s *server) serveFTP(ln net.Listener, uploads chan<- CompletedUpload, authE
 			continue
 		}
 		backoff = 0
-		applyTCPKeepAlive(nc, s.tcpKeepAlivePeriod())
+		applyTCPKeepAlive(nc, s.effectiveTCPKeepAlivePeriod())
 		if !s.trackConn(nc) {
 			_ = nc.Close()
 			continue
@@ -926,7 +926,7 @@ func (s *server) serveFTP(ln net.Listener, uploads chan<- CompletedUpload, authE
 					_ = nc.Close()
 				}
 			}()
-			s.handleFTPConn(nc, s.tempExtensions(), uploads, authEvents)
+			s.handleFTPConn(nc, s.configuredTempExtensions(), uploads, authEvents)
 		}()
 	}
 }
@@ -944,17 +944,17 @@ func nextAcceptBackoff(prev time.Duration) time.Duration {
 	return next
 }
 
-// tempExtensions returns a copy of the normalised temp extensions configured
-// at construction.
-func (s *server) tempExtensions() []string {
-	return slices.Clone(s.tempExtensionsConfig)
+// configuredTempExtensions returns a copy of the normalised temp extensions
+// configured at construction.
+func (s *server) configuredTempExtensions() []string {
+	return slices.Clone(s.tempExtensions)
 }
 
-// idleTimeout returns the effective idle timeout for SFTP connections.
+// effectiveIdleTimeout returns the effective idle timeout for SFTP connections.
 // A zero configured timeout selects the package default; a negative timeout
 // disables the deadline.
-func (s *server) idleTimeout() time.Duration {
-	d := s.idleTimeoutConfig
+func (s *server) effectiveIdleTimeout() time.Duration {
+	d := s.idleTimeout
 	switch {
 	case d == 0:
 		return defaultSFTPIdleTimeout
@@ -964,16 +964,16 @@ func (s *server) idleTimeout() time.Duration {
 	return d
 }
 
-// allowChown returns the configured chown permission.
-func (s *server) allowChown() bool {
-	return s.allowChownConfig
+// chownAllowed returns the configured chown permission.
+func (s *server) chownAllowed() bool {
+	return s.allowChown
 }
 
-// tcpKeepAlivePeriod returns the effective SO_KEEPALIVE probe interval for
+// effectiveTCPKeepAlivePeriod returns the effective SO_KEEPALIVE probe interval for
 // accepted control connections. A zero configured value selects the package
 // default; a negative value disables keepalive (returns 0).
-func (s *server) tcpKeepAlivePeriod() time.Duration {
-	d := s.tcpKeepAlivePeriodConfig
+func (s *server) effectiveTCPKeepAlivePeriod() time.Duration {
+	d := s.tcpKeepAlivePeriod
 	switch {
 	case d == 0:
 		return defaultTCPKeepAlivePeriod
@@ -1933,7 +1933,7 @@ func (s *server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- Co
 	// The idle timer below is only armed while the main loop is between
 	// commands; an in-flight transfer is not counted as "idle" because
 	// runTransfer blocks the main loop until it completes.
-	idleTimeout := s.idleTimeout()
+	idleTimeout := s.effectiveIdleTimeout()
 	var idleTimer *time.Timer
 	var idleC <-chan time.Time
 	if idleTimeout > 0 {
