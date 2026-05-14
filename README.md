@@ -1,5 +1,8 @@
 # ironport
 
+[![Go Report Card](https://goreportcard.com/badge/github.com/define42/ironport)](https://goreportcard.com/report/github.com/define42/ironport)
+[![codecov](https://codecov.io/gh/define42/ironport/graph/badge.svg?token=RI5OKZU3DR)](https://codecov.io/gh/define42/ironport)
+
 A production-ready, embeddable SFTP server and FTP server library for Go with a security-first design. The production-ready claim applies to the library API; the command under `cmd/ironport-demo` is only a runnable demo.
 
 ## Features
