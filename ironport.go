@@ -1187,6 +1187,15 @@ func canonicalJailRoot(root string) (string, error) {
 	return real, nil
 }
 
+// checkPassword performs a SHA-256-normalized constant-time comparison between
+// stored and supplied passwords, and rejects empty stored/supplied credentials.
+func checkPassword(storedPw, suppliedPw string) bool {
+	storedHash := sha256.Sum256([]byte(storedPw))
+	suppliedHash := sha256.Sum256([]byte(suppliedPw))
+	match := subtle.ConstantTimeCompare(storedHash[:], suppliedHash[:]) == 1
+	return match && len(storedPw) > 0 && len(suppliedPw) > 0
+}
+
 // sshServerConfig builds the SSH server configuration with both password-based
 // and public-key-based authentication enabled.
 //
@@ -1229,15 +1238,8 @@ func (s *server) sshServerConfig() *ssh.ServerConfig {
 			if ok {
 				storedPw = u.Password
 			}
-			storedHash := sha256.Sum256([]byte(storedPw))
-			passHash := sha256.Sum256(pass)
-			match := subtle.ConstantTimeCompare(storedHash[:], passHash[:]) == 1
-			// Reject empty stored or supplied passwords. An empty stored
-			// password disables password authentication for that user (or
-			// indicates a non-existent user); an empty supplied password is
-			// never a valid credential. This guards against accidentally
-			// permitting login when a UserInfo is added with Password: "".
-			if !ok || !match || len(pass) == 0 || len(storedPw) == 0 {
+			match := checkPassword(storedPw, string(pass))
+			if !ok || !match {
 				announceFailure(c)
 				return nil, fmt.Errorf("invalid credentials")
 			}
@@ -2250,13 +2252,8 @@ func (f *ftpSession) authenticate(pass string) bool {
 	if ok {
 		storedPw = u.Password
 	}
-	storedHash := sha256.Sum256([]byte(storedPw))
-	passHash := sha256.Sum256([]byte(pass))
-	match := subtle.ConstantTimeCompare(storedHash[:], passHash[:]) == 1
-	// Reject empty stored or supplied passwords. An empty stored password
-	// disables password authentication for the user; an empty supplied
-	// password is never a valid credential.
-	if !ok || !match || len(pass) == 0 || len(storedPw) == 0 {
+	match := checkPassword(storedPw, pass)
+	if !ok || !match {
 		return false
 	}
 	jailRoot, err := canonicalJailRoot(u.Root)
