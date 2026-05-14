@@ -52,8 +52,12 @@ func main() {
         signer, _ = ssh.NewSignerFromKey(priv)
     }
 
-    // ftpAddr is "" to disable the (plaintext) FTP listener.
-    srv := ironport.NewServer(":2022", "", "", users, signer, 64)
+    // FtpAddr is "" by default, disabling the (plaintext) FTP listener.
+    config := ironport.DefaultIronportConfig()
+    config.Addr = ":2022"
+    config.Users = users
+    config.Signer = signer
+    srv := ironport.NewServer(config)
 
     // Drain upload notifications in the background.
     go func() {
@@ -69,16 +73,20 @@ func main() {
 
 ### Configuring the upload-notification buffer size
 
-`NewServer` requires an explicit buffer-size argument:
+Set `CompletedUploadSize` on the server config:
 
 ```go
-srv := ironport.NewServer(":2022", "", "", users, signer, 256)
+config := ironport.DefaultIronportConfig()
+config.Users = users
+config.Signer = signer
+config.CompletedUploadSize = 256
+srv := ironport.NewServer(config)
 ```
 
 Read upload notifications from the receive-only `CompletedUploads()` stream.
 The underlying channel is internal, so callers cannot send to it, close it, or
-replace it while the server is running. To change the buffer capacity, pass a
-different size to `NewServer`.
+replace it while the server is running. To change the buffer capacity, set a
+different `CompletedUploadSize` before calling `NewServer`.
 
 ### Deferring completion notifications until final rename
 
@@ -88,7 +96,10 @@ Configure `TempExtensions` to emit `CompletedUploads()` events at that final
 rename boundary:
 
 ```go
-srv := ironport.NewServer(":2022", "", "", users, signer, 64)
+config := ironport.DefaultIronportConfig()
+config.Users = users
+config.Signer = signer
+srv := ironport.NewServer(config)
 srv.TempExtensions = []string{".tmp", ".writing"}
 ```
 
@@ -104,7 +115,10 @@ Nil fields keep the defaults from `golang.org/x/crypto/ssh`; non-nil fields
 are used as allow-lists in the order supplied:
 
 ```go
-srv := ironport.NewServer(":2022", "", "", users, signer, 64)
+config := ironport.DefaultIronportConfig()
+config.Users = users
+config.Signer = signer
+srv := ironport.NewServer(config)
 srv.SSHAlgorithms = ironport.SSHAlgorithms{
     KeyExchanges: []string{ssh.KeyExchangeCurve25519},
     Ciphers:      []string{ssh.CipherAES256CTR},
@@ -128,7 +142,12 @@ disabled by default; enable it only on a trusted network segment where you
 control all clients and intermediate hops:
 
 ```go
-srv := ironport.NewServer(":2022", ":2121", "5000-5010", users, signer, 64)
+config := ironport.DefaultIronportConfig()
+config.Users = users
+config.Signer = signer
+config.FtpAddr = ":2121"
+config.FtpPassivePortRange = "5000-5010"
+srv := ironport.NewServer(config)
 ```
 
 When FTP is enabled, only passive mode (`PASV` / `EPSV`) is supported; active

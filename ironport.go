@@ -15,7 +15,12 @@
 //
 // Typical usage:
 //
-//	srv := ironport.NewServer(":2022", ":2121", "5000-5010", users, signer, 64)
+//	cfg := ironport.DefaultIronportConfig()
+//	cfg.Addr = ":2022"
+//	cfg.FtpAddr = ":2121"
+//	cfg.Users = users
+//	cfg.Signer = signer
+//	srv := ironport.NewServer(cfg)
 //	log.Fatal(srv.ListenAndServe())
 package ironport
 
@@ -384,6 +389,16 @@ type server struct {
 	shuttingDown bool
 }
 
+// ironportConfig holds the values used to construct a server.
+type ironportConfig struct {
+	Addr                string
+	FtpAddr             string
+	FtpPassivePortRange string
+	Users               map[string]UserInfo
+	Signer              ssh.Signer
+	CompletedUploadSize int
+}
+
 // AddUser adds or replaces a user entry in the server's user map.
 // It is safe to call concurrently with active connections.
 func (s *server) AddUser(username string, info UserInfo) {
@@ -467,24 +482,40 @@ func (s *server) RemoveUserKey(username string, key ssh.PublicKey) {
 	s.users[username] = u
 }
 
-// NewServer creates a new server with the given SFTP address, FTP address,
-// optional FTP passive data port range, user map, and host key. Pass ftpAddr as
-// "" to disable FTP. Leave ftpPassivePortRange empty to use OS-assigned passive
-// data ports.
+// DefaultIronportConfig returns a fresh server configuration with package
+// defaults applied. Callers should set Users and Signer before starting the
+// server.
+func DefaultIronportConfig() *ironportConfig {
+	return &ironportConfig{
+		Addr:                ":2022",
+		FtpAddr:             "",
+		FtpPassivePortRange: "5000-5010",
+		CompletedUploadSize: defaultCompletedUploadsSize,
+	}
+}
+
+// NewServer creates a new server from config. Pass FtpAddr as "" to disable
+// FTP. Leave FtpPassivePortRange empty to use OS-assigned passive data ports.
 //
-// completedUploadsSize sets the buffer capacity of the CompletedUploads
-// channel. Pass a positive integer to set an explicit capacity; non-positive
-// values fall back to the default capacity of 64:
+// CompletedUploadSize sets the buffer capacity of the CompletedUploads channel.
+// A non-positive value falls back to the package default (64):
 //
-//	srv := ironport.NewServer(":2022", "", "", users, signer, 256)
-func NewServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserInfo, signer ssh.Signer, completedUploadsSize int) *server {
+//	cfg := ironport.DefaultIronportConfig()
+//	cfg.Users = users
+//	cfg.Signer = signer
+//	cfg.CompletedUploadSize = 256
+//	srv := ironport.NewServer(cfg)
+func NewServer(config *ironportConfig) *server {
+	if config == nil {
+		config = DefaultIronportConfig()
+	}
 	s := &server{
-		Addr:                addr,
-		FTPAddr:             ftpAddr,
-		FTPPassivePortRange: ftpPassivePortRange,
-		users:               cloneUsers(users),
-		signer:              signer,
-		completedUploads:    newCompletedUploadsChannel(completedUploadsSize),
+		Addr:                config.Addr,
+		FTPAddr:             config.FtpAddr,
+		FTPPassivePortRange: config.FtpPassivePortRange,
+		users:               cloneUsers(config.Users),
+		signer:              config.Signer,
+		completedUploads:    newCompletedUploadsChannel(config.CompletedUploadSize),
 		activeConns:         make(map[net.Conn]struct{}),
 	}
 	return s
@@ -553,8 +584,8 @@ func (s *server) completedUploadsChan() chan CompletedUpload {
 // consumer never stalls an upload. Callers should drain the stream
 // continuously.
 //
-// The buffer capacity is set by the completedUploadsSize argument of
-// NewServer. A non-positive value falls back to the package default (64).
+// The buffer capacity is set by ironportConfig.CompletedUploadSize. A
+// non-positive value falls back to the package default (64).
 func (s *server) CompletedUploads() <-chan CompletedUpload {
 	return s.completedUploadsChan()
 }

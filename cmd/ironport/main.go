@@ -40,7 +40,14 @@ func main() {
 		signer = mustHostKey()
 	}
 
-	srv := ironport.NewServer(*sftpAddr, *ftpAddr, *ftpPassive, users, signer, 64)
+	config := ironport.DefaultIronportConfig()
+	config.Addr = *sftpAddr
+	config.FtpAddr = *ftpAddr
+	config.FtpPassivePortRange = *ftpPassive
+	config.Users = users
+	config.Signer = signer
+	config.CompletedUploadSize = 64
+	srv := ironport.NewServer(config)
 	srv.SSHAlgorithms = ironport.SSHAlgorithms{
 		KeyExchanges:            splitCSV(*sshKex),
 		Ciphers:                 splitCSV(*sshCiphers),

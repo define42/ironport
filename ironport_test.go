@@ -204,6 +204,17 @@ func testSigner(t *testing.T) ssh.Signer {
 	return signer
 }
 
+func newTestServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserInfo, signer ssh.Signer, completedUploadsSize int) *server {
+	config := DefaultIronportConfig()
+	config.Addr = addr
+	config.FtpAddr = ftpAddr
+	config.FtpPassivePortRange = ftpPassivePortRange
+	config.Users = users
+	config.Signer = signer
+	config.CompletedUploadSize = completedUploadsSize
+	return NewServer(config)
+}
+
 // startTestServer launches a server on a random OS-assigned port and returns
 // the address and a cancel function that closes the listener.
 //
@@ -222,7 +233,7 @@ func startTestServer(t *testing.T, users map[string]UserInfo, configure ...func(
 	}
 	addr = ln.Addr().String()
 
-	srv = NewServer(addr, "", "", users, signer, defaultCompletedUploadsSize)
+	srv = newTestServer(addr, "", "", users, signer, defaultCompletedUploadsSize)
 	for _, fn := range configure {
 		if fn != nil {
 			fn(srv)
@@ -271,7 +282,7 @@ func dialSFTP(t *testing.T, addr, user, pass string) *sftp.Client {
 func startTestFTPServer(t *testing.T, users map[string]UserInfo, ftpPassivePortRange string) (srv *server, addr string, stop func()) {
 	t.Helper()
 
-	srv = NewServer("127.0.0.1:0", "127.0.0.1:0", ftpPassivePortRange, users, testSigner(t), defaultCompletedUploadsSize)
+	srv = newTestServer("127.0.0.1:0", "127.0.0.1:0", ftpPassivePortRange, users, testSigner(t), defaultCompletedUploadsSize)
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- srv.ListenAndServe()
@@ -496,7 +507,14 @@ func TestNewServer(t *testing.T) {
 		"alice": {Password: "pw", Root: "/tmp/alice", CanRead: true, CanWrite: true},
 	}
 	signer := testSigner(t)
-	srv := NewServer(":0", ":0", "5000-5010", users, signer, defaultCompletedUploadsSize)
+	config := DefaultIronportConfig()
+	config.Addr = ":0"
+	config.FtpAddr = ":0"
+	config.FtpPassivePortRange = "5000-5010"
+	config.Users = users
+	config.Signer = signer
+	config.CompletedUploadSize = defaultCompletedUploadsSize
+	srv := NewServer(config)
 	if srv.Addr != ":0" {
 		t.Errorf("Addr = %q; want :0", srv.Addr)
 	}
@@ -509,8 +527,43 @@ func TestNewServer(t *testing.T) {
 	if len(srv.users) != 1 {
 		t.Errorf("users len = %d; want 1", len(srv.users))
 	}
+	users["alice"] = UserInfo{Password: "changed", Root: "/tmp/changed"}
+	if got := srv.users["alice"].Password; got != "pw" {
+		t.Errorf("users map was not cloned; password = %q; want pw", got)
+	}
 	if srv.signer != signer {
 		t.Error("signer not set correctly")
+	}
+}
+
+func TestDefaultIronportConfig(t *testing.T) {
+	config := DefaultIronportConfig()
+	if config.Addr != ":2022" {
+		t.Errorf("Addr = %q; want :2022", config.Addr)
+	}
+	if config.FtpAddr != "" {
+		t.Errorf("FtpAddr = %q; want empty", config.FtpAddr)
+	}
+	if config.FtpPassivePortRange != "5000-5010" {
+		t.Errorf("FtpPassivePortRange = %q; want 5000-5010", config.FtpPassivePortRange)
+	}
+	if config.CompletedUploadSize != defaultCompletedUploadsSize {
+		t.Errorf("CompletedUploadSize = %d; want %d", config.CompletedUploadSize, defaultCompletedUploadsSize)
+	}
+	if config.Users != nil {
+		t.Error("Users is non-nil; want nil")
+	}
+	if config.Signer != nil {
+		t.Error("Signer is non-nil; want nil")
+	}
+
+	other := DefaultIronportConfig()
+	if config == other {
+		t.Fatal("DefaultIronportConfig returned the same pointer twice")
+	}
+	config.Addr = ":9999"
+	if other.Addr != ":2022" {
+		t.Errorf("second config Addr = %q after mutating first; want :2022", other.Addr)
 	}
 }
 
@@ -518,7 +571,7 @@ func TestSSHServerConfig_AppliesAlgorithmPins(t *testing.T) {
 	users := map[string]UserInfo{
 		"alice": {Password: "pw", Root: t.TempDir(), CanRead: true, CanWrite: true},
 	}
-	srv := NewServer(":0", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+	srv := newTestServer(":0", "", "", users, testSigner(t), defaultCompletedUploadsSize)
 	srv.SSHAlgorithms = SSHAlgorithms{
 		KeyExchanges:            []string{ssh.KeyExchangeCurve25519},
 		Ciphers:                 []string{ssh.CipherAES256CTR},
@@ -629,14 +682,26 @@ func TestCompletedUploadsBufferSize(t *testing.T) {
 		"u": {Password: "pw", Root: t.TempDir(), CanWrite: true},
 	}
 
-	// Default capacity: a non-positive constructor value selects defaultCompletedUploadsSize.
-	srv := NewServer(":0", "", "", users, signer, 0)
+	// Default capacity: a non-positive config value selects defaultCompletedUploadsSize.
+	config := DefaultIronportConfig()
+	config.Addr = ":0"
+	config.FtpPassivePortRange = ""
+	config.Users = users
+	config.Signer = signer
+	config.CompletedUploadSize = 0
+	srv := NewServer(config)
 	if cap(srv.CompletedUploads()) != defaultCompletedUploadsSize {
 		t.Errorf("default cap = %d; want %d", cap(srv.CompletedUploads()), defaultCompletedUploadsSize)
 	}
 
-	// Custom capacity via NewServer required parameter.
-	srv2 := NewServer(":0", "", "", users, signer, 256)
+	// Custom capacity via NewServer config.
+	config2 := DefaultIronportConfig()
+	config2.Addr = ":0"
+	config2.FtpPassivePortRange = ""
+	config2.Users = users
+	config2.Signer = signer
+	config2.CompletedUploadSize = 256
+	srv2 := NewServer(config2)
 	if cap(srv2.CompletedUploads()) != 256 {
 		t.Errorf("custom cap via NewServer = %d; want 256", cap(srv2.CompletedUploads()))
 	}
@@ -970,7 +1035,7 @@ func TestServer_AddUser_ClonesAuthorizedKeys(t *testing.T) {
 	keys := make([]ssh.PublicKey, 1, 2)
 	keys[0] = pubKey1
 
-	srv := NewServer(":0", "", "", map[string]UserInfo{}, testSigner(t), defaultCompletedUploadsSize)
+	srv := newTestServer(":0", "", "", map[string]UserInfo{}, testSigner(t), defaultCompletedUploadsSize)
 	srv.AddUser("alice", UserInfo{
 		Password:       "pw",
 		AuthorizedKeys: keys,
@@ -1152,7 +1217,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 	}
 	addr := ln.Addr().String()
 
-	srv := NewServer(addr, "", "", users, signer, defaultCompletedUploadsSize)
+	srv := newTestServer(addr, "", "", users, signer, defaultCompletedUploadsSize)
 	cfg := srv.sshServerConfig()
 
 	go func() {
@@ -1643,7 +1708,7 @@ func TestSFTPServer_PasswordAuth_ValidatesJailRoot(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := NewServer(":0", "", "", map[string]UserInfo{
+			srv := newTestServer(":0", "", "", map[string]UserInfo{
 				"alice": {Password: "alicepw", Root: tc.root, CanRead: true, CanWrite: true},
 			}, testSigner(t), defaultCompletedUploadsSize)
 			cfg := srv.sshServerConfig()
@@ -1668,7 +1733,7 @@ func TestSFTPServer_PasswordAuth_ValidatesJailRoot(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatalf("os.Symlink: %v", err)
 	}
-	srv := NewServer(":0", "", "", map[string]UserInfo{
+	srv := newTestServer(":0", "", "", map[string]UserInfo{
 		"alice": {Password: "alicepw", Root: link, CanRead: true, CanWrite: true},
 	}, testSigner(t), defaultCompletedUploadsSize)
 	cfg := srv.sshServerConfig()
@@ -1700,7 +1765,7 @@ func TestSFTPServer_PublicKeyAuth_RejectsInvalidJailRoot(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := NewServer(":0", "", "", map[string]UserInfo{
+			srv := newTestServer(":0", "", "", map[string]UserInfo{
 				"alice": {AuthorizedKeys: []ssh.PublicKey{clientPubKey}, Root: tc.root, CanRead: true, CanWrite: true},
 			}, testSigner(t), defaultCompletedUploadsSize)
 			cfg := srv.sshServerConfig()
@@ -1728,7 +1793,7 @@ func TestNewServer_ClonesUsersMapAndAuthorizedKeys(t *testing.T) {
 		},
 	}
 
-	srv := NewServer(":0", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+	srv := newTestServer(":0", "", "", users, testSigner(t), defaultCompletedUploadsSize)
 
 	users["alice"] = UserInfo{Password: "pw2", Root: root}
 	delete(users, "alice")
@@ -1832,7 +1897,7 @@ func TestServer_AddUserKey_NoDuplicate(t *testing.T) {
 	root := t.TempDir()
 	_, pubKey := testClientKey(t)
 
-	srv := NewServer(":0", "", "", map[string]UserInfo{
+	srv := newTestServer(":0", "", "", map[string]UserInfo{
 		"carol": {Root: root, CanRead: true},
 	}, testSigner(t), defaultCompletedUploadsSize)
 
@@ -1852,7 +1917,7 @@ func TestServer_AddUserKey_NoDuplicate(t *testing.T) {
 // TestServer_AddRemoveUserKey_NonExistentUser verifies that calling AddUserKey
 // or RemoveUserKey for a user that does not exist is a safe no-op.
 func TestServer_AddRemoveUserKey_NonExistentUser(t *testing.T) {
-	srv := NewServer(":0", "", "", map[string]UserInfo{}, testSigner(t), defaultCompletedUploadsSize)
+	srv := newTestServer(":0", "", "", map[string]UserInfo{}, testSigner(t), defaultCompletedUploadsSize)
 	_, pub := testClientKey(t)
 
 	// Neither call should panic or create phantom entries.
@@ -1898,7 +1963,7 @@ func TestServer_NilKeyInAuthorizedKeys(t *testing.T) {
 func TestServer_AddUserKey_NilKey(t *testing.T) {
 	root := t.TempDir()
 	_, pub := testClientKey(t)
-	srv := NewServer(":0", "", "", map[string]UserInfo{
+	srv := newTestServer(":0", "", "", map[string]UserInfo{
 		"eve": {AuthorizedKeys: []ssh.PublicKey{pub}, Root: root, CanRead: true},
 	}, testSigner(t), defaultCompletedUploadsSize)
 
@@ -1918,7 +1983,7 @@ func TestServer_AddUserKey_NilKey(t *testing.T) {
 func TestServer_RemoveUserKey_NilEntry(t *testing.T) {
 	root := t.TempDir()
 	_, pub := testClientKey(t)
-	srv := NewServer(":0", "", "", map[string]UserInfo{
+	srv := newTestServer(":0", "", "", map[string]UserInfo{
 		"frank": {
 			// Mix nil entries with a real key.
 			AuthorizedKeys: []ssh.PublicKey{nil, pub, nil},
@@ -1946,7 +2011,7 @@ func TestServer_RemoveUserKey_NilEntry(t *testing.T) {
 func TestServer_RemoveUserKey_NilKey(t *testing.T) {
 	root := t.TempDir()
 	_, pub := testClientKey(t)
-	srv := NewServer(":0", "", "", map[string]UserInfo{
+	srv := newTestServer(":0", "", "", map[string]UserInfo{
 		"grace": {AuthorizedKeys: []ssh.PublicKey{pub}, Root: root, CanRead: true},
 	}, testSigner(t), defaultCompletedUploadsSize)
 
@@ -2463,7 +2528,7 @@ func TestServer_ListenAndServe_Close(t *testing.T) {
 	}
 	signer := testSigner(t)
 
-	srv := NewServer("127.0.0.1:0", "", "", users, signer, defaultCompletedUploadsSize)
+	srv := newTestServer("127.0.0.1:0", "", "", users, signer, defaultCompletedUploadsSize)
 
 	errc := make(chan error, 1)
 	go func() {
@@ -2518,7 +2583,7 @@ func TestServer_ListenAndServe_Close(t *testing.T) {
 // TestServer_Close_BeforeListenAndServe verifies that calling Close before
 // ListenAndServe is a safe no-op and does not panic or return an error.
 func TestServer_Close_BeforeListenAndServe(t *testing.T) {
-	srv := NewServer(":0", "", "", map[string]UserInfo{}, testSigner(t), defaultCompletedUploadsSize)
+	srv := newTestServer(":0", "", "", map[string]UserInfo{}, testSigner(t), defaultCompletedUploadsSize)
 	if err := srv.Close(); err != nil {
 		t.Errorf("Close before ListenAndServe returned %v; want nil", err)
 	}
@@ -2529,7 +2594,7 @@ func TestServer_Close_BeforeListenAndServe(t *testing.T) {
 // errCh and call Shutdown/Close to stop the server.
 func startListenAndServe(t *testing.T, users map[string]UserInfo) (srv *server, addr string, errCh chan error) {
 	t.Helper()
-	srv = NewServer("127.0.0.1:0", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+	srv = newTestServer("127.0.0.1:0", "", "", users, testSigner(t), defaultCompletedUploadsSize)
 	errCh = make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()
 
@@ -2664,7 +2729,7 @@ func TestServer_Shutdown_ForceClosesOnContextDeadline(t *testing.T) {
 
 // TestServer_Shutdown_BeforeListenAndServe is a no-op and must not block.
 func TestServer_Shutdown_BeforeListenAndServe(t *testing.T) {
-	srv := NewServer(":0", "", "", map[string]UserInfo{}, testSigner(t), defaultCompletedUploadsSize)
+	srv := newTestServer(":0", "", "", map[string]UserInfo{}, testSigner(t), defaultCompletedUploadsSize)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
@@ -2676,7 +2741,7 @@ func TestServer_Shutdown_BeforeListenAndServe(t *testing.T) {
 // shut down it cannot be restarted; ListenAndServe returns a sentinel error
 // instead of silently spinning a refusing accept loop.
 func TestServer_ListenAndServe_AfterShutdown(t *testing.T) {
-	srv := NewServer("127.0.0.1:0", "", "", map[string]UserInfo{}, testSigner(t), defaultCompletedUploadsSize)
+	srv := newTestServer("127.0.0.1:0", "", "", map[string]UserInfo{}, testSigner(t), defaultCompletedUploadsSize)
 	if err := srv.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
@@ -2790,7 +2855,7 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
 	signer := testSigner(t)
-	srv := NewServer("127.0.0.1:0", "", "", users, signer, defaultCompletedUploadsSize)
+	srv := newTestServer("127.0.0.1:0", "", "", users, signer, defaultCompletedUploadsSize)
 	cfg := srv.sshServerConfig()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
