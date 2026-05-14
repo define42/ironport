@@ -11,8 +11,9 @@
 //   - Optional SSH algorithm pinning for key exchange, ciphers, MACs, and public-key auth signatures.
 //   - Graceful shutdown via Close; upload-completion notifications via CompletedUploads;
 //     authentication/session notifications via AuthEvents.
-//   - Optional passive-mode FTP listener sharing the same users, jails, permissions,
+//   - Optional FTP listener sharing the same users, jails, permissions,
 //     temp-extension handling, CompletedUploads stream, and AuthEvents stream as SFTP.
+//     FTP uses passive mode by default; active mode can be enabled explicitly.
 //
 // Typical usage:
 //
@@ -75,7 +76,8 @@ const (
 	// not finish cleanly.
 	ftpDataIdleTimeout = 5 * time.Minute
 	// defaultFTPDataAcceptTimeout bounds how long a passive-mode FTP data
-	// listener waits for the client to connect after PASV/EPSV.
+	// listener waits after PASV/EPSV and how long an active-mode FTP dial may
+	// take after PORT/EPRT.
 	defaultFTPDataAcceptTimeout = 30 * time.Second
 	// defaultCompletedUploadsSize is the fallback buffer size used for the
 	// CompletedUploads channel.
@@ -422,9 +424,12 @@ type Server struct {
 	// to let the OS choose any available port.
 	ftpPassivePortRange string
 	// ftpDataAcceptTimeout bounds how long passive-mode FTP data listeners wait
-	// for the client data connection after PASV/EPSV. Zero selects the package
-	// default; negative disables the deadline.
+	// after PASV/EPSV and how long active-mode FTP dials may take after
+	// PORT/EPRT. Zero selects the package default; negative disables the deadline.
 	ftpDataAcceptTimeout time.Duration
+	// ftpAllowActiveMode controls whether FTP PORT/EPRT commands may ask the
+	// server to dial an active-mode data connection back to the client IP.
+	ftpAllowActiveMode bool
 	// users maps usernames to their credentials and jail roots.
 	users map[string]UserInfo
 	// mu protects users, completedUploads, authEvents, and listeners for concurrent reads and writes.
@@ -514,13 +519,18 @@ type Config struct {
 	FtpAddr             string
 	FtpPassivePortRange string
 	// FtpDataAcceptTimeout bounds how long passive-mode FTP data listeners wait
-	// for the client data connection after PASV/EPSV. Zero selects the package
-	// default (30 seconds); negative disables the deadline.
+	// for the client data connection after PASV/EPSV, and how long active-mode
+	// FTP dials may take after PORT/EPRT. Zero selects the package default
+	// (30 seconds); negative disables the deadline.
 	FtpDataAcceptTimeout time.Duration
-	Users                map[string]UserInfo
-	SftpSigner           ssh.Signer
-	CompletedUploadSize  int
-	AuthEventSize        int
+	// FtpAllowActiveMode enables FTP active mode (PORT/EPRT). It defaults to
+	// false because active mode requires outbound connections from the server.
+	// When enabled, this server only dials the same IP as the control connection.
+	FtpAllowActiveMode  bool
+	Users               map[string]UserInfo
+	SftpSigner          ssh.Signer
+	CompletedUploadSize int
+	AuthEventSize       int
 	// SSHKeyExchanges, SSHCiphers, SSHMACs, and
 	// SSHPublicKeyAuthAlgorithms optionally pin SSH negotiation and public-key
 	// auth signature algorithms. Nil slices use golang.org/x/crypto/ssh
@@ -690,6 +700,7 @@ func NewServer(config *Config) *Server {
 		ftpAddr:                    config.FtpAddr,
 		ftpPassivePortRange:        config.FtpPassivePortRange,
 		ftpDataAcceptTimeout:       config.FtpDataAcceptTimeout,
+		ftpAllowActiveMode:         config.FtpAllowActiveMode,
 		users:                      cloneUsers(config.Users),
 		sftpSigner:                 config.SftpSigner,
 		completedUploads:           newCompletedUploadsChannel(config.CompletedUploadSize),
@@ -1104,9 +1115,9 @@ func (s *Server) effectiveIdleTimeout() time.Duration {
 	return resolveDur(s.idleTimeout, defaultSFTPIdleTimeout)
 }
 
-// effectiveFTPDataAcceptTimeout returns the effective passive data-connection
-// accept timeout. A zero configured timeout selects the package default; a
-// negative timeout disables the deadline.
+// effectiveFTPDataAcceptTimeout returns the effective FTP data-connection
+// setup timeout. A zero configured timeout selects the package default; a
+// negative timeout disables the passive accept or active dial deadline.
 func (s *Server) effectiveFTPDataAcceptTimeout() time.Duration {
 	return resolveDur(s.ftpDataAcceptTimeout, defaultFTPDataAcceptTimeout)
 }
@@ -2012,9 +2023,10 @@ func listerFromFileInfo(infos []os.FileInfo) sftp.ListerAt {
 	return fileInfoLister{infos: infos}
 }
 
-// FTP implementation. It is deliberately passive-mode only. Active FTP (PORT / EPRT)
-// is disabled because it is harder to firewall safely and opens client-chosen
-// outbound connections from the server.
+// FTP implementation. Passive mode is the default. Active FTP (PORT / EPRT)
+// is opt-in because it is harder to firewall safely and opens outbound
+// connections from the server; when enabled, active targets are restricted to
+// the control connection's peer IP.
 
 // ftpCtlMsg is one item produced by the control-reader goroutine: either a
 // raw control-protocol line (terminator stripped by the receiver) or the
@@ -2036,6 +2048,8 @@ type ftpSession struct {
 	authenticated bool
 	cwd           string
 	dataLn        net.Listener
+	dataAddr      *net.TCPAddr
+	epsvAll       bool
 	rnfrPath      string
 	restartOffset int64
 	// expectedUploadSize is the byte count declared by the client via the
@@ -2083,7 +2097,7 @@ func (s *Server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- Co
 		for range sess.ctlMsg {
 		}
 	}()
-	defer sess.closeDataListener()
+	defer sess.closeDataEndpoint()
 	defer sess.closeJail()
 	defer sess.logoutIfAuthenticated()
 
@@ -2251,7 +2265,7 @@ func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
 		return false
 
 	case "FEAT":
-		_ = f.multilineReply(211, "Features:", []string{
+		features := []string{
 			"UTF8",
 			"EPSV",
 			"PASV",
@@ -2263,7 +2277,11 @@ func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
 			"TVFS",
 			"LANG en-US*",
 			"HOST",
-		}, "End")
+		}
+		if f.server.ftpAllowActiveMode {
+			features = append(features, "EPRT")
+		}
+		_ = f.multilineReply(211, "Features:", features, "End")
 		return false
 
 	case "HELP":
@@ -2346,10 +2364,19 @@ func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
 		f.enterPassive(false)
 
 	case "EPSV":
-		f.enterPassive(true)
+		if strings.EqualFold(strings.TrimSpace(arg), "ALL") {
+			f.closeDataEndpoint()
+			f.epsvAll = true
+			_ = f.reply(200, "EPSV ALL ok")
+		} else {
+			f.enterPassive(true)
+		}
 
-	case "PORT", "EPRT":
-		_ = f.reply(502, "active mode is disabled; use PASV or EPSV")
+	case "PORT":
+		f.enterActivePORT(arg)
+
+	case "EPRT":
+		f.enterActiveEPRT(arg)
 
 	case "LIST":
 		f.cmdList(arg, false)
@@ -2579,7 +2606,7 @@ func (f *ftpSession) cmdCWD(arg string) {
 }
 
 func (f *ftpSession) enterPassive(epsv bool) {
-	f.closeDataListener()
+	f.closeDataEndpoint()
 
 	host, _, err := net.SplitHostPort(f.conn.LocalAddr().String())
 	if err != nil || host == "" {
@@ -2612,33 +2639,151 @@ func (f *ftpSession) enterPassive(epsv bool) {
 	_ = f.reply(227, fmt.Sprintf("Entering Passive Mode (%d,%d,%d,%d,%d,%d)", v4[0], v4[1], v4[2], v4[3], p1, p2))
 }
 
-func (f *ftpSession) acceptDataConn() (net.Conn, error) {
-	if f.dataLn == nil {
-		return nil, errors.New("passive mode not enabled")
-	}
-	ln := f.dataLn
-	f.dataLn = nil
-	defer func() { _ = ln.Close() }()
-
-	if tcpLn, ok := ln.(*net.TCPListener); ok {
-		if timeout := f.server.effectiveFTPDataAcceptTimeout(); timeout > 0 {
-			_ = tcpLn.SetDeadline(time.Now().Add(timeout))
-		}
+func (f *ftpSession) enterActivePORT(arg string) {
+	f.closeDataEndpoint()
+	if !f.activeModeAllowed() {
+		_ = f.reply(502, "active mode is disabled; use PASV or EPSV")
+		return
 	}
 
-	dc, err := ln.Accept()
+	addr, err := parseFTPPORTArg(arg)
 	if err != nil {
-		return nil, err
+		_ = f.reply(501, "invalid PORT")
+		return
+	}
+	f.enterActive(addr)
+}
+
+func (f *ftpSession) enterActiveEPRT(arg string) {
+	f.closeDataEndpoint()
+	if !f.activeModeAllowed() {
+		_ = f.reply(502, "active mode is disabled; use PASV or EPSV")
+		return
 	}
 
-	// Prevent passive data-port stealing by requiring the data connection to
-	// originate from the same IP as the control connection.
-	if f.clientIP != "" && remoteIP(dc.RemoteAddr()) != f.clientIP {
-		_ = dc.Close()
-		return nil, fmt.Errorf("data connection from unexpected IP %s", remoteIP(dc.RemoteAddr()))
+	addr, err := parseFTPEPRTArg(arg)
+	if err != nil {
+		_ = f.reply(501, "invalid EPRT")
+		return
+	}
+	f.enterActive(addr)
+}
+
+func (f *ftpSession) activeModeAllowed() bool {
+	return f.server.ftpAllowActiveMode && !f.epsvAll
+}
+
+func (f *ftpSession) enterActive(addr *net.TCPAddr) {
+	if !f.activeTargetAllowed(addr.IP) {
+		_ = f.reply(501, "active target address not allowed")
+		return
+	}
+	f.closeDataEndpoint()
+	f.dataAddr = addr
+	_ = f.reply(200, "active mode ready")
+}
+
+func (f *ftpSession) activeTargetAllowed(ip net.IP) bool {
+	clientIP := net.ParseIP(f.clientIP)
+	return clientIP != nil && ip != nil && ip.Equal(clientIP)
+}
+
+func parseFTPPORTArg(arg string) (*net.TCPAddr, error) {
+	parts := strings.Split(strings.TrimSpace(arg), ",")
+	if len(parts) != 6 {
+		return nil, errors.New("invalid PORT")
+	}
+	values := make([]int, len(parts))
+	for i, part := range parts {
+		n, err := strconv.Atoi(strings.TrimSpace(part))
+		if err != nil || n < 0 || n > 255 {
+			return nil, errors.New("invalid PORT")
+		}
+		values[i] = n
+	}
+	port := values[4]*256 + values[5]
+	if port <= 0 || port > 65535 {
+		return nil, errors.New("invalid PORT")
+	}
+	return &net.TCPAddr{
+		IP:   net.IPv4(byte(values[0]), byte(values[1]), byte(values[2]), byte(values[3])),
+		Port: port,
+	}, nil
+}
+
+func parseFTPEPRTArg(arg string) (*net.TCPAddr, error) {
+	arg = strings.TrimSpace(arg)
+	if len(arg) < 5 {
+		return nil, errors.New("invalid EPRT")
+	}
+	delim := arg[:1]
+	parts := strings.Split(arg[1:], delim)
+	if len(parts) != 4 || parts[3] != "" {
+		return nil, errors.New("invalid EPRT")
+	}
+	family, addrText, portText := parts[0], parts[1], parts[2]
+	ip := net.ParseIP(addrText)
+	if ip == nil {
+		return nil, errors.New("invalid EPRT")
+	}
+	switch family {
+	case "1":
+		ip = ip.To4()
+		if ip == nil {
+			return nil, errors.New("invalid EPRT")
+		}
+	case "2":
+		if ip.To4() != nil {
+			return nil, errors.New("invalid EPRT")
+		}
+	default:
+		return nil, errors.New("invalid EPRT")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port <= 0 || port > 65535 {
+		return nil, errors.New("invalid EPRT")
+	}
+	return &net.TCPAddr{IP: ip, Port: port}, nil
+}
+
+func (f *ftpSession) acceptDataConn() (net.Conn, error) {
+	if f.dataLn != nil {
+		ln := f.dataLn
+		f.dataLn = nil
+		defer func() { _ = ln.Close() }()
+
+		if tcpLn, ok := ln.(*net.TCPListener); ok {
+			if timeout := f.server.effectiveFTPDataAcceptTimeout(); timeout > 0 {
+				_ = tcpLn.SetDeadline(time.Now().Add(timeout))
+			}
+		}
+
+		dc, err := ln.Accept()
+		if err != nil {
+			return nil, err
+		}
+
+		// Prevent passive data-port stealing by requiring the data connection to
+		// originate from the same IP as the control connection.
+		if f.clientIP != "" && remoteIP(dc.RemoteAddr()) != f.clientIP {
+			_ = dc.Close()
+			return nil, fmt.Errorf("data connection from unexpected IP %s", remoteIP(dc.RemoteAddr()))
+		}
+
+		return dc, nil
 	}
 
-	return dc, nil
+	if f.dataAddr != nil {
+		addr := f.dataAddr
+		f.dataAddr = nil
+		dialer := net.Dialer{}
+		if timeout := f.server.effectiveFTPDataAcceptTimeout(); timeout > 0 {
+			dialer.Timeout = timeout
+		}
+		return dialer.Dial("tcp", addr.String())
+	}
+
+	return nil, errors.New("data connection not prepared")
 }
 
 func (f *ftpSession) closeDataListener() {
@@ -2646,6 +2791,11 @@ func (f *ftpSession) closeDataListener() {
 		_ = f.dataLn.Close()
 		f.dataLn = nil
 	}
+}
+
+func (f *ftpSession) closeDataEndpoint() {
+	f.closeDataListener()
+	f.dataAddr = nil
 }
 
 // runTransfer executes work on dc while watching the control connection
@@ -2996,17 +3146,26 @@ func (f *ftpSession) announceUpload(ftpPath, fullPath string) {
 func (f *ftpSession) cmdHelp(arg string) {
 	arg = strings.TrimSpace(arg)
 	if arg != "" {
-		_ = f.reply(214, fmt.Sprintf("%s command recognized", strings.ToUpper(arg)))
+		upper := strings.ToUpper(arg)
+		if (upper == "PORT" || upper == "EPRT") && !f.server.ftpAllowActiveMode {
+			_ = f.reply(502, "active mode is disabled; use PASV or EPSV")
+			return
+		}
+		_ = f.reply(214, fmt.Sprintf("%s command recognized", upper))
 		return
 	}
-	_ = f.multilineReply(214, "The following commands are recognized:", []string{
+	lines := []string{
 		"USER PASS QUIT NOOP SYST FEAT HELP STAT",
 		"PWD CWD CDUP TYPE MODE STRU OPTS REIN",
 		"PASV EPSV LIST NLST MLST MLSD",
 		"RETR STOR APPE ALLO REST SIZE MDTM",
 		"DELE MKD RMD RNFR RNTO ABOR",
 		"LANG HOST",
-	}, "End")
+	}
+	if f.server.ftpAllowActiveMode {
+		lines = append(lines, "PORT EPRT")
+	}
+	_ = f.multilineReply(214, "The following commands are recognized:", lines, "End")
 }
 
 // cmdLang answers the LANG command (RFC 2640). The server's only output
@@ -3052,13 +3211,14 @@ func (f *ftpSession) cmdHost(arg string) {
 // authentication state and returns the session to the pre-login state without
 // closing the control connection. Any pending data transfer is aborted.
 func (f *ftpSession) cmdRein() {
-	f.closeDataListener()
+	f.closeDataEndpoint()
 	f.logoutIfAuthenticated()
 	f.username = ""
 	f.cwd = "/"
 	f.rnfrPath = ""
 	f.restartOffset = 0
 	f.expectedUploadSize = 0
+	f.epsvAll = false
 	// The session is no longer tied to the previous user; clear the
 	// connection's user association so a RemoveUser for that name does not
 	// kick this now-anonymous session.

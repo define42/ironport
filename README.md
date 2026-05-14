@@ -169,8 +169,8 @@ For RSA host-key signature pinning, pass a signer already restricted with
 
 ## FTP support (plaintext, opt-in)
 
-This package also exposes a passive-mode FTP listener that shares the SFTP
-user database, jails, and permission flags. **FTP transmits credentials and
+This package also exposes an FTP listener that shares the SFTP user database,
+jails, and permission flags. **FTP transmits credentials and
 data in the clear and this server does not implement FTPS.** FTP is therefore
 disabled by default; enable it only on a trusted network segment where you
 control all clients and intermediate hops:
@@ -182,14 +182,17 @@ config.SftpSigner = signer
 config.FtpAddr = ":2121"
 config.FtpPassivePortRange = "5000-5010"
 config.FtpDataAcceptTimeout = 30 * time.Second // zero selects this default
+config.FtpAllowActiveMode = false              // opt in to PORT/EPRT when needed
 srv := ironport.NewServer(config)
 ```
 
-When FTP is enabled, only passive mode (`PASV` / `EPSV`) is supported; active
-mode (`PORT` / `EPRT`) is refused, and the data connection peer IP is checked
-against the control connection to prevent passive-port stealing. Passive data
-listeners wait up to `FtpDataAcceptTimeout` for the client to connect; set it
-negative to disable that deadline.
+When FTP is enabled, passive mode (`PASV` / `EPSV`) is supported by default.
+Active mode (`PORT` / `EPRT`) is refused unless `FtpAllowActiveMode` is true.
+Even then, the server only dials back to the same IP as the control connection
+to prevent FTP bounce behavior. Passive data connections are checked against the
+control connection IP to prevent passive-port stealing. Passive listeners and
+active dials wait up to `FtpDataAcceptTimeout`; set it negative to disable that
+deadline.
 
 ## Public-key authentication
 

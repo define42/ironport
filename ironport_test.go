@@ -221,6 +221,13 @@ func newTestServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]U
 	return NewServer(newTestConfig(addr, ftpAddr, ftpPassivePortRange, users, signer, completedUploadsSize))
 }
 
+func newTestFTPConfig(t *testing.T, users map[string]UserInfo, ftpPassivePortRange string, allowActive bool) *Config {
+	t.Helper()
+	config := newTestConfig("127.0.0.1:0", "127.0.0.1:0", ftpPassivePortRange, users, testSigner(t), defaultCompletedUploadsSize)
+	config.FtpAllowActiveMode = allowActive
+	return config
+}
+
 // startTestServer launches a server on a random OS-assigned port and returns
 // the address and a cancel function that closes the listener.
 func startTestServer(t *testing.T, users map[string]UserInfo) (srv *Server, addr string, stop func()) {
@@ -294,7 +301,19 @@ func dialSFTP(t *testing.T, addr, user, pass string) *sftp.Client {
 func startTestFTPServer(t *testing.T, users map[string]UserInfo, ftpPassivePortRange string) (srv *Server, addr string, stop func()) {
 	t.Helper()
 
-	srv = newTestServer("127.0.0.1:0", "127.0.0.1:0", ftpPassivePortRange, users, testSigner(t), defaultCompletedUploadsSize)
+	return startTestFTPServerWithConfig(t, newTestFTPConfig(t, users, ftpPassivePortRange, false))
+}
+
+func startTestFTPServerWithActive(t *testing.T, users map[string]UserInfo, ftpPassivePortRange string) (srv *Server, addr string, stop func()) {
+	t.Helper()
+
+	return startTestFTPServerWithConfig(t, newTestFTPConfig(t, users, ftpPassivePortRange, true))
+}
+
+func startTestFTPServerWithConfig(t *testing.T, config *Config) (srv *Server, addr string, stop func()) {
+	t.Helper()
+
+	srv = NewServer(config)
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- srv.ListenAndServe()
@@ -401,6 +420,52 @@ func (c *ftpTestClient) passiveConn() (net.Conn, int) {
 		c.t.Fatalf("net.DialTimeout(data): %v", err)
 	}
 	return dc, port
+}
+
+func listenFTPActiveData(t *testing.T) net.Listener {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen(active data): %v", err)
+	}
+	return ln
+}
+
+func acceptFTPActiveData(t *testing.T, ln net.Listener) net.Conn {
+	t.Helper()
+
+	if tcpLn, ok := ln.(*net.TCPListener); ok {
+		_ = tcpLn.SetDeadline(time.Now().Add(5 * time.Second))
+	}
+	dc, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("active data Accept: %v", err)
+	}
+	return dc
+}
+
+func (c *ftpTestClient) activePORTListener() net.Listener {
+	c.t.Helper()
+
+	ln := listenFTPActiveData(c.t)
+	addr := ln.Addr().(*net.TCPAddr)
+	ip := addr.IP.To4()
+	if ip == nil {
+		_ = ln.Close()
+		c.t.Fatalf("active listener IP = %v; want IPv4", addr.IP)
+	}
+	c.command(200, "PORT %d,%d,%d,%d,%d,%d", ip[0], ip[1], ip[2], ip[3], addr.Port/256, addr.Port%256)
+	return ln
+}
+
+func (c *ftpTestClient) activeEPRTListener() net.Listener {
+	c.t.Helper()
+
+	ln := listenFTPActiveData(c.t)
+	addr := ln.Addr().(*net.TCPAddr)
+	c.command(200, "EPRT |1|%s|%d|", addr.IP.String(), addr.Port)
+	return ln
 }
 
 func requireAuthEvent(t *testing.T, events <-chan AuthEvent, eventType AuthEventType, username, protocol string) AuthEvent {
@@ -635,6 +700,7 @@ func TestNewServer(t *testing.T) {
 	config.FtpAddr = ":0"
 	config.FtpPassivePortRange = "5000-5010"
 	config.FtpDataAcceptTimeout = 17 * time.Second
+	config.FtpAllowActiveMode = true
 	config.Users = users
 	config.SftpSigner = signer
 	config.CompletedUploadSize = defaultCompletedUploadsSize
@@ -651,6 +717,9 @@ func TestNewServer(t *testing.T) {
 	}
 	if srv.ftpDataAcceptTimeout != 17*time.Second {
 		t.Errorf("ftpDataAcceptTimeout = %v; want 17s", srv.ftpDataAcceptTimeout)
+	}
+	if !srv.ftpAllowActiveMode {
+		t.Error("ftpAllowActiveMode = false; want true")
 	}
 	if len(srv.users) != 1 {
 		t.Errorf("users len = %d; want 1", len(srv.users))
@@ -680,6 +749,9 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if config.FtpDataAcceptTimeout != 0 {
 		t.Errorf("FtpDataAcceptTimeout = %v; want 0", config.FtpDataAcceptTimeout)
+	}
+	if config.FtpAllowActiveMode {
+		t.Error("FtpAllowActiveMode = true; want false")
 	}
 	if config.CompletedUploadSize != defaultCompletedUploadsSize {
 		t.Errorf("CompletedUploadSize = %d; want %d", config.CompletedUploadSize, defaultCompletedUploadsSize)
@@ -6046,13 +6118,7 @@ func TestFTPServer_BareCRDoesNotSmuggleCommands(t *testing.T) {
 	readPrefix("200")
 }
 
-// TestFTPServer_EPSVAllRejectsActiveMode documents the EPSV ALL contract
-// from RFC 2428: once a client sends EPSV ALL, the server must refuse
-// active-mode commands for the rest of the session. The server currently
-// does not track the EPSV-ALL state per-session, but PORT and EPRT are
-// rejected unconditionally — which means the user-visible contract holds
-// even without explicit state. EPSV must still work afterward.
-func TestFTPServer_EPSVAllRejectsActiveMode(t *testing.T) {
+func TestFTPServer_ActiveModeDisabledByDefault(t *testing.T) {
 	root := t.TempDir()
 	users := map[string]UserInfo{
 		"u": {Password: "p", Root: root, CanRead: true, CanWrite: true},
@@ -6063,14 +6129,150 @@ func TestFTPServer_EPSVAllRejectsActiveMode(t *testing.T) {
 	client := dialFTP(t, addr)
 	client.login("u", "p")
 
-	client.send("EPSV ALL")
-	code, _, err := client.tp.ReadResponse(0)
+	features := client.command(211, "FEAT")
+	if strings.Contains(features, "EPRT") {
+		t.Fatalf("FEAT response = %q; active EPRT must not be advertised by default", features)
+	}
+	help := client.command(214, "HELP")
+	if strings.Contains(help, "PORT EPRT") {
+		t.Fatalf("HELP response = %q; active commands must not be advertised by default", help)
+	}
+	client.command(502, "HELP PORT")
+	client.command(502, "HELP EPRT")
+	client.command(502, "PORT 127,0,0,1,4,210")
+	client.command(502, "EPRT |1|127.0.0.1|1234|")
+}
+
+func TestFTPServer_ActiveModeTransfers(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "download.txt"), []byte("retr-data"), 0644); err != nil {
+		t.Fatalf("os.WriteFile(download): %v", err)
+	}
+	users := map[string]UserInfo{
+		"u": {Password: "p", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestFTPServerWithActive(t, users, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("u", "p")
+
+	features := client.command(211, "FEAT")
+	if !strings.Contains(features, "EPRT") {
+		t.Fatalf("FEAT response = %q; want EPRT advertised when active mode is enabled", features)
+	}
+	help := client.command(214, "HELP")
+	if !strings.Contains(help, "PORT EPRT") {
+		t.Fatalf("HELP response = %q; want PORT/EPRT advertised when active mode is enabled", help)
+	}
+	client.command(214, "HELP PORT")
+	client.command(214, "HELP EPRT")
+
+	listLn := client.activePORTListener()
+	client.send("LIST")
+	client.read(150)
+	listDC := acceptFTPActiveData(t, listLn)
+	listData, err := io.ReadAll(listDC)
 	if err != nil {
-		t.Fatalf("ReadResponse(EPSV ALL): %v", err)
+		t.Fatalf("active LIST read: %v", err)
 	}
-	if code != 200 && code != 229 {
-		t.Fatalf("EPSV ALL got %d; want 200 (RFC 2428) or 229 (current behavior)", code)
+	_ = listDC.Close()
+	_ = listLn.Close()
+	client.read(226)
+	if !bytes.Contains(listData, []byte("download.txt")) {
+		t.Fatalf("active LIST data = %q; want download.txt", listData)
 	}
+
+	retrLn := client.activeEPRTListener()
+	client.send("RETR download.txt")
+	client.read(150)
+	retrDC := acceptFTPActiveData(t, retrLn)
+	retrData, err := io.ReadAll(retrDC)
+	if err != nil {
+		t.Fatalf("active RETR read: %v", err)
+	}
+	_ = retrDC.Close()
+	_ = retrLn.Close()
+	client.read(226)
+	if !bytes.Equal(retrData, []byte("retr-data")) {
+		t.Fatalf("active RETR data = %q; want retr-data", retrData)
+	}
+
+	storLn := client.activePORTListener()
+	client.send("STOR upload.txt")
+	client.read(150)
+	storDC := acceptFTPActiveData(t, storLn)
+	if _, err := storDC.Write([]byte("stor-data")); err != nil {
+		t.Fatalf("active STOR write: %v", err)
+	}
+	_ = storDC.Close()
+	_ = storLn.Close()
+	client.read(226)
+	if got, err := os.ReadFile(filepath.Join(root, "upload.txt")); err != nil {
+		t.Fatalf("os.ReadFile(upload): %v", err)
+	} else if !bytes.Equal(got, []byte("stor-data")) {
+		t.Fatalf("upload.txt = %q; want stor-data", got)
+	}
+	select {
+	case got := <-srv.CompletedUploads():
+		if got.Protocol != CompletedUploadProtocolFTP || got.FilePath != "/upload.txt" || got.ClientIP != "127.0.0.1" {
+			t.Fatalf("CompletedUpload = %+v; want FTP /upload.txt from 127.0.0.1", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for active STOR CompletedUpload")
+	}
+}
+
+func TestFTPServer_ActiveModeRejectsInvalidCommands(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"u": {Password: "p", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestFTPServerWithActive(t, users, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("u", "p")
+
+	client.command(501, "PORT 127,0,0,1,4")
+	client.command(501, "PORT 127,0,0,1,999,1")
+	client.command(501, "PORT 127,0,0,1,0,0")
+	client.command(501, "EPRT |1|127.0.0.1|")
+	client.command(501, "EPRT |3|127.0.0.1|1234|")
+	client.command(501, "EPRT |1|::1|1234|")
+	client.command(501, "EPRT |2|127.0.0.1|1234|")
+}
+
+func TestFTPServer_ActiveModeRejectsDifferentTargetIP(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"u": {Password: "p", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestFTPServerWithActive(t, users, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("u", "p")
+
+	client.command(501, "PORT 127,0,0,2,4,210")
+	client.command(501, "EPRT |1|127.0.0.2|1234|")
+}
+
+// TestFTPServer_EPSVAllRejectsActiveMode documents the EPSV ALL contract
+// from RFC 2428: once a client sends EPSV ALL, the server must refuse
+// active-mode commands for the rest of the session. EPSV must still work afterward.
+func TestFTPServer_EPSVAllRejectsActiveMode(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"u": {Password: "p", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestFTPServerWithActive(t, users, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("u", "p")
+
+	client.command(200, "EPSV ALL")
 
 	client.command(502, "PORT 127,0,0,1,4,210")
 	client.command(502, "EPRT |1|127.0.0.1|4000|")

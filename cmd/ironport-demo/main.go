@@ -17,6 +17,7 @@ func main() {
 	sftpAddr := flag.String("sftp-addr", ":2022", "TCP address to listen on for SFTP")
 	ftpAddr := flag.String("ftp-addr", "", "TCP address to listen on for plaintext FTP (empty to disable; credentials are sent in the clear, see README)")
 	ftpPassive := flag.String("ftp-passive", "5000-5010", "FTP passive-mode data port range (used only when -ftp-addr is set)")
+	ftpActive := flag.Bool("ftp-active", false, "enable FTP active mode PORT/EPRT (dials back only to the control connection IP)")
 	sshKex := flag.String("ssh-key-exchanges", "", "comma-separated SSH key-exchange algorithms to allow (empty uses defaults)")
 	sshCiphers := flag.String("ssh-ciphers", "", "comma-separated SSH cipher algorithms to allow (empty uses defaults)")
 	sshMACs := flag.String("ssh-macs", "", "comma-separated SSH MAC algorithms to allow (empty uses defaults)")
@@ -43,6 +44,7 @@ func main() {
 	config.SftpAddr = *sftpAddr
 	config.FtpAddr = *ftpAddr
 	config.FtpPassivePortRange = *ftpPassive
+	config.FtpAllowActiveMode = *ftpActive
 	config.Users = users
 	config.SftpSigner = signer
 	config.CompletedUploadSize = 64
