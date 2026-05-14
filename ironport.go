@@ -1048,11 +1048,11 @@ func deferRecoverSFTPHandlerPanic(username, clientIP string, r *sftp.Request, er
 	}
 }
 
-// recoverSFTPPanicf returns a deferred panic-recovery function for helpers that
+// deferRecoverSFTPPanicf returns a deferred panic-recovery function for helpers that
 // do not have an sftp.Request available for recoverSFTPHandlerPanic. format
 // must include two trailing verbs for the recovered panic value and stack trace
 // after args.
-func recoverSFTPPanicf(errp *error, onPanic func(), format string, args ...any) func() {
+func deferRecoverSFTPPanicf(errp *error, onPanic func(), format string, args ...any) func() {
 	return func() {
 		if recovered := recover(); recovered != nil {
 			allArgs := append(args, recovered, debug.Stack())
@@ -1528,7 +1528,7 @@ type writeLogger struct {
 }
 
 func (w *writeLogger) WriteAt(p []byte, off int64) (n int, err error) {
-	defer recoverSFTPPanicf(&err, func() { n = 0 }, "sftp write panic user=%q ip=%q path=%q: %v\n%s", w.username, w.clientIP, w.filepath)()
+	defer deferRecoverSFTPPanicf(&err, func() { n = 0 }, "sftp write panic user=%q ip=%q path=%q: %v\n%s", w.username, w.clientIP, w.filepath)()
 	if w.appendMode {
 		return w.Write(p)
 	}
@@ -1553,7 +1553,7 @@ func (w *writeLogger) TransferError(err error) {
 }
 
 func (w *writeLogger) Close() (err error) {
-	defer recoverSFTPPanicf(&err, nil, "sftp write close panic user=%q ip=%q path=%q: %v\n%s", w.username, w.clientIP, w.filepath)()
+	defer deferRecoverSFTPPanicf(&err, nil, "sftp write close panic user=%q ip=%q path=%q: %v\n%s", w.username, w.clientIP, w.filepath)()
 	err = w.File.Close()
 	w.mu.Lock()
 	transferErr := w.transferErr
@@ -1811,7 +1811,7 @@ func jailedHandlers(root, username, clientIP string, canRead, canWrite bool, upl
 type fileInfoLister struct{ infos []os.FileInfo }
 
 func (l fileInfoLister) ListAt(fis []os.FileInfo, offset int64) (n int, err error) {
-	defer recoverSFTPPanicf(&err, func() { n = 0 }, "sftp list panic offset=%d: %v\n%s", offset)()
+	defer deferRecoverSFTPPanicf(&err, func() { n = 0 }, "sftp list panic offset=%d: %v\n%s", offset)()
 	if offset < 0 {
 		return 0, os.ErrInvalid
 	}
