@@ -23,6 +23,7 @@ package ironport
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -229,30 +230,54 @@ func (j *jailFS) Stat(clientPath string) (os.FileInfo, error) {
 // metadata lookup also goes through the openat2-rooted directory and never
 // follows a symlink.
 func (j *jailFS) List(clientPath string) ([]os.FileInfo, error) {
+	var out []os.FileInfo
+	if err := j.ListStream(clientPath, func(info os.FileInfo) error {
+		out = append(out, info)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// listStreamBatch is the dirent batch size for ListStream. Small enough
+// to keep peak memory bounded on enormous directories, large enough to
+// amortise getdents and the per-batch goroutine context switch.
+const listStreamBatch = 512
+
+// ListStream invokes yield once per directory entry, pulling dirents in
+// fixed-size batches so a directory with millions of entries does not
+// have to be materialised in memory before being transmitted. Entries
+// that vanish between readdir and fstatat (race with a concurrent
+// unlink) are silently skipped — same tolerance as List. yield may
+// return a non-nil error to terminate the walk early; that error is
+// propagated to the caller unchanged.
+func (j *jailFS) ListStream(clientPath string, yield func(os.FileInfo) error) error {
 	rel := cleanRelClientPath(clientPath)
 	fd, err := j.openat(rel, os.O_RDONLY|unix.O_DIRECTORY, 0)
 	if err != nil {
-		return nil, &os.PathError{Op: "open", Path: clientPath, Err: err}
+		return &os.PathError{Op: "open", Path: clientPath, Err: err}
 	}
-	// Use os.NewFile with the on-disk path so any internal stat fallbacks
-	// resolve correctly; Readdirnames itself reads via getdents on the fd.
 	f := os.NewFile(uintptr(fd), j.fullPath(rel))
 	defer func() { _ = f.Close() }()
-	names, err := f.Readdirnames(-1)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]os.FileInfo, 0, len(names))
-	for _, name := range names {
-		var st unix.Stat_t
-		if err := unix.Fstatat(fd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-			// Entry vanished between readdir and fstatat (race with a
-			// concurrent unlink). Skip it rather than failing the listing.
-			continue
+	for {
+		names, readErr := f.Readdirnames(listStreamBatch)
+		for _, name := range names {
+			var st unix.Stat_t
+			if statErr := unix.Fstatat(fd, name, &st, unix.AT_SYMLINK_NOFOLLOW); statErr != nil {
+				continue
+			}
+			if yieldErr := yield(&statFileInfo{name: name, st: st}); yieldErr != nil {
+				return yieldErr
+			}
 		}
-		out = append(out, &statFileInfo{name: name, st: st})
+		if errors.Is(readErr, io.EOF) {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
+		}
 	}
-	return out, nil
 }
 
 // Mkdir creates a new directory at clientPath with the given permission.

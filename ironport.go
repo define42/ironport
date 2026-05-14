@@ -1833,6 +1833,16 @@ func listerFromFileInfo(infos []os.FileInfo) sftp.ListerAt {
 // is disabled because it is harder to firewall safely and opens client-chosen
 // outbound connections from the server.
 
+// ftpCtlMsg is one item produced by the control-reader goroutine: either a
+// raw control-protocol line (terminator stripped by the receiver) or the
+// error that ended the reader. After an error is delivered the reader
+// closes its channel, so the main loop and any in-flight transfer helper
+// see a single sentinel signalling session end.
+type ftpCtlMsg struct {
+	line string
+	err  error
+}
+
 type ftpSession struct {
 	server        *server
 	conn          net.Conn
@@ -1845,10 +1855,23 @@ type ftpSession struct {
 	dataLn        net.Listener
 	rnfrPath      string
 	restartOffset int64
-	clientIP      string
-	tempExts      []string
-	uploads       chan<- CompletedUpload
-	authEvents    chan<- AuthEvent
+	// expectedUploadSize is the byte count declared by the client via the
+	// most recent ALLO command; it is consumed by the next STOR/APPE so
+	// an aborted transfer cannot let the hint leak into a later command.
+	// When non-zero, STOR rejects transfers whose byte count does not
+	// match — the only reliable way to detect a client that truncates by
+	// half-closing the data connection in STREAM mode.
+	expectedUploadSize int64
+	// ctlMsg carries control-protocol lines from the reader goroutine to
+	// both the main command loop and any in-flight data transfer. Having
+	// a single producer/consumer pair makes ABOR mid-transfer possible:
+	// the transfer helper selects on this channel alongside the transfer
+	// goroutine's completion signal.
+	ctlMsg     chan ftpCtlMsg
+	clientIP   string
+	tempExts   []string
+	uploads    chan<- CompletedUpload
+	authEvents chan<- AuthEvent
 	// fs is the fd-relative filesystem backing this session's jail. It is
 	// constructed by authenticate on successful login and released when the
 	// session ends (closeJail). Until login succeeds it is nil.
@@ -1856,8 +1879,6 @@ type ftpSession struct {
 }
 
 func (s *server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) {
-	defer func() { _ = nc.Close() }()
-
 	sess := &ftpSession{
 		server:     s,
 		conn:       nc,
@@ -1868,7 +1889,17 @@ func (s *server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- Co
 		tempExts:   tempExts,
 		uploads:    uploads,
 		authEvents: authEvents,
+		ctlMsg:     make(chan ftpCtlMsg, 1),
 	}
+	// Close nc first, then drain the reader so its goroutine can exit.
+	// LIFO defer order means this runs last — after closeDataListener,
+	// closeJail, and logoutIfAuthenticated — so the reader keeps running
+	// in case those handlers want to reply on the control connection.
+	defer func() {
+		_ = nc.Close()
+		for range sess.ctlMsg {
+		}
+	}()
 	defer sess.closeDataListener()
 	defer sess.closeJail()
 	defer sess.logoutIfAuthenticated()
@@ -1877,38 +1908,77 @@ func (s *server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- Co
 		return
 	}
 
-	// Capture the configured idle timeout once at session start. Mutating
-	// The timeout is captured when the session starts, matching the SFTP
-	// per-session semantics. A zero value disables the
-	// deadline.
+	go sess.readControlLines()
+
+	// Capture the configured idle timeout once at session start, matching
+	// the SFTP per-session semantics. A zero value disables the deadline.
+	// The idle timer below is only armed while the main loop is between
+	// commands; an in-flight transfer is not counted as "idle" because
+	// runTransfer blocks the main loop until it completes.
 	idleTimeout := s.idleTimeout()
+	var idleTimer *time.Timer
+	var idleC <-chan time.Time
+	if idleTimeout > 0 {
+		idleTimer = time.NewTimer(idleTimeout)
+		idleC = idleTimer.C
+		defer idleTimer.Stop()
+	}
 	for {
-		if idleTimeout > 0 {
-			_ = nc.SetReadDeadline(time.Now().Add(idleTimeout))
-		} else {
-			_ = nc.SetReadDeadline(time.Time{})
+		if idleTimer != nil {
+			if !idleTimer.Stop() {
+				select {
+				case <-idleTimer.C:
+				default:
+				}
+			}
+			idleTimer.Reset(idleTimeout)
 		}
-		line, err := readFTPControlLine(sess.r, ftpMaxControlLineLen)
-		if err != nil {
-			if errors.Is(err, errFTPLineTooLong) {
-				_ = sess.reply(500, ftpErrMsg(err))
+		var msg ftpCtlMsg
+		var ok bool
+		select {
+		case msg, ok = <-sess.ctlMsg:
+			if !ok {
+				return
+			}
+		case <-idleC:
+			log.Printf("ftp control idle timeout from=%s", nc.RemoteAddr())
+			return
+		}
+		if msg.err != nil {
+			if errors.Is(msg.err, errFTPLineTooLong) {
+				_ = sess.reply(500, ftpErrMsg(msg.err))
 				log.Printf("ftp control read from=%s: line exceeded %d bytes", nc.RemoteAddr(), ftpMaxControlLineLen)
 				return
 			}
-			if !errors.Is(err, io.EOF) {
-				log.Printf("ftp control read from=%s: %v", nc.RemoteAddr(), err)
+			if !errors.Is(msg.err, io.EOF) {
+				log.Printf("ftp control read from=%s: %v", nc.RemoteAddr(), msg.err)
 			}
 			return
 		}
-		_ = nc.SetReadDeadline(time.Time{})
 
-		line = strings.TrimRight(line, "\r\n")
+		line := strings.TrimRight(msg.line, "\r\n")
 		if line == "" {
 			continue
 		}
 		cmd, arg := parseFTPCommand(line)
 		quit := sess.handleFTPCommand(cmd, arg)
 		if quit {
+			return
+		}
+	}
+}
+
+// readControlLines is the sole reader of the control connection. It runs
+// from session start until the connection closes (or an oversized line is
+// encountered), delivering each parsed line to ctlMsg and a final error
+// message before closing the channel. Centralising reads here is what
+// lets a long-running data transfer also observe ABOR in real time.
+func (f *ftpSession) readControlLines() {
+	defer close(f.ctlMsg)
+	for {
+		line, err := readFTPControlLine(f.r, ftpMaxControlLineLen)
+		f.ctlMsg <- ftpCtlMsg{line: line, err: err}
+		if err != nil {
 			return
 		}
 	}
@@ -2113,6 +2183,9 @@ func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
 	case "APPE":
 		f.cmdStor(arg, true)
 
+	case "ALLO":
+		f.cmdAllo(arg)
+
 	case "REST":
 		f.cmdRest(arg)
 
@@ -2140,6 +2213,7 @@ func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
 	case "ABOR":
 		f.closeDataListener()
 		f.restartOffset = 0
+		f.expectedUploadSize = 0
 		_ = f.reply(226, "abort successful")
 
 	case "MLST":
@@ -2297,20 +2371,19 @@ func ftpQuotePath(p string) string {
 	return "\"" + strings.ReplaceAll(p, "\"", "\"\"") + "\""
 }
 
+// listPathArg extracts the pathname argument from a LIST/NLST/STAT line,
+// discarding any leading ls-style flags. Only the first non-flag token is
+// honoured: anything after it is dropped on the floor rather than being
+// silently concatenated. FTP has no quoting convention for the LIST
+// argument, so an unquoted multi-word path is ambiguous with a series of
+// stray arguments — RFC 959 specifies a single optional pathname, so the
+// strict interpretation is the safer one.
 func listPathArg(arg string) string {
-	arg = strings.TrimSpace(arg)
-	if arg == "" {
-		return ""
-	}
-	fields := strings.Fields(arg)
-	if len(fields) == 0 {
-		return ""
-	}
-	for i, field := range fields {
+	for _, field := range strings.Fields(arg) {
 		if strings.HasPrefix(field, "-") {
 			continue
 		}
-		return strings.Join(fields[i:], " ")
+		return field
 	}
 	return ""
 }
@@ -2402,6 +2475,51 @@ func (f *ftpSession) closeDataListener() {
 	}
 }
 
+// runTransfer executes work on dc while watching the control connection
+// for ABOR. If ABOR arrives mid-transfer it closes dc (forcing work to
+// return), drains the worker, and reports aborted=true; the caller is
+// then responsible for the RFC 959 reply sequence (426 to the transfer
+// command, 226 to the ABOR). Control commands other than ABOR received
+// during a transfer are answered with 503 and the transfer continues.
+// A control-reader error or close also aborts the transfer so the
+// session can shut down cleanly; the main loop will observe the same
+// signal on its next receive from ctlMsg.
+func (f *ftpSession) runTransfer(dc net.Conn, work func() error) (aborted bool, transferErr error) {
+	done := make(chan error, 1)
+	go func() {
+		done <- work()
+	}()
+
+	for {
+		select {
+		case transferErr = <-done:
+			return false, transferErr
+		case msg, ok := <-f.ctlMsg:
+			if !ok || msg.err != nil {
+				_ = dc.Close()
+				transferErr = <-done
+				return true, transferErr
+			}
+			cmd, _ := parseFTPCommand(strings.TrimRight(msg.line, "\r\n"))
+			if cmd == "ABOR" {
+				_ = dc.Close()
+				transferErr = <-done
+				return true, transferErr
+			}
+			_ = f.reply(503, "transfer in progress")
+		}
+	}
+}
+
+// replyAborted emits the RFC 959 two-message sequence for a transfer that
+// was interrupted by ABOR: 426 closes out the transfer command, then 226
+// acknowledges the ABOR itself. Centralising this keeps the wording (and
+// the order) consistent across cmdStor/cmdRetr/cmdList/cmdMLSD.
+func (f *ftpSession) replyAborted() {
+	_ = f.reply(426, "transfer aborted")
+	_ = f.reply(226, "abort successful")
+}
+
 func (f *ftpSession) cmdList(arg string, namesOnly bool) {
 	if !f.user.CanRead {
 		_ = f.reply(550, "permission denied")
@@ -2412,26 +2530,6 @@ func (f *ftpSession) cmdList(arg string, namesOnly bool) {
 	if err != nil {
 		_ = f.reply(550, ftpErrMsg(err))
 		return
-	}
-
-	var lines []string
-	if st.IsDir() {
-		entries, err := f.fs.List(ftpPath)
-		if err != nil {
-			_ = f.reply(550, ftpErrMsg(err))
-			return
-		}
-		for _, info := range entries {
-			if namesOnly {
-				lines = append(lines, sanitizeFTPText(info.Name()))
-			} else {
-				lines = append(lines, ftpListLine(info, info.Name()))
-			}
-		}
-	} else if namesOnly {
-		lines = append(lines, sanitizeFTPText(path.Base(ftpPath)))
-	} else {
-		lines = append(lines, ftpListLine(st, path.Base(ftpPath)))
 	}
 
 	if err := f.reply(150, "opening data connection"); err != nil {
@@ -2449,11 +2547,34 @@ func (f *ftpSession) cmdList(arg string, namesOnly bool) {
 	// indefinitely once its TCP receive buffer fills.
 	idleDC := &idleConn{Conn: dc}
 	idleDC.setWriteTimeout(ftpDataIdleTimeout)
-	for _, line := range lines {
-		if _, err := io.WriteString(idleDC, line+"\r\n"); err != nil {
-			_ = f.reply(426, ftpErrMsg(err))
-			return
+	aborted, copyErr := f.runTransfer(dc, func() error {
+		formatLine := func(info os.FileInfo, name string) string {
+			if namesOnly {
+				return sanitizeFTPText(name)
+			}
+			return ftpListLine(info, name)
 		}
+		writeLine := func(line string) error {
+			_, err := io.WriteString(idleDC, line+"\r\n")
+			return err
+		}
+		if !st.IsDir() {
+			return writeLine(formatLine(st, path.Base(ftpPath)))
+		}
+		// Stream directory entries straight to the data connection so a
+		// directory with millions of entries does not have to be buffered
+		// in memory before transmission begins.
+		return f.fs.ListStream(ftpPath, func(info os.FileInfo) error {
+			return writeLine(formatLine(info, info.Name()))
+		})
+	})
+	if aborted {
+		f.replyAborted()
+		return
+	}
+	if copyErr != nil {
+		_ = f.reply(426, ftpErrMsg(copyErr))
+		return
 	}
 	_ = f.reply(226, "transfer complete")
 }
@@ -2530,8 +2651,16 @@ func (f *ftpSession) cmdRetr(arg string) {
 	// not pin this goroutine and FD indefinitely.
 	idleDC := &idleConn{Conn: dc}
 	idleDC.setWriteTimeout(ftpDataIdleTimeout)
-	if _, err := io.Copy(idleDC, file); err != nil {
-		_ = f.reply(426, ftpErrMsg(err))
+	aborted, copyErr := f.runTransfer(dc, func() error {
+		_, err := io.Copy(idleDC, file)
+		return err
+	})
+	if aborted {
+		f.replyAborted()
+		return
+	}
+	if copyErr != nil {
+		_ = f.reply(426, ftpErrMsg(copyErr))
 		return
 	}
 	_ = f.reply(226, "transfer complete")
@@ -2580,6 +2709,27 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 	}
 
 	if f.restartOffset > 0 && !appendMode {
+		// Reject restart offsets beyond the current end of file. Without
+		// this guard, O_CREATE+seek+write would happily produce a sparse
+		// file with a hole between the previous EOF and restartOffset —
+		// silently corrupting the upload (the hole reads back as NULs,
+		// not as the bytes the client thought it had already sent).
+		// This also covers the "REST N + STOR newfile" case, where the
+		// file is created at size 0 and any positive offset is invalid.
+		st, statErr := file.Stat()
+		if statErr != nil {
+			f.restartOffset = 0
+			_ = file.Close()
+			_ = f.reply(550, ftpErrMsg(statErr))
+			return
+		}
+		if f.restartOffset > st.Size() {
+			offset, size := f.restartOffset, st.Size()
+			f.restartOffset = 0
+			_ = file.Close()
+			_ = f.reply(554, fmt.Sprintf("restart offset %d exceeds file size %d", offset, size))
+			return
+		}
 		if _, err := file.Seek(f.restartOffset, io.SeekStart); err != nil {
 			f.restartOffset = 0
 			_ = file.Close()
@@ -2589,6 +2739,11 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 	}
 	f.restartOffset = 0
 
+	// Consume any prior ALLO hint up front so a transfer that errors out
+	// below cannot leave the hint hanging for an unrelated later STOR.
+	expectedSize := f.expectedUploadSize
+	f.expectedUploadSize = 0
+
 	log.Printf("upload protocol=ftp path=%q", ftpPath)
 	// Wrap the data connection so that every Read enforces a fresh idle
 	// deadline. A stalled client that stops sending bytes but keeps the TCP
@@ -2596,16 +2751,30 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 	// in turn skips the CompletedUploads notification — partial uploads must
 	// never be announced as complete.
 	//
-	// Note: FTP STREAM mode signals "end of file" by half-closing the data
+	// FTP STREAM mode signals "end of file" by half-closing the data
 	// connection, so a client that uploads N bytes then half-closes is
 	// indistinguishable at the protocol level from a client that intended
-	// to upload exactly N bytes. The idle deadline therefore catches stalled
-	// transfers but cannot detect a client that deliberately truncates by
-	// half-closing early; that is an inherent limitation of FTP itself.
+	// to upload exactly N bytes. The only reliable defense is an explicit
+	// size hint from the client (ALLO); when present, the byte count is
+	// verified below and a mismatch is rejected. Without ALLO the idle
+	// deadline still catches stalls, but a deliberate early half-close
+	// will be accepted — that is an inherent limitation of FTP itself,
+	// and downstream consumers of CompletedUploads must treat events from
+	// no-ALLO transfers as best-effort.
 	idleDC := &idleConn{Conn: dc}
 	idleDC.setReadTimeout(ftpDataIdleTimeout)
-	_, copyErr := io.Copy(file, idleDC)
+	var written int64
+	aborted, copyErr := f.runTransfer(dc, func() error {
+		n, err := io.Copy(file, idleDC)
+		written = n
+		return err
+	})
 	closeErr := file.Close()
+	if aborted {
+		log.Printf("upload aborted protocol=ftp path=%q bytes=%d", ftpPath, written)
+		f.replyAborted()
+		return
+	}
 	if copyErr != nil {
 		log.Printf("upload interrupted protocol=ftp path=%q: %v", ftpPath, copyErr)
 		_ = f.reply(426, ftpErrMsg(copyErr))
@@ -2616,11 +2785,24 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 		_ = f.reply(451, ftpErrMsg(closeErr))
 		return
 	}
+	if expectedSize > 0 && written != expectedSize {
+		log.Printf("upload size mismatch protocol=ftp path=%q expected=%d got=%d", ftpPath, expectedSize, written)
+		_ = f.reply(551, fmt.Sprintf("expected %d bytes, received %d", expectedSize, written))
+		return
+	}
 
 	f.announceUpload(ftpPath, f.fs.fullPath(ftpPath))
 	_ = f.reply(226, "transfer complete")
 }
 
+// announceUpload publishes the CompletedUpload event for a successful STOR.
+//
+// Completeness guarantee: when the client preceded STOR with ALLO, cmdStor
+// verifies the byte count matches before calling here, so the event is
+// authoritative. Without an ALLO hint, FTP STREAM mode cannot distinguish
+// "client sent every intended byte then half-closed" from "client truncated
+// mid-transfer", so the event is best-effort — its absence is not proof of
+// failure and its presence is not proof of byte-level integrity.
 func (f *ftpSession) announceUpload(ftpPath, fullPath string) {
 	log.Printf("upload complete: %q", ftpPath)
 	if hasTempExt(ftpPath, f.tempExts) {
@@ -2656,7 +2838,7 @@ func (f *ftpSession) cmdHelp(arg string) {
 		"USER PASS QUIT NOOP SYST FEAT HELP STAT",
 		"PWD CWD CDUP TYPE MODE STRU OPTS REIN",
 		"PASV EPSV LIST NLST MLST MLSD",
-		"RETR STOR APPE REST SIZE MDTM",
+		"RETR STOR APPE ALLO REST SIZE MDTM",
 		"DELE MKD RMD RNFR RNTO ABOR",
 		"LANG HOST",
 	}, "End")
@@ -2711,6 +2893,7 @@ func (f *ftpSession) cmdRein() {
 	f.cwd = "/"
 	f.rnfrPath = ""
 	f.restartOffset = 0
+	f.expectedUploadSize = 0
 	_ = f.reply(220, "ready for new user")
 }
 
@@ -2800,11 +2983,6 @@ func (f *ftpSession) cmdMLSD(arg string) {
 		_ = f.reply(501, "MLSD requires a directory")
 		return
 	}
-	entries, err := f.fs.List(ftpPath)
-	if err != nil {
-		_ = f.reply(550, ftpErrMsg(err))
-		return
-	}
 
 	if err := f.reply(150, "opening data connection"); err != nil {
 		return
@@ -2818,12 +2996,22 @@ func (f *ftpSession) cmdMLSD(arg string) {
 
 	idleDC := &idleConn{Conn: dc}
 	idleDC.setWriteTimeout(ftpDataIdleTimeout)
-	for _, info := range entries {
-		line := mlstFactLine(info, info.Name(), f.user.CanWrite)
-		if _, err := io.WriteString(idleDC, line+"\r\n"); err != nil {
-			_ = f.reply(426, ftpErrMsg(err))
-			return
-		}
+	aborted, copyErr := f.runTransfer(dc, func() error {
+		// Stream entries straight to the data connection rather than
+		// materialising the whole listing in memory — see cmdList.
+		return f.fs.ListStream(ftpPath, func(info os.FileInfo) error {
+			line := mlstFactLine(info, info.Name(), f.user.CanWrite)
+			_, err := io.WriteString(idleDC, line+"\r\n")
+			return err
+		})
+	})
+	if aborted {
+		f.replyAborted()
+		return
+	}
+	if copyErr != nil {
+		_ = f.reply(426, ftpErrMsg(copyErr))
+		return
 	}
 	_ = f.reply(226, "transfer complete")
 }
@@ -2897,6 +3085,27 @@ func ftpPathBase(p string) string {
 		return "/"
 	}
 	return path.Base(p)
+}
+
+// cmdAllo answers the ALLO command (RFC 959 §4.1.3). The size argument is
+// recorded so the next STOR/APPE can verify the uploaded byte count matches
+// — STREAM mode signals end-of-file by half-close, which is otherwise
+// indistinguishable from a client that deliberately truncates the upload.
+// The "R record-size" form is accepted for compatibility (STRU F is the
+// only structure supported, so record size is meaningless here).
+func (f *ftpSession) cmdAllo(arg string) {
+	fields := strings.Fields(arg)
+	if len(fields) == 0 {
+		_ = f.reply(501, "missing size")
+		return
+	}
+	size, err := strconv.ParseInt(fields[0], 10, 64)
+	if err != nil || size < 0 {
+		_ = f.reply(501, "invalid size")
+		return
+	}
+	f.expectedUploadSize = size
+	_ = f.reply(200, "allocation noted")
 }
 
 func (f *ftpSession) cmdRest(arg string) {

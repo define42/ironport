@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/textproto"
@@ -1023,7 +1024,12 @@ func TestFTPPathHelpers(t *testing.T) {
 		{"-la", ""},
 		{"-la /incoming", "/incoming"},
 		{"-la -- almost", "almost"},
-		{"file name.txt", "file name.txt"},
+		// Only the first non-flag token is honoured. Extra positional
+		// arguments (whether they look like paths, "/a /b", or like a
+		// multi-word filename, "file name.txt") are dropped rather than
+		// silently concatenated — RFC 959 specifies one pathname.
+		{"-la /a /b", "/a"},
+		{"file name.txt", "file"},
 	}
 	for _, tc := range listCases {
 		if got := listPathArg(tc.in); got != tc.want {
@@ -1218,6 +1224,288 @@ func TestFTPServer_UploadDownloadList(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for FTP upload completion event")
+	}
+}
+
+// TestFTPServer_AlloSizeVerification covers the ALLO size hint contract:
+// when a client declares an upload size via ALLO, STOR must verify the
+// uploaded byte count and reject mismatches rather than announce a
+// truncated upload as complete. This is the only way to detect a client
+// that half-closes early in STREAM mode (see cmdStor for the discussion).
+func TestFTPServer_AlloSizeVerification(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"ftpuser": {Password: "ftppw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestFTPServer(t, users, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("ftpuser", "ftppw")
+	client.command(200, "TYPE I")
+
+	// Bad ALLO arguments are rejected without touching session state.
+	client.command(501, "ALLO")
+	client.command(501, "ALLO not-a-number")
+	client.command(501, "ALLO -1")
+
+	content := []byte("hello allo world") // 16 bytes
+
+	// Matching size: ALLO N + STOR with exactly N bytes succeeds and
+	// publishes a CompletedUploads event.
+	client.command(200, "ALLO %d", len(content))
+	uploadConn, _ := client.passiveConn()
+	client.send("STOR ok.txt")
+	client.read(150)
+	if _, err := uploadConn.Write(content); err != nil {
+		t.Fatalf("uploadConn.Write: %v", err)
+	}
+	_ = uploadConn.Close()
+	client.read(226)
+
+	select {
+	case evt := <-srv.CompletedUploads():
+		if evt.FilePath != "/ok.txt" {
+			t.Fatalf("CompletedUploads FilePath = %q; want /ok.txt", evt.FilePath)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for matched-size upload event")
+	}
+
+	// Mismatched size: ALLO N + STOR of fewer bytes is rejected with 551
+	// and must NOT publish a CompletedUploads event.
+	client.command(200, "ALLO %d", len(content))
+	truncConn, _ := client.passiveConn()
+	client.send("STOR short.txt")
+	client.read(150)
+	if _, err := truncConn.Write(content[:len(content)/2]); err != nil {
+		t.Fatalf("truncConn.Write: %v", err)
+	}
+	_ = truncConn.Close()
+	client.read(551)
+
+	select {
+	case evt := <-srv.CompletedUploads():
+		t.Fatalf("CompletedUploads fired for truncated upload: %+v", evt)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// The ALLO hint must not carry over: a follow-up STOR without ALLO
+	// is judged on the no-hint best-effort path again.
+	plainConn, _ := client.passiveConn()
+	client.send("STOR plain.txt")
+	client.read(150)
+	if _, err := plainConn.Write(content); err != nil {
+		t.Fatalf("plainConn.Write: %v", err)
+	}
+	_ = plainConn.Close()
+	client.read(226)
+
+	select {
+	case evt := <-srv.CompletedUploads():
+		if evt.FilePath != "/plain.txt" {
+			t.Fatalf("CompletedUploads FilePath = %q; want /plain.txt", evt.FilePath)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for follow-up upload event")
+	}
+}
+
+// TestFTPServer_ListStreamsLargeDirectory verifies that LIST against a
+// directory containing more than listStreamBatch (512) entries returns
+// every entry by exercising the batched-readdir path. The historical
+// implementation called Readdirnames(-1) and would have buffered the
+// entire listing in memory — fine for unit tests but an OOM hazard for
+// real million-entry directories.
+func TestFTPServer_ListStreamsLargeDirectory(t *testing.T) {
+	root := t.TempDir()
+	const entryCount = listStreamBatch*3 + 7 // straddle several batch boundaries
+	expected := make(map[string]struct{}, entryCount)
+	for i := 0; i < entryCount; i++ {
+		name := fmt.Sprintf("entry-%05d", i)
+		if err := os.WriteFile(filepath.Join(root, name), []byte{}, 0o644); err != nil {
+			t.Fatalf("os.WriteFile(%s): %v", name, err)
+		}
+		expected[name] = struct{}{}
+	}
+
+	_, addr, stop := startTestFTPServer(t, map[string]UserInfo{
+		"ftpuser": {Password: "ftppw", Root: root, CanRead: true},
+	}, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("ftpuser", "ftppw")
+
+	listConn, _ := client.passiveConn()
+	client.send("NLST")
+	client.read(150)
+	data, err := io.ReadAll(listConn)
+	if err != nil {
+		t.Fatalf("io.ReadAll(listConn): %v", err)
+	}
+	_ = listConn.Close()
+	client.read(226)
+
+	got := map[string]struct{}{}
+	for _, name := range strings.Split(strings.TrimRight(string(data), "\r\n"), "\r\n") {
+		if name == "" {
+			continue
+		}
+		got[name] = struct{}{}
+	}
+	if len(got) != len(expected) {
+		t.Fatalf("NLST returned %d entries; want %d", len(got), len(expected))
+	}
+	for name := range expected {
+		if _, ok := got[name]; !ok {
+			t.Fatalf("NLST missing entry %q", name)
+		}
+	}
+}
+
+// TestFTPServer_AborMidTransfer verifies the RFC 959 ABOR handshake when
+// the data transfer is already in flight: the server must close the data
+// connection, reply 426 to the transfer command, and follow with 226 to
+// acknowledge the ABOR. It also checks that a no-transfer ABOR still
+// produces just a 226 (the historical behavior), that a half-written
+// upload is NOT announced as complete, and that commands other than ABOR
+// arriving during a transfer are politely deferred with 503.
+func TestFTPServer_AborMidTransfer(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"ftpuser": {Password: "ftppw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestFTPServer(t, users, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("ftpuser", "ftppw")
+	client.command(200, "TYPE I")
+
+	// ABOR with no active transfer remains a simple 226.
+	client.command(226, "ABOR")
+
+	// Mid-transfer ABOR: open STOR, write a partial chunk, send ABOR.
+	// The server should reply 426 then 226 and not publish the partial
+	// upload via CompletedUploads.
+	uploadConn, _ := client.passiveConn()
+	client.send("STOR aborted.txt")
+	client.read(150)
+	if _, err := uploadConn.Write([]byte("partial-")); err != nil {
+		t.Fatalf("uploadConn.Write: %v", err)
+	}
+
+	// A command that isn't ABOR while the transfer is open should be
+	// answered with 503 and must not terminate the transfer.
+	client.command(503, "NOOP")
+
+	client.send("ABOR")
+	client.read(426)
+	client.read(226)
+	_ = uploadConn.Close()
+
+	select {
+	case evt := <-srv.CompletedUploads():
+		t.Fatalf("CompletedUploads fired for aborted upload: %+v", evt)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// The session must remain usable after an abort: a follow-up upload
+	// should succeed and publish normally.
+	plainConn, _ := client.passiveConn()
+	client.send("STOR after.txt")
+	client.read(150)
+	body := []byte("after-abort")
+	if _, err := plainConn.Write(body); err != nil {
+		t.Fatalf("plainConn.Write: %v", err)
+	}
+	_ = plainConn.Close()
+	client.read(226)
+
+	select {
+	case evt := <-srv.CompletedUploads():
+		if evt.FilePath != "/after.txt" {
+			t.Fatalf("CompletedUploads FilePath = %q; want /after.txt", evt.FilePath)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for post-abort upload event")
+	}
+
+	if got, err := os.ReadFile(filepath.Join(root, "after.txt")); err != nil {
+		t.Fatalf("os.ReadFile(after.txt): %v", err)
+	} else if !bytes.Equal(got, body) {
+		t.Fatalf("after.txt = %q; want %q", got, body)
+	}
+}
+
+// TestFTPServer_RestBeyondFileSizeRejected verifies that REST N followed by
+// STOR (without APPE) is rejected when N is past the current end of file.
+// The naive implementation would seek past EOF and write, producing a
+// sparse file with a NUL hole between the prior tail and the new bytes —
+// silent corruption from the client's perspective.
+func TestFTPServer_RestBeyondFileSizeRejected(t *testing.T) {
+	root := t.TempDir()
+	existing := []byte("abcde") // 5 bytes
+	existingPath := filepath.Join(root, "existing.txt")
+	if err := os.WriteFile(existingPath, existing, 0o644); err != nil {
+		t.Fatalf("os.WriteFile: %v", err)
+	}
+
+	_, addr, stop := startTestFTPServer(t, map[string]UserInfo{
+		"ftpuser": {Password: "ftppw", Root: root, CanRead: true, CanWrite: true},
+	}, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("ftpuser", "ftppw")
+	client.command(200, "TYPE I")
+
+	// REST past EOF of an existing file: STOR must fail with 554 and the
+	// existing bytes must remain untouched.
+	client.command(350, "REST 99")
+	rejectConn, _ := client.passiveConn()
+	client.send("STOR existing.txt")
+	client.read(150)
+	// The server may close the data connection before reading any bytes
+	// once it rejects the transfer; ignore write errors from the client.
+	_, _ = rejectConn.Write([]byte("XXXX"))
+	_ = rejectConn.Close()
+	client.read(554)
+
+	if got, err := os.ReadFile(existingPath); err != nil {
+		t.Fatalf("os.ReadFile(existing) after rejected REST: %v", err)
+	} else if !bytes.Equal(got, existing) {
+		t.Fatalf("existing.txt after rejected REST = %q; want %q (untouched)", got, existing)
+	}
+
+	// REST > 0 against a brand-new path is also invalid: the file would
+	// be created at size 0 and writing at offset N would leave a hole.
+	client.command(350, "REST 10")
+	newConn, _ := client.passiveConn()
+	client.send("STOR new.txt")
+	client.read(150)
+	_, _ = newConn.Write([]byte("YYYY"))
+	_ = newConn.Close()
+	client.read(554)
+
+	// REST at exactly EOF is still allowed (equivalent to APPE-style
+	// continuation) — guard against an off-by-one in the size check.
+	client.command(350, "REST %d", len(existing))
+	tailConn, _ := client.passiveConn()
+	client.send("STOR existing.txt")
+	client.read(150)
+	if _, err := tailConn.Write([]byte("FGH")); err != nil {
+		t.Fatalf("tailConn.Write: %v", err)
+	}
+	_ = tailConn.Close()
+	client.read(226)
+
+	want := append(append([]byte{}, existing...), 'F', 'G', 'H')
+	if got, err := os.ReadFile(existingPath); err != nil {
+		t.Fatalf("os.ReadFile(existing) after REST=size: %v", err)
+	} else if !bytes.Equal(got, want) {
+		t.Fatalf("existing.txt after REST=size = %q; want %q", got, want)
 	}
 }
 
