@@ -89,6 +89,13 @@ const (
 	// user has configured. Users with more than this many keys still take
 	// longer; tune upward if a deployment routinely exceeds it.
 	authorizedKeyTimingPad = 32
+	// defaultTCPKeepAlivePeriod is the SO_KEEPALIVE probe interval applied
+	// to accepted control connections when ironportConfig.TCPKeepAlivePeriod
+	// is zero. Keepalive probes prevent stateful firewalls and NAT devices
+	// from silently dropping long-idle control connections, and surface
+	// half-open connections (e.g. peer reboot, route loss) as read errors
+	// instead of leaving handler goroutines blocked indefinitely.
+	defaultTCPKeepAlivePeriod = 30 * time.Second
 )
 
 const (
@@ -395,6 +402,10 @@ type server struct {
 	// the package default (15 minutes); a negative value disables the idle
 	// timeout entirely.
 	idleTimeoutConfig time.Duration
+	// tcpKeepAlivePeriodConfig is the SO_KEEPALIVE probe interval applied to
+	// accepted SFTP and FTP control connections. A zero value selects the
+	// package default; a negative value disables keepalive entirely.
+	tcpKeepAlivePeriodConfig time.Duration
 	// allowChownConfig controls whether SFTP clients may change the ownership
 	// (uid/gid) of files in their jail via Setstat/Fsetstat requests.
 	// It defaults to false: chown requests are rejected with a permission
@@ -444,6 +455,12 @@ type ironportConfig struct {
 	// IdleTimeout bounds authenticated SFTP connection inactivity. Zero selects
 	// the package default; negative disables the idle timeout.
 	IdleTimeout time.Duration
+	// TCPKeepAlivePeriod controls the SO_KEEPALIVE probe interval applied to
+	// accepted SFTP and FTP control connections. Zero selects the package
+	// default (30 seconds); a negative value disables keepalive entirely.
+	// Probes keep idle control connections alive through stateful
+	// firewalls/NAT and surface half-open peers as read errors.
+	TCPKeepAlivePeriod time.Duration
 	// AllowChown controls whether SFTP clients may change file ownership inside
 	// their jail. It defaults to false.
 	AllowChown bool
@@ -577,6 +594,7 @@ func NewServer(config *ironportConfig) *server {
 		sshPublicKeyAuthAlgorithms: slices.Clone(config.SSHPublicKeyAuthAlgorithms),
 		tempExtensionsConfig:       normalizeTempExtensions(config.TempExtensions),
 		idleTimeoutConfig:          config.IdleTimeout,
+		tcpKeepAlivePeriodConfig:   config.TCPKeepAlivePeriod,
 		allowChownConfig:           config.AllowChown,
 		activeConns:                make(map[net.Conn]struct{}),
 	}
@@ -858,6 +876,7 @@ func (s *server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig, uploads chan<
 			continue
 		}
 		backoff = 0
+		applyTCPKeepAlive(nc, s.tcpKeepAlivePeriod())
 		if !s.trackConn(nc) {
 			// Shutdown began between Accept returning and tracking; refuse
 			// the connection rather than spawning an untrackable handler.
@@ -892,6 +911,7 @@ func (s *server) serveFTP(ln net.Listener, uploads chan<- CompletedUpload, authE
 			continue
 		}
 		backoff = 0
+		applyTCPKeepAlive(nc, s.tcpKeepAlivePeriod())
 		if !s.trackConn(nc) {
 			_ = nc.Close()
 			continue
@@ -946,6 +966,37 @@ func (s *server) idleTimeout() time.Duration {
 // allowChown returns the configured chown permission.
 func (s *server) allowChown() bool {
 	return s.allowChownConfig
+}
+
+// tcpKeepAlivePeriod returns the effective SO_KEEPALIVE probe interval for
+// accepted control connections. A zero configured value selects the package
+// default; a negative value disables keepalive (returns 0).
+func (s *server) tcpKeepAlivePeriod() time.Duration {
+	d := s.tcpKeepAlivePeriodConfig
+	switch {
+	case d == 0:
+		return defaultTCPKeepAlivePeriod
+	case d < 0:
+		return 0
+	}
+	return d
+}
+
+// applyTCPKeepAlive enables SO_KEEPALIVE on a freshly accepted control
+// connection and sets the probe interval. A non-positive period disables
+// keepalive. Connections that are not *net.TCPConn (e.g. test fakes) are
+// left untouched.
+func applyTCPKeepAlive(nc net.Conn, period time.Duration) {
+	tc, ok := nc.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	if period <= 0 {
+		_ = tc.SetKeepAlive(false)
+		return
+	}
+	_ = tc.SetKeepAlive(true)
+	_ = tc.SetKeepAlivePeriod(period)
 }
 
 // cleanSFTPClientPath normalises a raw SFTP client path into an absolute,

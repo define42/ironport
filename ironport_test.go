@@ -695,6 +695,9 @@ func TestDefaultIronportConfig(t *testing.T) {
 	if config.IdleTimeout != 0 {
 		t.Errorf("IdleTimeout = %v; want 0", config.IdleTimeout)
 	}
+	if config.TCPKeepAlivePeriod != 0 {
+		t.Errorf("TCPKeepAlivePeriod = %v; want 0", config.TCPKeepAlivePeriod)
+	}
 	if config.AllowChown {
 		t.Error("AllowChown is true; want false")
 	}
@@ -4215,6 +4218,68 @@ func TestServer_IdleTimeout(t *testing.T) {
 	if got := s.idleTimeout(); got != 0 {
 		t.Errorf("negative idleTimeout = %v; want 0", got)
 	}
+}
+
+// TestServer_TCPKeepAlivePeriod verifies the resolution rules of
+// server.tcpKeepAlivePeriod.
+func TestServer_TCPKeepAlivePeriod(t *testing.T) {
+	s := &server{}
+	if got := s.tcpKeepAlivePeriod(); got != defaultTCPKeepAlivePeriod {
+		t.Errorf("default tcpKeepAlivePeriod = %v; want %v", got, defaultTCPKeepAlivePeriod)
+	}
+	s.tcpKeepAlivePeriodConfig = 90 * time.Second
+	if got := s.tcpKeepAlivePeriod(); got != 90*time.Second {
+		t.Errorf("custom tcpKeepAlivePeriod = %v; want 90s", got)
+	}
+	s.tcpKeepAlivePeriodConfig = -1
+	if got := s.tcpKeepAlivePeriod(); got != 0 {
+		t.Errorf("negative tcpKeepAlivePeriod = %v; want 0", got)
+	}
+}
+
+// TestApplyTCPKeepAlive verifies that the helper is a no-op for non-TCP
+// connections and does not panic for either polarity of period.
+func TestApplyTCPKeepAlive(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			accepted <- nil
+			return
+		}
+		accepted <- c
+	}()
+
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	srv := <-accepted
+	if srv == nil {
+		t.Fatal("accept failed")
+	}
+	defer func() { _ = srv.Close() }()
+
+	// Enabled path: must not panic and must accept a *net.TCPConn.
+	applyTCPKeepAlive(srv, 30*time.Second)
+	// Disabled path: zero/negative disables keepalive.
+	applyTCPKeepAlive(srv, 0)
+	applyTCPKeepAlive(srv, -1)
+
+	// Non-TCP connection: pipe(2) endpoints implement net.Conn but are not
+	// *net.TCPConn — the helper must silently no-op.
+	p1, p2 := net.Pipe()
+	defer func() { _ = p1.Close() }()
+	defer func() { _ = p2.Close() }()
+	applyTCPKeepAlive(p1, 30*time.Second)
 }
 
 // TestIdleConn_ResetsReadDeadline verifies that the per-Read deadline is
