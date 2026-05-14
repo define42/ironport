@@ -1047,7 +1047,9 @@ func deferRecoverSFTPHandlerPanic(username, clientIP string, r *sftp.Request, er
 func recoverSFTPPanicf(errp *error, onPanic func(), format string, args ...any) func() {
 	return func() {
 		if recovered := recover(); recovered != nil {
-			log.Printf(format, append(args, recovered, debug.Stack())...)
+			allArgs := append([]any{}, args...)
+			allArgs = append(allArgs, recovered, debug.Stack())
+			log.Printf(format, allArgs...)
 			if onPanic != nil {
 				onPanic()
 			}
