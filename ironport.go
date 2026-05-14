@@ -1035,6 +1035,38 @@ func recoverSFTPHandlerPanic(username, clientIP, method, filepath string, recove
 	return true
 }
 
+// deferRecoverSFTPHandlerPanic returns a deferred panic-recovery function for
+// SFTP handler methods. It logs the recovered panic using the request's method
+// and path, stores errSFTPRequestFailed in errp, and optionally runs onPanic to
+// zero any additional named return values.
+func deferRecoverSFTPHandlerPanic(username, clientIP string, r *sftp.Request, errp *error, onPanic func()) func() {
+	method, filePath := sftpRequestContext(r)
+	return func() {
+		if recoverSFTPHandlerPanic(username, clientIP, method, filePath, recover(), errp) && onPanic != nil {
+			onPanic()
+		}
+	}
+}
+
+// deferRecoverSFTPPanicf returns a deferred panic-recovery function for helpers that
+// do not have an sftp.Request available for deferRecoverSFTPHandlerPanic. format
+// must include two trailing verbs for the recovered panic value and stack trace
+// after args.
+func deferRecoverSFTPPanicf(errp *error, onPanic func(), format string, args ...any) func() {
+	return func() {
+		if recovered := recover(); recovered != nil {
+			allArgs := append(args, recovered, debug.Stack())
+			log.Printf(format, allArgs...)
+			if onPanic != nil {
+				onPanic()
+			}
+			if errp != nil {
+				*errp = errSFTPRequestFailed
+			}
+		}
+	}
+}
+
 // hasTempExt reports whether name ends with one of the given (already
 // normalised, lower-case, dot-prefixed) extensions. Matching is
 // case-insensitive on the filename.
@@ -1399,23 +1431,36 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, usernam
 			}
 			_ = req.Reply(true, nil)
 
-			handlers, fs, err := jailedHandlers(jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts, allowChown)
-			if err != nil {
-				log.Printf("open jail root %q: %v", jailRoot, err)
-				return
-			}
-			defer func() { _ = fs.Close() }()
-
-			server := sftp.NewRequestServer(ch, handlers)
-			defer func() { _ = server.Close() }()
-			if err := server.Serve(); err != nil && !errors.Is(err, io.EOF) {
-				log.Println("sftp serve:", err)
-			}
+			// Serving the SFTP subsystem is delegated to a helper so that
+			// its cleanup defers (fs.Close, server.Close) run on its own
+			// return rather than accumulating inside this for/switch — a
+			// defer placed directly in this case would survive across loop
+			// iterations if the trailing `return` were ever removed.
+			serveSFTPSubsystem(ch, jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts, allowChown)
 			return
 
 		default:
 			_ = req.Reply(false, nil)
 		}
+	}
+}
+
+// serveSFTPSubsystem opens the per-session jail, runs the SFTP request server
+// to completion, and tears both down via defer so the cleanup is local to this
+// function and not to handleSession's loop body. Callers must already have
+// replied to the "subsystem" request before invoking it.
+func serveSFTPSubsystem(ch ssh.Channel, jailRoot, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, allowChown bool) {
+	handlers, fs, err := jailedHandlers(jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts, allowChown)
+	if err != nil {
+		log.Printf("open jail root %q: %v", jailRoot, err)
+		return
+	}
+	defer func() { _ = fs.Close() }()
+
+	server := sftp.NewRequestServer(ch, handlers)
+	defer func() { _ = server.Close() }()
+	if err := server.Serve(); err != nil && !errors.Is(err, io.EOF) {
+		log.Println("sftp serve:", err)
 	}
 }
 
@@ -1447,12 +1492,7 @@ type jail struct {
 // jail implements the four sftp handler interfaces for a chrooted filesystem.
 // Fileread implements sftp.FileReader.
 func (j jail) Fileread(r *sftp.Request) (reader io.ReaderAt, err error) {
-	method, filePath := sftpRequestContext(r)
-	defer func() {
-		if recoverSFTPHandlerPanic(j.username, j.clientIP, method, filePath, recover(), &err) {
-			reader = nil
-		}
-	}()
+	defer deferRecoverSFTPHandlerPanic(j.username, j.clientIP, r, &err, func() { reader = nil })()
 	if !j.canRead {
 		return nil, os.ErrPermission
 	}
@@ -1501,14 +1541,13 @@ type writeLogger struct {
 }
 
 func (w *writeLogger) WriteAt(p []byte, off int64) (n int, err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			log.Printf("sftp write panic user=%q ip=%q path=%q: %v\n%s", w.username, w.clientIP, w.filepath, recovered, debug.Stack())
-			n = 0
-			err = errSFTPRequestFailed
-		}
-	}()
+	defer deferRecoverSFTPPanicf(&err, func() { n = 0 }, "sftp write panic user=%q ip=%q path=%q: %v\n%s", w.username, w.clientIP, w.filepath)()
 	if w.appendMode {
+		// O_APPEND semantics (open(2)): on every write the kernel
+		// atomically re-seeks the file offset to EOF before writing, so
+		// the off parameter from the SFTP request is intentionally
+		// dropped — honouring it would not change the destination of
+		// the bytes and would only confuse the next reader.
 		return w.Write(p)
 	}
 	return w.File.WriteAt(p, off)
@@ -1532,12 +1571,7 @@ func (w *writeLogger) TransferError(err error) {
 }
 
 func (w *writeLogger) Close() (err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			log.Printf("sftp write close panic user=%q ip=%q path=%q: %v\n%s", w.username, w.clientIP, w.filepath, recovered, debug.Stack())
-			err = errSFTPRequestFailed
-		}
-	}()
+	defer deferRecoverSFTPPanicf(&err, nil, "sftp write close panic user=%q ip=%q path=%q: %v\n%s", w.username, w.clientIP, w.filepath)()
 	err = w.File.Close()
 	w.mu.Lock()
 	transferErr := w.transferErr
@@ -1574,12 +1608,7 @@ func (w *writeLogger) Close() (err error) {
 
 // Filewrite implements sftp.FileWriter.
 func (j jail) Filewrite(r *sftp.Request) (writer io.WriterAt, err error) {
-	method, filePath := sftpRequestContext(r)
-	defer func() {
-		if recoverSFTPHandlerPanic(j.username, j.clientIP, method, filePath, recover(), &err) {
-			writer = nil
-		}
-	}()
+	defer deferRecoverSFTPHandlerPanic(j.username, j.clientIP, r, &err, func() { writer = nil })()
 	if !j.canWrite {
 		return nil, os.ErrPermission
 	}
@@ -1632,10 +1661,7 @@ func sftpWriteOpenFlags(r *sftp.Request) (int, bool, error) {
 
 // Filecmd implements sftp.FileCmder.
 func (j jail) Filecmd(r *sftp.Request) (err error) {
-	method, filePath := sftpRequestContext(r)
-	defer func() {
-		recoverSFTPHandlerPanic(j.username, j.clientIP, method, filePath, recover(), &err)
-	}()
+	defer deferRecoverSFTPHandlerPanic(j.username, j.clientIP, r, &err, nil)()
 	if !j.canWrite {
 		return os.ErrPermission
 	}
@@ -1697,12 +1723,7 @@ func (j jail) Filecmd(r *sftp.Request) (err error) {
 
 // Filelist implements sftp.FileLister.
 func (j jail) Filelist(r *sftp.Request) (lister sftp.ListerAt, err error) {
-	method, filePath := sftpRequestContext(r)
-	defer func() {
-		if recoverSFTPHandlerPanic(j.username, j.clientIP, method, filePath, recover(), &err) {
-			lister = nil
-		}
-	}()
+	defer deferRecoverSFTPHandlerPanic(j.username, j.clientIP, r, &err, func() { lister = nil })()
 	if !j.canRead {
 		return nil, os.ErrPermission
 	}
@@ -1808,13 +1829,7 @@ func jailedHandlers(root, username, clientIP string, canRead, canWrite bool, upl
 type fileInfoLister struct{ infos []os.FileInfo }
 
 func (l fileInfoLister) ListAt(fis []os.FileInfo, offset int64) (n int, err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			log.Printf("sftp list panic offset=%d: %v\n%s", offset, recovered, debug.Stack())
-			n = 0
-			err = errSFTPRequestFailed
-		}
-	}()
+	defer deferRecoverSFTPPanicf(&err, func() { n = 0 }, "sftp list panic offset=%d: %v\n%s", offset)()
 	if offset < 0 {
 		return 0, os.ErrInvalid
 	}
@@ -2611,7 +2626,20 @@ func ftpModeString(mode os.FileMode) string {
 	return string(buf)
 }
 
+// consumeTransferHints atomically captures and clears both the REST restart
+// offset and the ALLO expected-size hint. Calling it at the top of cmdStor
+// (and cmdRetr) ensures that every exit path — error or success — always
+// leaves both fields zeroed, with no risk of a stale hint leaking into a
+// subsequent transfer command.
+func (f *ftpSession) consumeTransferHints() (restartOffset, expectedSize int64) {
+	restartOffset, expectedSize = f.restartOffset, f.expectedUploadSize
+	f.restartOffset = 0
+	f.expectedUploadSize = 0
+	return
+}
+
 func (f *ftpSession) cmdRetr(arg string) {
+	restartOffset, _ := f.consumeTransferHints()
 	if !f.user.CanRead {
 		_ = f.reply(550, "permission denied")
 		return
@@ -2619,20 +2647,17 @@ func (f *ftpSession) cmdRetr(arg string) {
 	ftpPath := f.cleanPath(arg)
 	file, err := f.fs.OpenRead(ftpPath)
 	if err != nil {
-		f.restartOffset = 0
 		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 	defer func() { _ = file.Close() }()
 
-	if f.restartOffset > 0 {
-		if _, err := file.Seek(f.restartOffset, io.SeekStart); err != nil {
-			f.restartOffset = 0
+	if restartOffset > 0 {
+		if _, err := file.Seek(restartOffset, io.SeekStart); err != nil {
 			_ = f.reply(550, ftpErrMsg(err))
 			return
 		}
 	}
-	f.restartOffset = 0
 
 	if err := f.reply(150, "opening data connection"); err != nil {
 		return
@@ -2665,25 +2690,22 @@ func (f *ftpSession) cmdRetr(arg string) {
 }
 
 func (f *ftpSession) cmdStor(arg string, appendMode bool) {
+	restartOffset, expectedSize := f.consumeTransferHints()
 	if !f.user.CanWrite {
-		f.restartOffset = 0
 		_ = f.reply(550, "permission denied")
 		return
 	}
 	if hasCRLF(arg) {
-		f.restartOffset = 0
 		_ = f.reply(553, "invalid filename")
 		return
 	}
 	ftpPath := f.cleanPath(arg)
 
 	if err := f.reply(150, "opening data connection"); err != nil {
-		f.restartOffset = 0
 		return
 	}
 	dc, err := f.acceptDataConn()
 	if err != nil {
-		f.restartOffset = 0
 		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
@@ -2693,7 +2715,7 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 	switch {
 	case appendMode:
 		flags |= os.O_APPEND
-	case f.restartOffset > 0:
+	case restartOffset > 0:
 		// Keep existing bytes and resume at requested offset.
 	default:
 		flags |= os.O_TRUNC
@@ -2701,12 +2723,11 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 
 	file, err := f.fs.OpenWrite(ftpPath, flags, 0600)
 	if err != nil {
-		f.restartOffset = 0
 		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
 
-	if f.restartOffset > 0 && !appendMode {
+	if restartOffset > 0 && !appendMode {
 		// Reject restart offsets beyond the current end of file. Without
 		// this guard, O_CREATE+seek+write would happily produce a sparse
 		// file with a hole between the previous EOF and restartOffset —
@@ -2716,31 +2737,22 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 		// file is created at size 0 and any positive offset is invalid.
 		st, statErr := file.Stat()
 		if statErr != nil {
-			f.restartOffset = 0
 			_ = file.Close()
 			_ = f.reply(550, ftpErrMsg(statErr))
 			return
 		}
-		if f.restartOffset > st.Size() {
-			offset, size := f.restartOffset, st.Size()
-			f.restartOffset = 0
+		if restartOffset > st.Size() {
+			offset, size := restartOffset, st.Size()
 			_ = file.Close()
 			_ = f.reply(554, fmt.Sprintf("restart offset %d exceeds file size %d", offset, size))
 			return
 		}
-		if _, err := file.Seek(f.restartOffset, io.SeekStart); err != nil {
-			f.restartOffset = 0
+		if _, err := file.Seek(restartOffset, io.SeekStart); err != nil {
 			_ = file.Close()
 			_ = f.reply(550, ftpErrMsg(err))
 			return
 		}
 	}
-	f.restartOffset = 0
-
-	// Consume any prior ALLO hint up front so a transfer that errors out
-	// below cannot leave the hint hanging for an unrelated later STOR.
-	expectedSize := f.expectedUploadSize
-	f.expectedUploadSize = 0
 
 	log.Printf("upload protocol=ftp path=%q", ftpPath)
 	// Wrap the data connection so that every Read enforces a fresh idle
@@ -2900,8 +2912,12 @@ func (f *ftpSession) cmdRein() {
 // over the control connection (no data connection), which clients often
 // issue immediately after login as a low-overhead probe.
 func (f *ftpSession) cmdStat(arg string) {
-	path := strings.TrimSpace(arg)
-	if path == "" {
+	// Use rawPath rather than path here: a local named "path" would shadow
+	// the imported "path" package, so any future edit that calls path.Base
+	// or path.Clean inside this function would silently become a method
+	// call on a string.
+	rawPath := strings.TrimSpace(arg)
+	if rawPath == "" {
 		lines := []string{
 			fmt.Sprintf("Connected from %s", sanitizeFTPText(f.clientIP)),
 			fmt.Sprintf("Logged in as %s", sanitizeFTPText(f.username)),
@@ -2919,7 +2935,7 @@ func (f *ftpSession) cmdStat(arg string) {
 		_ = f.reply(550, "permission denied")
 		return
 	}
-	ftpPath := f.cleanPath(listPathArg(path))
+	ftpPath := f.cleanPath(listPathArg(rawPath))
 	st, err := f.fs.Stat(ftpPath)
 	if err != nil {
 		_ = f.reply(550, ftpErrMsg(err))
