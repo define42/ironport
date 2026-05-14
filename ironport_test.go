@@ -5511,6 +5511,168 @@ func TestFTPServer_PASVExhaustsPortRange(t *testing.T) {
 	_ = extra.tp.Close()
 }
 
+// TestFTPServer_PASVConcurrentTransfers runs many simultaneous STOR transfers
+// through a constrained passive port range. The intent is twofold:
+//
+//   - Stress the port allocator and acceptDataConn paths under contention so
+//     -race can catch any data race in listenFTPData / handleFTPConn.
+//   - Confirm that when transfer count exceeds the port range, the server
+//     fails late dialers cleanly with 425 instead of hanging or producing a
+//     port collision, and that every accepted upload writes the full body.
+//
+// Each goroutine drives a full session: login, PASV, STOR, write payload,
+// close, read 226. Any goroutine that runs while the range is full gets 425
+// on PASV and retries — the test only requires that every goroutine
+// eventually completes successfully and that the on-disk file matches.
+func TestFTPServer_PASVConcurrentTransfers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping concurrent PASV stress in -short mode")
+	}
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"u": {Password: "p", Root: root, CanRead: true, CanWrite: true},
+	}
+	// Range of 4 ports vs. 12 concurrent workers guarantees the allocator
+	// is repeatedly exhausted and forced to fail-fast some PASV calls.
+	srv, addr, stop := startTestFTPServer(t, users, "5600-5603")
+	t.Cleanup(stop)
+
+	const workers = 12
+	payload := bytes.Repeat([]byte("payload-"), 256) // 2 KiB
+
+	drainUploads := func() {
+		for {
+			select {
+			case <-srv.CompletedUploads():
+			case <-time.After(50 * time.Millisecond):
+				return
+			}
+		}
+	}
+	t.Cleanup(drainUploads)
+
+	doOne := func(t *testing.T, id int) error {
+		t.Helper()
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			return fmt.Errorf("worker %d dial: %w", id, err)
+		}
+		defer func() { _ = conn.Close() }()
+		tp := textproto.NewConn(conn)
+		defer func() { _ = tp.Close() }()
+
+		if _, _, err := tp.ReadResponse(220); err != nil {
+			return fmt.Errorf("worker %d greeting: %w", id, err)
+		}
+		if err := tp.PrintfLine("USER u"); err != nil {
+			return fmt.Errorf("worker %d USER: %w", id, err)
+		}
+		if _, _, err := tp.ReadResponse(331); err != nil {
+			return fmt.Errorf("worker %d USER reply: %w", id, err)
+		}
+		if err := tp.PrintfLine("PASS p"); err != nil {
+			return fmt.Errorf("worker %d PASS: %w", id, err)
+		}
+		if _, _, err := tp.ReadResponse(230); err != nil {
+			return fmt.Errorf("worker %d PASS reply: %w", id, err)
+		}
+		if err := tp.PrintfLine("TYPE I"); err != nil {
+			return fmt.Errorf("worker %d TYPE: %w", id, err)
+		}
+		if _, _, err := tp.ReadResponse(200); err != nil {
+			return fmt.Errorf("worker %d TYPE reply: %w", id, err)
+		}
+
+		// Retry PASV until the allocator hands us a port — a 425 only means
+		// every range slot was busy at that moment; another worker will free
+		// one shortly. Cap the loop so a real regression (425 forever) fails.
+		deadline := time.Now().Add(10 * time.Second)
+		var host string
+		var port int
+		for {
+			if err := tp.PrintfLine("PASV"); err != nil {
+				return fmt.Errorf("worker %d PASV: %w", id, err)
+			}
+			code, msg, err := tp.ReadResponse(0)
+			if err != nil {
+				return fmt.Errorf("worker %d PASV reply: %w", id, err)
+			}
+			if code == 227 {
+				host, port, err = parseFTPPASVResponse(msg)
+				if err != nil {
+					return fmt.Errorf("worker %d parse PASV: %w", id, err)
+				}
+				if port < 5600 || port > 5603 {
+					return fmt.Errorf("worker %d PASV port %d outside configured range", id, port)
+				}
+				break
+			}
+			if code != 425 {
+				return fmt.Errorf("worker %d PASV got code %d: %s", id, code, msg)
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("worker %d PASV stuck at 425 past deadline", id)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		dc, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), 5*time.Second)
+		if err != nil {
+			return fmt.Errorf("worker %d dial data: %w", id, err)
+		}
+		name := fmt.Sprintf("file-%02d.bin", id)
+		if err := tp.PrintfLine("STOR %s", name); err != nil {
+			_ = dc.Close()
+			return fmt.Errorf("worker %d STOR: %w", id, err)
+		}
+		if _, _, err := tp.ReadResponse(150); err != nil {
+			_ = dc.Close()
+			return fmt.Errorf("worker %d STOR 150: %w", id, err)
+		}
+		if _, err := dc.Write(payload); err != nil {
+			_ = dc.Close()
+			return fmt.Errorf("worker %d write: %w", id, err)
+		}
+		_ = dc.Close()
+		if _, _, err := tp.ReadResponse(226); err != nil {
+			return fmt.Errorf("worker %d STOR 226: %w", id, err)
+		}
+		if err := tp.PrintfLine("QUIT"); err != nil {
+			return fmt.Errorf("worker %d QUIT: %w", id, err)
+		}
+		_, _, _ = tp.ReadResponse(221)
+		return nil
+	}
+
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func(id int) {
+			defer wg.Done()
+			errCh <- doOne(t, id)
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for i := 0; i < workers; i++ {
+		name := fmt.Sprintf("file-%02d.bin", i)
+		got, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			t.Fatalf("os.ReadFile(%s): %v", name, err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("%s body mismatch: got %d bytes, want %d", name, len(got), len(payload))
+		}
+	}
+}
+
 // FuzzReadFTPControlLine exercises the control-line reader with arbitrary
 // byte streams to confirm it never panics and that the line cap is honored
 // regardless of how the input is framed.
