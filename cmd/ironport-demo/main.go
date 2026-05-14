@@ -46,13 +46,12 @@ func main() {
 	config.Users = users
 	config.Signer = signer
 	config.CompletedUploadSize = 64
+	config.SSHKeyExchanges = splitCSV(*sshKex)
+	config.SSHCiphers = splitCSV(*sshCiphers)
+	config.SSHMACs = splitCSV(*sshMACs)
+	config.SSHPublicKeyAuthAlgorithms = splitCSV(*sshPublicKeyAuthAlgorithms)
 	srv := ironport.NewServer(config)
-	srv.SSHAlgorithms = ironport.SSHAlgorithms{
-		KeyExchanges:            splitCSV(*sshKex),
-		Ciphers:                 splitCSV(*sshCiphers),
-		MACs:                    splitCSV(*sshMACs),
-		PublicKeyAuthAlgorithms: splitCSV(*sshPublicKeyAuthAlgorithms),
-	}
+
 	// Files written with one of these extensions are considered "still being
 	// written" and won't be announced on CompletedUploads until the client
 	// renames them to a final (non-temp) name.

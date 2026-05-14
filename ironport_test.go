@@ -204,7 +204,7 @@ func testSigner(t *testing.T) ssh.Signer {
 	return signer
 }
 
-func newTestServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserInfo, signer ssh.Signer, completedUploadsSize int) *server {
+func newTestConfig(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserInfo, signer ssh.Signer, completedUploadsSize int) *ironportConfig {
 	config := DefaultIronportConfig()
 	config.Addr = addr
 	config.FtpAddr = ftpAddr
@@ -212,7 +212,11 @@ func newTestServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]U
 	config.Users = users
 	config.Signer = signer
 	config.CompletedUploadSize = completedUploadsSize
-	return NewServer(config)
+	return config
+}
+
+func newTestServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]UserInfo, signer ssh.Signer, completedUploadsSize int) *server {
+	return NewServer(newTestConfig(addr, ftpAddr, ftpPassivePortRange, users, signer, completedUploadsSize))
 }
 
 // startTestServer launches a server on a random OS-assigned port and returns
@@ -225,15 +229,24 @@ func newTestServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]U
 // is unsafe under the race detector.
 func startTestServer(t *testing.T, users map[string]UserInfo, configure ...func(*server)) (srv *server, addr string, stop func()) {
 	t.Helper()
-	signer := testSigner(t)
+	config := newTestConfig("", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+	return startTestServerWithConfig(t, config, configure...)
+}
 
+func startTestServerWithConfig(t *testing.T, config *ironportConfig, configure ...func(*server)) (srv *server, addr string, stop func()) {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	addr = ln.Addr().String()
 
-	srv = newTestServer(addr, "", "", users, signer, defaultCompletedUploadsSize)
+	if config == nil {
+		config = DefaultIronportConfig()
+	}
+	serverConfig := *config
+	serverConfig.Addr = addr
+	srv = NewServer(&serverConfig)
 	for _, fn := range configure {
 		if fn != nil {
 			fn(srv)
@@ -556,6 +569,18 @@ func TestDefaultIronportConfig(t *testing.T) {
 	if config.Signer != nil {
 		t.Error("Signer is non-nil; want nil")
 	}
+	if config.SSHKeyExchanges != nil {
+		t.Error("SSHKeyExchanges is non-nil; want nil")
+	}
+	if config.SSHCiphers != nil {
+		t.Error("SSHCiphers is non-nil; want nil")
+	}
+	if config.SSHMACs != nil {
+		t.Error("SSHMACs is non-nil; want nil")
+	}
+	if config.SSHPublicKeyAuthAlgorithms != nil {
+		t.Error("SSHPublicKeyAuthAlgorithms is non-nil; want nil")
+	}
 
 	other := DefaultIronportConfig()
 	if config == other {
@@ -571,13 +596,13 @@ func TestSSHServerConfig_AppliesAlgorithmPins(t *testing.T) {
 	users := map[string]UserInfo{
 		"alice": {Password: "pw", Root: t.TempDir(), CanRead: true, CanWrite: true},
 	}
-	srv := newTestServer(":0", "", "", users, testSigner(t), defaultCompletedUploadsSize)
-	srv.SSHAlgorithms = SSHAlgorithms{
-		KeyExchanges:            []string{ssh.KeyExchangeCurve25519},
-		Ciphers:                 []string{ssh.CipherAES256CTR},
-		MACs:                    []string{ssh.HMACSHA256},
-		PublicKeyAuthAlgorithms: []string{ssh.KeyAlgoRSASHA256},
-	}
+	config := newTestConfig(":0", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+	config.SSHKeyExchanges = []string{ssh.KeyExchangeCurve25519}
+	config.SSHCiphers = []string{ssh.CipherAES256CTR}
+	config.SSHMACs = []string{ssh.HMACSHA256}
+	config.SSHPublicKeyAuthAlgorithms = []string{ssh.KeyAlgoRSASHA256}
+	srv := NewServer(config)
+	config.SSHCiphers[0] = ssh.CipherAES128CTR
 
 	cfg := srv.sshServerConfig()
 	if !reflect.DeepEqual(cfg.KeyExchanges, []string{ssh.KeyExchangeCurve25519}) {
@@ -593,9 +618,9 @@ func TestSSHServerConfig_AppliesAlgorithmPins(t *testing.T) {
 		t.Fatalf("PublicKeyAuthAlgorithms = %v; want %v", cfg.PublicKeyAuthAlgorithms, []string{ssh.KeyAlgoRSASHA256})
 	}
 
-	srv.SSHAlgorithms.Ciphers[0] = ssh.CipherAES128CTR
+	srv.sshCiphers[0] = ssh.CipherAES128CTR
 	if got := cfg.Ciphers[0]; got != ssh.CipherAES256CTR {
-		t.Fatalf("sshServerConfig aliased server SSHAlgorithms; Ciphers[0] = %q", got)
+		t.Fatalf("sshServerConfig aliased server SSHCiphers; Ciphers[0] = %q", got)
 	}
 }
 
@@ -604,13 +629,11 @@ func TestSFTPServer_SSHAlgorithmPinning(t *testing.T) {
 	users := map[string]UserInfo{
 		"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
 	}
-	_, addr, stop := startTestServer(t, users, func(s *server) {
-		s.SSHAlgorithms = SSHAlgorithms{
-			KeyExchanges: []string{ssh.KeyExchangeCurve25519},
-			Ciphers:      []string{ssh.CipherAES256CTR},
-			MACs:         []string{ssh.HMACSHA256},
-		}
-	})
+	config := newTestConfig("", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+	config.SSHKeyExchanges = []string{ssh.KeyExchangeCurve25519}
+	config.SSHCiphers = []string{ssh.CipherAES256CTR}
+	config.SSHMACs = []string{ssh.HMACSHA256}
+	_, addr, stop := startTestServerWithConfig(t, config)
 	t.Cleanup(stop)
 
 	sshCfg := &ssh.ClientConfig{
@@ -643,11 +666,9 @@ func TestSFTPServer_PublicKeyAuthAlgorithmPinning(t *testing.T) {
 		"alice": {AuthorizedKeys: []ssh.PublicKey{clientPubKey}, Root: root, CanRead: true, CanWrite: true},
 	}
 
-	_, addr, stop := startTestServer(t, users, func(s *server) {
-		s.SSHAlgorithms = SSHAlgorithms{
-			PublicKeyAuthAlgorithms: []string{ssh.KeyAlgoRSASHA256},
-		}
-	})
+	config := newTestConfig("", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+	config.SSHPublicKeyAuthAlgorithms = []string{ssh.KeyAlgoRSASHA256}
+	_, addr, stop := startTestServerWithConfig(t, config)
 	t.Cleanup(stop)
 
 	sshCfg := &ssh.ClientConfig{
@@ -661,11 +682,9 @@ func TestSFTPServer_PublicKeyAuthAlgorithmPinning(t *testing.T) {
 	}
 	_ = conn.Close()
 
-	_, rejectAddr, rejectStop := startTestServer(t, users, func(s *server) {
-		s.SSHAlgorithms = SSHAlgorithms{
-			PublicKeyAuthAlgorithms: []string{ssh.KeyAlgoED25519},
-		}
-	})
+	rejectConfig := newTestConfig("", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+	rejectConfig.SSHPublicKeyAuthAlgorithms = []string{ssh.KeyAlgoED25519}
+	_, rejectAddr, rejectStop := startTestServerWithConfig(t, rejectConfig)
 	t.Cleanup(rejectStop)
 
 	if conn, err = ssh.Dial("tcp", rejectAddr, sshCfg); err == nil {

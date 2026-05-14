@@ -250,19 +250,6 @@ type UserInfo struct {
 	CanWrite       bool            // allow write/upload/delete/rename operations
 }
 
-// SSHAlgorithms contains optional SSH algorithm allow-lists.
-//
-// A nil field uses golang.org/x/crypto/ssh defaults. A non-nil field pins that
-// algorithm class to the listed values, in order. KeyExchanges, Ciphers, and
-// MACs correspond to ssh.Config fields; PublicKeyAuthAlgorithms controls the
-// client public-key signature algorithms accepted by ssh.ServerConfig.
-type SSHAlgorithms struct {
-	KeyExchanges            []string
-	Ciphers                 []string
-	MACs                    []string
-	PublicKeyAuthAlgorithms []string
-}
-
 func cloneUserInfo(u UserInfo) UserInfo {
 	if u.AuthorizedKeys != nil {
 		u.AuthorizedKeys = append([]ssh.PublicKey(nil), u.AuthorizedKeys...)
@@ -277,15 +264,6 @@ func cloneStringSlice(in []string) []string {
 	out := make([]string, len(in))
 	copy(out, in)
 	return out
-}
-
-func cloneSSHAlgorithms(a SSHAlgorithms) SSHAlgorithms {
-	return SSHAlgorithms{
-		KeyExchanges:            cloneStringSlice(a.KeyExchanges),
-		Ciphers:                 cloneStringSlice(a.Ciphers),
-		MACs:                    cloneStringSlice(a.MACs),
-		PublicKeyAuthAlgorithms: cloneStringSlice(a.PublicKeyAuthAlgorithms),
-	}
 }
 
 func cloneUsers(users map[string]UserInfo) map[string]UserInfo {
@@ -338,11 +316,12 @@ type server struct {
 	ftpLn net.Listener
 	// signer is the host key used for the SSH handshake.
 	signer ssh.Signer
-	// SSHAlgorithms optionally pins SSH negotiation and public-key auth
-	// signature algorithms. Leave fields nil to use golang.org/x/crypto/ssh
-	// defaults. Set before ListenAndServe; changes after startup do not affect
-	// the already-created SSH server configuration.
-	SSHAlgorithms SSHAlgorithms
+	// SSH algorithm allow-lists. Nil slices use golang.org/x/crypto/ssh
+	// defaults.
+	sshKeyExchanges            []string
+	sshCiphers                 []string
+	sshMACs                    []string
+	sshPublicKeyAuthAlgorithms []string
 	// completedUploads receives upload notifications. Use CompletedUploads to
 	// access it as a receive-only stream.
 	completedUploads chan CompletedUpload
@@ -402,6 +381,14 @@ type ironportConfig struct {
 	Users               map[string]UserInfo
 	Signer              ssh.Signer
 	CompletedUploadSize int
+	// SSHKeyExchanges, SSHCiphers, SSHMACs, and
+	// SSHPublicKeyAuthAlgorithms optionally pin SSH negotiation and public-key
+	// auth signature algorithms. Nil slices use golang.org/x/crypto/ssh
+	// defaults.
+	SSHKeyExchanges            []string
+	SSHCiphers                 []string
+	SSHMACs                    []string
+	SSHPublicKeyAuthAlgorithms []string
 }
 
 // AddUser adds or replaces a user entry in the server's user map.
@@ -516,13 +503,17 @@ func NewServer(config *ironportConfig) *server {
 		config = DefaultIronportConfig()
 	}
 	s := &server{
-		Addr:                config.Addr,
-		FTPAddr:             config.FtpAddr,
-		FTPPassivePortRange: config.FtpPassivePortRange,
-		users:               cloneUsers(config.Users),
-		signer:              config.Signer,
-		completedUploads:    newCompletedUploadsChannel(config.CompletedUploadSize),
-		activeConns:         make(map[net.Conn]struct{}),
+		Addr:                       config.Addr,
+		FTPAddr:                    config.FtpAddr,
+		FTPPassivePortRange:        config.FtpPassivePortRange,
+		users:                      cloneUsers(config.Users),
+		signer:                     config.Signer,
+		completedUploads:           newCompletedUploadsChannel(config.CompletedUploadSize),
+		sshKeyExchanges:            cloneStringSlice(config.SSHKeyExchanges),
+		sshCiphers:                 cloneStringSlice(config.SSHCiphers),
+		sshMACs:                    cloneStringSlice(config.SSHMACs),
+		sshPublicKeyAuthAlgorithms: cloneStringSlice(config.SSHPublicKeyAuthAlgorithms),
+		activeConns:                make(map[net.Conn]struct{}),
 	}
 	return s
 }
@@ -1075,14 +1066,13 @@ func canonicalJailRoot(root string) (string, error) {
 // in the user's AuthorizedKeys slice (constant-time comparison of wire-format
 // bytes).
 func (s *server) sshServerConfig() *ssh.ServerConfig {
-	algorithms := cloneSSHAlgorithms(s.SSHAlgorithms)
 	cfg := &ssh.ServerConfig{
 		Config: ssh.Config{
-			KeyExchanges: algorithms.KeyExchanges,
-			Ciphers:      algorithms.Ciphers,
-			MACs:         algorithms.MACs,
+			KeyExchanges: cloneStringSlice(s.sshKeyExchanges),
+			Ciphers:      cloneStringSlice(s.sshCiphers),
+			MACs:         cloneStringSlice(s.sshMACs),
 		},
-		PublicKeyAuthAlgorithms: algorithms.PublicKeyAuthAlgorithms,
+		PublicKeyAuthAlgorithms: cloneStringSlice(s.sshPublicKeyAuthAlgorithms),
 		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
 			s.mu.RLock()
 			u, ok := s.users[c.User()]

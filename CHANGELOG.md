@@ -14,6 +14,7 @@ changes are tracked under `Unreleased`.
 - Added project security and contribution documentation.
 - Added a main-branch release workflow that bumps the next SemVer tag and
   creates a GitHub Release.
+- Moved SSH algorithm pinning onto `ironportConfig` fields.
 
 ## Releases
 

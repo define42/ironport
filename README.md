@@ -115,24 +115,23 @@ With this setting:
 
 ### Pinning SSH algorithms
 
-Set `SSHAlgorithms` before starting the server to restrict SSH negotiation.
-Nil fields keep the defaults from `golang.org/x/crypto/ssh`; non-nil fields
-are used as allow-lists in the order supplied:
+Set SSH algorithm fields on the config before constructing the server to
+restrict SSH negotiation. Nil fields keep the defaults from
+`golang.org/x/crypto/ssh`; non-nil fields are used as allow-lists in the order
+supplied:
 
 ```go
 config := ironport.DefaultIronportConfig()
 config.Users = users
 config.Signer = signer
-srv := ironport.NewServer(config)
-srv.SSHAlgorithms = ironport.SSHAlgorithms{
-    KeyExchanges: []string{ssh.KeyExchangeCurve25519},
-    Ciphers:      []string{ssh.CipherAES256CTR},
-    MACs:         []string{ssh.HMACSHA256},
-    PublicKeyAuthAlgorithms: []string{
-        ssh.KeyAlgoED25519,
-        ssh.KeyAlgoRSASHA256,
-    },
+config.SSHKeyExchanges = []string{ssh.KeyExchangeCurve25519}
+config.SSHCiphers = []string{ssh.CipherAES256CTR}
+config.SSHMACs = []string{ssh.HMACSHA256}
+config.SSHPublicKeyAuthAlgorithms = []string{
+    ssh.KeyAlgoED25519,
+    ssh.KeyAlgoRSASHA256,
 }
+srv := ironport.NewServer(config)
 ```
 
 For RSA host-key signature pinning, pass a signer already restricted with
