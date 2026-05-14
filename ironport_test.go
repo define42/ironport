@@ -626,6 +626,7 @@ func TestNewServer(t *testing.T) {
 	config.Addr = ":0"
 	config.FtpAddr = ":0"
 	config.FtpPassivePortRange = "5000-5010"
+	config.FtpDataAcceptTimeout = 17 * time.Second
 	config.Users = users
 	config.Signer = signer
 	config.CompletedUploadSize = defaultCompletedUploadsSize
@@ -639,6 +640,9 @@ func TestNewServer(t *testing.T) {
 	}
 	if srv.ftpPassivePortRange != "5000-5010" {
 		t.Errorf("ftpPassivePortRange = %q; want 5000-5010", srv.ftpPassivePortRange)
+	}
+	if srv.ftpDataAcceptTimeout != 17*time.Second {
+		t.Errorf("ftpDataAcceptTimeout = %v; want 17s", srv.ftpDataAcceptTimeout)
 	}
 	if len(srv.users) != 1 {
 		t.Errorf("users len = %d; want 1", len(srv.users))
@@ -665,6 +669,9 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if config.FtpPassivePortRange != "5000-5010" {
 		t.Errorf("FtpPassivePortRange = %q; want 5000-5010", config.FtpPassivePortRange)
+	}
+	if config.FtpDataAcceptTimeout != 0 {
+		t.Errorf("FtpDataAcceptTimeout = %v; want 0", config.FtpDataAcceptTimeout)
 	}
 	if config.CompletedUploadSize != defaultCompletedUploadsSize {
 		t.Errorf("CompletedUploadSize = %d; want %d", config.CompletedUploadSize, defaultCompletedUploadsSize)
@@ -2111,6 +2118,28 @@ func TestServer_RemoveAllUsers(t *testing.T) {
 	}
 }
 
+func TestServer_RemoveAllUsers_ReplacesUserMap(t *testing.T) {
+	srv := newTestServer(":0", "", "", map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: t.TempDir(), CanRead: true},
+	}, testSigner(t), defaultCompletedUploadsSize)
+
+	srv.mu.RLock()
+	oldUsers := srv.users
+	srv.mu.RUnlock()
+
+	srv.RemoveAllUsers()
+
+	if len(oldUsers) != 1 {
+		t.Fatalf("old user map length = %d; want 1", len(oldUsers))
+	}
+	srv.mu.RLock()
+	n := len(srv.users)
+	srv.mu.RUnlock()
+	if n != 0 {
+		t.Fatalf("new user map length = %d; want 0", n)
+	}
+}
+
 // TestNewSignerFromFile verifies that NewSignerFromFile loads a valid PEM key file
 // and returns a usable signer, and that it returns an error for invalid inputs.
 func TestNewSignerFromFile(t *testing.T) {
@@ -2852,6 +2881,47 @@ func TestServer_AddUserKey(t *testing.T) {
 	_ = dialSFTP(t, addr, "alice", "alicepw")
 }
 
+func TestServer_AddUserKey_DoesNotMutateExistingAuthorizedKeysSnapshots(t *testing.T) {
+	root := t.TempDir()
+	_, pubKey1 := testClientKey(t)
+	_, pubKey2 := testClientKey(t)
+	srv := newTestServer(":0", "", "", map[string]UserInfo{
+		"alice": {AuthorizedKeys: []ssh.PublicKey{pubKey1}, Root: root, CanRead: true},
+	}, testSigner(t), defaultCompletedUploadsSize)
+
+	// Simulate a future reader holding a UserInfo copy whose AuthorizedKeys
+	// slice has spare capacity. AddUserKey must not append into that backing
+	// array after the reader has released the lock.
+	keys := make([]ssh.PublicKey, 1, 2)
+	keys[0] = pubKey1
+	srv.mu.Lock()
+	u := srv.users["alice"]
+	u.AuthorizedKeys = keys
+	srv.users["alice"] = u
+	snapshot := srv.users["alice"]
+	srv.mu.Unlock()
+
+	srv.AddUserKey("alice", pubKey2)
+
+	if len(snapshot.AuthorizedKeys) != 1 {
+		t.Fatalf("snapshot AuthorizedKeys length = %d; want 1", len(snapshot.AuthorizedKeys))
+	}
+	grownSnapshot := snapshot.AuthorizedKeys[:2]
+	if grownSnapshot[1] != nil {
+		t.Fatal("AddUserKey appended into an existing snapshot's AuthorizedKeys backing array")
+	}
+
+	srv.mu.RLock()
+	stored := srv.users["alice"].AuthorizedKeys
+	srv.mu.RUnlock()
+	if len(stored) != 2 {
+		t.Fatalf("stored AuthorizedKeys length = %d; want 2", len(stored))
+	}
+	if !bytes.Equal(stored[1].Marshal(), pubKey2.Marshal()) {
+		t.Fatal("stored AuthorizedKeys missing appended key")
+	}
+}
+
 // TestServer_RemoveUserKey verifies that RemoveUserKey revokes a specific key
 // while leaving any other keys (and password auth) intact.
 func TestServer_RemoveUserKey(t *testing.T) {
@@ -3588,6 +3658,64 @@ func TestServer_ListenAndServe_Close(t *testing.T) {
 	}
 }
 
+// TestServer_ListenAndServe_RestartAfterClose verifies that Close stops the
+// current listeners cleanly enough for the same Server to be started again,
+// even while an older accepted connection is still draining.
+func TestServer_ListenAndServe_RestartAfterClose(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv := newTestServer("127.0.0.1:0", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+	sshCfg := &ssh.ClientConfig{
+		User:            "testuser",
+		Auth:            []ssh.AuthMethod{ssh.Password("testpw")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+
+	errc1 := make(chan error, 1)
+	go func() { errc1 <- srv.ListenAndServe() }()
+	addr1 := waitForSFTPListener(t, srv, errc1)
+
+	conn1, err := ssh.Dial("tcp", addr1, sshCfg)
+	if err != nil {
+		t.Fatalf("first ssh.Dial: %v", err)
+	}
+	defer func() { _ = conn1.Close() }()
+
+	if err := srv.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	// Start again immediately, before the first ListenAndServe goroutine has
+	// necessarily finished its cleanup.
+	errc2 := make(chan error, 1)
+	go func() { errc2 <- srv.ListenAndServe() }()
+	addr2 := waitForSFTPListener(t, srv, errc2)
+
+	conn2, err := ssh.Dial("tcp", addr2, sshCfg)
+	if err != nil {
+		t.Fatalf("second ssh.Dial: %v", err)
+	}
+	_ = conn2.Close()
+
+	if err := srv.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	_ = conn1.Close()
+
+	for name, errc := range map[string]chan error{"first": errc1, "second": errc2} {
+		select {
+		case err := <-errc:
+			if err != nil {
+				t.Errorf("%s ListenAndServe returned %v; want nil", name, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s ListenAndServe did not return after Close", name)
+		}
+	}
+}
+
 // TestServer_Close_BeforeListenAndServe verifies that calling Close before
 // ListenAndServe is a safe no-op and does not panic or return an error.
 func TestServer_Close_BeforeListenAndServe(t *testing.T) {
@@ -3605,11 +3733,16 @@ func startListenAndServe(t *testing.T, users map[string]UserInfo) (srv *Server, 
 	srv = newTestServer("127.0.0.1:0", "", "", users, testSigner(t), defaultCompletedUploadsSize)
 	errCh = make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()
+	addr = waitForSFTPListener(t, srv, errCh)
+	return srv, addr, errCh
+}
 
+func waitForSFTPListener(t *testing.T, srv *Server, errCh <-chan error) string {
+	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if a := srv.ListeningAddr(); a != nil {
-			return srv, a.String(), errCh
+			return a.String()
 		}
 		select {
 		case err := <-errCh:
@@ -3620,7 +3753,7 @@ func startListenAndServe(t *testing.T, users map[string]UserInfo) (srv *Server, 
 	}
 	_ = srv.Close()
 	t.Fatal("server did not start in time")
-	return nil, "", nil
+	return ""
 }
 
 // TestServer_Shutdown_DrainsInFlight verifies that Shutdown waits for an
@@ -3745,20 +3878,50 @@ func TestServer_Shutdown_BeforeListenAndServe(t *testing.T) {
 	}
 }
 
-// TestServer_ListenAndServe_AfterShutdown verifies that once a server has been
-// shut down it cannot be restarted; ListenAndServe returns a sentinel error
-// instead of silently spinning a refusing accept loop.
+// TestServer_ListenAndServe_AfterShutdown verifies that Shutdown drains the
+// current run but does not permanently poison the Server; it can be started
+// again once Shutdown returns.
 func TestServer_ListenAndServe_AfterShutdown(t *testing.T) {
-	srv := newTestServer("127.0.0.1:0", "", "", map[string]UserInfo{}, testSigner(t), defaultCompletedUploadsSize)
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: t.TempDir(), CanRead: true, CanWrite: true},
+	}
+	srv, _, errc1 := startListenAndServe(t, users)
 	if err := srv.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
-	err := srv.ListenAndServe()
-	if err == nil {
-		t.Fatal("expected ListenAndServe to fail after Shutdown")
+	select {
+	case err := <-errc1:
+		if err != nil {
+			t.Fatalf("first ListenAndServe returned %v; want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first ListenAndServe did not return after Shutdown")
 	}
-	if want := "ironport: server has been shut down"; err.Error() != want {
-		t.Errorf("got %q; want %q", err.Error(), want)
+
+	errc2 := make(chan error, 1)
+	go func() { errc2 <- srv.ListenAndServe() }()
+	addr := waitForSFTPListener(t, srv, errc2)
+	sshCfg := &ssh.ClientConfig{
+		User:            "alice",
+		Auth:            []ssh.AuthMethod{ssh.Password("alicepw")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	conn, err := ssh.Dial("tcp", addr, sshCfg)
+	if err != nil {
+		t.Fatalf("ssh.Dial after restart: %v", err)
+	}
+	_ = conn.Close()
+
+	if err := srv.Close(); err != nil {
+		t.Fatalf("Close after restart: %v", err)
+	}
+	select {
+	case err := <-errc2:
+		if err != nil {
+			t.Errorf("second ListenAndServe returned %v; want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second ListenAndServe did not return after Close")
 	}
 }
 
@@ -4505,6 +4668,61 @@ func TestServer_EffectiveIdleTimeout(t *testing.T) {
 	s.idleTimeout = -1
 	if got := s.effectiveIdleTimeout(); got != 0 {
 		t.Errorf("negative idleTimeout = %v; want 0", got)
+	}
+}
+
+func TestServer_EffectiveFTPDataAcceptTimeout(t *testing.T) {
+	s := &Server{}
+	if got := s.effectiveFTPDataAcceptTimeout(); got != defaultFTPDataAcceptTimeout {
+		t.Errorf("default ftpDataAcceptTimeout = %v; want %v", got, defaultFTPDataAcceptTimeout)
+	}
+	s.ftpDataAcceptTimeout = 7 * time.Second
+	if got := s.effectiveFTPDataAcceptTimeout(); got != 7*time.Second {
+		t.Errorf("custom ftpDataAcceptTimeout = %v; want 7s", got)
+	}
+	s.ftpDataAcceptTimeout = -1
+	if got := s.effectiveFTPDataAcceptTimeout(); got != 0 {
+		t.Errorf("negative ftpDataAcceptTimeout = %v; want 0", got)
+	}
+}
+
+func TestFTPSession_AcceptDataConnUsesConfiguredTimeout(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := &ftpSession{
+		server: &Server{
+			ftpDataAcceptTimeout: 20 * time.Millisecond,
+		},
+		dataLn: ln,
+	}
+
+	start := time.Now()
+	errCh := make(chan error, 1)
+	go func() {
+		dc, err := fs.acceptDataConn()
+		if dc != nil {
+			_ = dc.Close()
+		}
+		errCh <- err
+	}()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("acceptDataConn returned nil error; want timeout")
+		}
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			t.Fatalf("acceptDataConn error = %v; want timeout", err)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("acceptDataConn took %v; expected configured timeout", elapsed)
+		}
+	case <-time.After(time.Second):
+		_ = ln.Close()
+		t.Fatal("acceptDataConn did not return after configured timeout")
 	}
 }
 

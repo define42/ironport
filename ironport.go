@@ -74,6 +74,9 @@ const (
 	// suppresses the CompletedUpload notification for a STOR/APPE that did
 	// not finish cleanly.
 	ftpDataIdleTimeout = 5 * time.Minute
+	// defaultFTPDataAcceptTimeout bounds how long a passive-mode FTP data
+	// listener waits for the client to connect after PASV/EPSV.
+	defaultFTPDataAcceptTimeout = 30 * time.Second
 	// defaultCompletedUploadsSize is the fallback buffer size used for the
 	// CompletedUploads channel.
 	defaultCompletedUploadsSize = 64
@@ -90,7 +93,7 @@ const (
 	// user has configured. Users with more than this many keys still take
 	// longer; tune upward if a deployment routinely exceeds it.
 	authorizedKeyTimingPad = 32
-	// defaultTCPKeepAlivePeriod is the SO_KEEPALIVE probe interval applied
+	// defaultTCPKeepAlivePeriod is the SO_KEEPALIVE idle period applied
 	// to accepted control connections when Config.TCPKeepAlivePeriod
 	// is zero. Keepalive probes prevent stateful firewalls and NAT devices
 	// from silently dropping long-idle control connections, and surface
@@ -297,6 +300,16 @@ func cloneUsers(users map[string]UserInfo) map[string]UserInfo {
 	return cloned
 }
 
+func (s *Server) userSnapshot(username string) (UserInfo, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	u, ok := s.users[username]
+	if !ok {
+		return UserInfo{}, false
+	}
+	return cloneUserInfo(u), true
+}
+
 func normalizeTempExtensions(src []string) []string {
 	if len(src) == 0 {
 		return nil
@@ -361,6 +374,10 @@ type Server struct {
 	// to a single port or inclusive range such as "5000-5010". Leave it empty
 	// to let the OS choose any available port.
 	ftpPassivePortRange string
+	// ftpDataAcceptTimeout bounds how long passive-mode FTP data listeners wait
+	// for the client data connection after PASV/EPSV. Zero selects the package
+	// default; negative disables the deadline.
+	ftpDataAcceptTimeout time.Duration
 	// users maps usernames to their credentials and jail roots.
 	users map[string]UserInfo
 	// mu protects users, completedUploads, authEvents, and listeners for concurrent reads and writes.
@@ -369,6 +386,13 @@ type Server struct {
 	ln net.Listener
 	// ftpLn is the active FTP listener; set by ListenAndServe and closed by Close.
 	ftpLn net.Listener
+	// serveID increments for each ListenAndServe invocation so cleanup from an
+	// older run cannot clear listeners published by a restarted run.
+	serveID uint64
+	// serving is true while a ListenAndServe invocation is starting or has
+	// active listeners. Close clears it after closing the current listeners,
+	// allowing a new ListenAndServe call while older in-flight sessions drain.
+	serving bool
 	// signer is the host key used for the SSH handshake.
 	signer ssh.Signer
 	// SSH algorithm allow-lists. Nil slices use golang.org/x/crypto/ssh
@@ -402,7 +426,7 @@ type Server struct {
 	// the package default (15 minutes); a negative value disables the idle
 	// timeout entirely.
 	idleTimeout time.Duration
-	// tcpKeepAlivePeriod is the SO_KEEPALIVE probe interval applied to
+	// tcpKeepAlivePeriod is the SO_KEEPALIVE idle period applied to
 	// accepted SFTP and FTP control connections. A zero value selects the
 	// package default; a negative value disables keepalive entirely.
 	tcpKeepAlivePeriod time.Duration
@@ -424,10 +448,13 @@ type Server struct {
 	// from its handler. It is consulted by Shutdown to force-close
 	// stragglers when the caller's context deadline fires.
 	activeConns map[net.Conn]struct{}
-	// shuttingDown is set by Shutdown so subsequent trackConn calls refuse
-	// new work instead of starting handlers we would have to drain. It is
-	// guarded by mu so it serialises with connWG.Add inside trackConn.
-	// Shutdown is one-shot: once set, ListenAndServe cannot start again.
+	// shutdownWaiters counts concurrent Shutdown callers so shuttingDown stays
+	// true until the final caller has finished waiting on connWG.
+	shutdownWaiters int
+	// shuttingDown is set while Shutdown is draining so subsequent trackConn
+	// calls refuse new work instead of starting handlers we would have to
+	// drain. It is guarded by mu so it serialises with connWG.Add inside
+	// trackConn.
 	shuttingDown bool
 }
 
@@ -436,10 +463,14 @@ type Config struct {
 	Addr                string
 	FtpAddr             string
 	FtpPassivePortRange string
-	Users               map[string]UserInfo
-	Signer              ssh.Signer
-	CompletedUploadSize int
-	AuthEventSize       int
+	// FtpDataAcceptTimeout bounds how long passive-mode FTP data listeners wait
+	// for the client data connection after PASV/EPSV. Zero selects the package
+	// default (30 seconds); negative disables the deadline.
+	FtpDataAcceptTimeout time.Duration
+	Users                map[string]UserInfo
+	Signer               ssh.Signer
+	CompletedUploadSize  int
+	AuthEventSize        int
 	// SSHKeyExchanges, SSHCiphers, SSHMACs, and
 	// SSHPublicKeyAuthAlgorithms optionally pin SSH negotiation and public-key
 	// auth signature algorithms. Nil slices use golang.org/x/crypto/ssh
@@ -455,7 +486,7 @@ type Config struct {
 	// IdleTimeout bounds authenticated SFTP connection inactivity. Zero selects
 	// the package default; negative disables the idle timeout.
 	IdleTimeout time.Duration
-	// TCPKeepAlivePeriod controls the SO_KEEPALIVE probe interval applied to
+	// TCPKeepAlivePeriod controls the SO_KEEPALIVE idle period applied to
 	// accepted SFTP and FTP control connections. Zero selects the package
 	// default (30 seconds); a negative value disables keepalive entirely.
 	// Probes keep idle control connections alive through stateful
@@ -492,7 +523,7 @@ func (s *Server) RemoveUser(username string) {
 func (s *Server) RemoveAllUsers() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	clear(s.users)
+	s.users = make(map[string]UserInfo)
 }
 
 // AddUserKey appends key to the AuthorizedKeys of an existing user.
@@ -509,8 +540,9 @@ func (s *Server) AddUserKey(username string, key ssh.PublicKey) {
 	if !ok {
 		return
 	}
+	keys := slices.Clone(u.AuthorizedKeys)
 	keyBytes := key.Marshal()
-	for _, existing := range u.AuthorizedKeys {
+	for _, existing := range keys {
 		if existing == nil {
 			continue
 		}
@@ -518,7 +550,7 @@ func (s *Server) AddUserKey(username string, key ssh.PublicKey) {
 			return // already present
 		}
 	}
-	u.AuthorizedKeys = append(u.AuthorizedKeys, key)
+	u.AuthorizedKeys = append(keys, key)
 	s.users[username] = u
 }
 
@@ -584,6 +616,7 @@ func NewServer(config *Config) *Server {
 		addr:                       config.Addr,
 		ftpAddr:                    config.FtpAddr,
 		ftpPassivePortRange:        config.FtpPassivePortRange,
+		ftpDataAcceptTimeout:       config.FtpDataAcceptTimeout,
 		users:                      cloneUsers(config.Users),
 		signer:                     config.Signer,
 		completedUploads:           newCompletedUploadsChannel(config.CompletedUploadSize),
@@ -621,6 +654,57 @@ func (s *Server) ensureSigner() error {
 	}
 	s.signer = signer
 	return nil
+}
+
+func (s *Server) beginListenAndServe() (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.shuttingDown {
+		return 0, errors.New("ironport: server is shutting down")
+	}
+	if s.serving {
+		return 0, errors.New("ironport: server is already running")
+	}
+	s.serveID++
+	s.serving = true
+	return s.serveID, nil
+}
+
+func (s *Server) publishListeners(runID uint64, sftpLn, ftpLn net.Listener) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.serveID != runID || !s.serving || s.shuttingDown {
+		return false
+	}
+	s.ln = sftpLn
+	s.ftpLn = ftpLn
+	return true
+}
+
+func (s *Server) finishListenAndServe(runID uint64) {
+	s.mu.Lock()
+	if s.serveID == runID {
+		s.ln = nil
+		s.ftpLn = nil
+		s.serving = false
+	}
+	s.mu.Unlock()
+}
+
+func (s *Server) beginShutdown() {
+	s.mu.Lock()
+	s.shuttingDown = true
+	s.shutdownWaiters++
+	s.mu.Unlock()
+}
+
+func (s *Server) endShutdown() {
+	s.mu.Lock()
+	s.shutdownWaiters--
+	if s.shutdownWaiters == 0 {
+		s.shuttingDown = false
+	}
+	s.mu.Unlock()
 }
 
 // trackConn records nc as an in-flight handler-owned connection. It returns
@@ -786,18 +870,20 @@ func (s *Server) listenFTPData(host string) (net.Listener, error) {
 // too. It blocks until Close or Shutdown is called or an unexpected
 // listener error occurs. It returns nil when stopped via Close or Shutdown.
 //
-// A server that has been Shutdown cannot be reused; ListenAndServe returns
-// an error in that case. Construct a fresh server instead.
+// A stopped server can be started again by calling ListenAndServe after Close
+// or Shutdown returns. Concurrent ListenAndServe calls are rejected.
 func (s *Server) ListenAndServe() error {
 	if strings.TrimSpace(s.addr) == "" {
 		return errors.New("ironport: Addr is required")
 	}
-	s.mu.RLock()
-	closed := s.shuttingDown
-	s.mu.RUnlock()
-	if closed {
-		return errors.New("ironport: server has been shut down")
+	runID, err := s.beginListenAndServe()
+	if err != nil {
+		return err
 	}
+	var sftpLn net.Listener
+	var ftpLn net.Listener
+	defer s.finishListenAndServe(runID)
+
 	if err := s.ensureSigner(); err != nil {
 		return fmt.Errorf("ironport: %w", err)
 	}
@@ -812,12 +898,11 @@ func (s *Server) ListenAndServe() error {
 	authEvents := s.authEventsChan()
 	cfg := s.sshServerConfig()
 
-	sftpLn, err := net.Listen("tcp", s.addr)
+	sftpLn, err = net.Listen("tcp", s.addr)
 	if err != nil {
 		return err
 	}
 
-	var ftpLn net.Listener
 	if strings.TrimSpace(s.ftpAddr) != "" {
 		ftpLn, err = net.Listen("tcp", s.ftpAddr)
 		if err != nil {
@@ -826,17 +911,9 @@ func (s *Server) ListenAndServe() error {
 		}
 	}
 
-	s.mu.Lock()
-	s.ln = sftpLn
-	s.ftpLn = ftpLn
-	s.mu.Unlock()
-
-	defer func() {
-		s.mu.Lock()
-		s.ln = nil
-		s.ftpLn = nil
-		s.mu.Unlock()
-	}()
+	if !s.publishListeners(runID, sftpLn, ftpLn) {
+		return closeListenerPair(sftpLn, ftpLn)
+	}
 
 	log.Printf("SFTP listening on %s", sftpLn.Addr())
 	workers := 1
@@ -853,7 +930,7 @@ func (s *Server) ListenAndServe() error {
 	for i := 0; i < workers; i++ {
 		if err := <-errCh; err != nil && ret == nil {
 			ret = err
-			_ = s.closeListeners()
+			_ = s.closeRunListeners(runID, sftpLn, ftpLn)
 		}
 	}
 	return ret
@@ -963,12 +1040,26 @@ func (s *Server) effectiveIdleTimeout() time.Duration {
 	return d
 }
 
+// effectiveFTPDataAcceptTimeout returns the effective passive data-connection
+// accept timeout. A zero configured timeout selects the package default; a
+// negative timeout disables the deadline.
+func (s *Server) effectiveFTPDataAcceptTimeout() time.Duration {
+	d := s.ftpDataAcceptTimeout
+	switch {
+	case d == 0:
+		return defaultFTPDataAcceptTimeout
+	case d < 0:
+		return 0
+	}
+	return d
+}
+
 // chownAllowed returns the configured chown permission.
 func (s *Server) chownAllowed() bool {
 	return s.allowChown
 }
 
-// effectiveTCPKeepAlivePeriod returns the effective SO_KEEPALIVE probe interval for
+// effectiveTCPKeepAlivePeriod returns the effective SO_KEEPALIVE idle period for
 // accepted control connections. A zero configured value selects the package
 // default; a negative value disables keepalive (returns 0).
 func (s *Server) effectiveTCPKeepAlivePeriod() time.Duration {
@@ -983,20 +1074,29 @@ func (s *Server) effectiveTCPKeepAlivePeriod() time.Duration {
 }
 
 // applyTCPKeepAlive enables SO_KEEPALIVE on a freshly accepted control
-// connection and sets the probe interval. A non-positive period disables
-// keepalive. Connections that are not *net.TCPConn (e.g. test fakes) are
-// left untouched.
+// connection and sets the idle period before probes begin. A non-positive
+// period disables keepalive. Connections that are not *net.TCPConn (e.g. test
+// fakes) are left untouched.
 func applyTCPKeepAlive(nc net.Conn, period time.Duration) {
 	tc, ok := nc.(*net.TCPConn)
 	if !ok {
 		return
 	}
 	if period <= 0 {
-		_ = tc.SetKeepAlive(false)
+		_ = tc.SetKeepAliveConfig(net.KeepAliveConfig{
+			Enable:   false,
+			Idle:     -1,
+			Interval: -1,
+			Count:    -1,
+		})
 		return
 	}
-	_ = tc.SetKeepAlive(true)
-	_ = tc.SetKeepAlivePeriod(period)
+	_ = tc.SetKeepAliveConfig(net.KeepAliveConfig{
+		Enable:   true,
+		Idle:     period,
+		Interval: -1,
+		Count:    -1,
+	})
 }
 
 // cleanSFTPClientPath normalises a raw SFTP client path into an absolute,
@@ -1084,8 +1184,9 @@ func hasTempExt(name string, tempExts []string) bool {
 
 // Close stops both listeners, causing ListenAndServe to return nil. It is safe
 // to call concurrently with active connections; in-flight connections are not
-// terminated. Calling Close before ListenAndServe has been called, or after it
-// has already returned, is a no-op.
+// terminated, and the server can be started again after Close returns. Calling
+// Close before ListenAndServe has been called, or after it has already
+// returned, is a no-op.
 func (s *Server) Close() error {
 	return s.closeListeners()
 }
@@ -1101,18 +1202,17 @@ func (s *Server) Close() error {
 // blocks until all handlers exit.
 //
 // Shutdown is safe to call concurrently with Close and with itself. After
-// Shutdown returns, ListenAndServe (if it was running) will have returned
-// nil. Calling Shutdown before ListenAndServe has been started, or after it
-// has already returned and all handlers have exited, returns immediately
-// with nil.
+// Shutdown returns, ListenAndServe (if it was running) will have returned nil,
+// and the server can be started again. Calling Shutdown before ListenAndServe
+// has been started, or after it has already returned and all handlers have
+// exited, returns immediately with nil.
 func (s *Server) Shutdown(ctx context.Context) error {
 	// Mark the server as shutting down so any accept that races with the
 	// listener close refuses the connection rather than starting a handler
 	// we would then have to drain. Setting this under mu serialises with
 	// trackConn's connWG.Add so the WaitGroup Add/Wait pair is race-free.
-	s.mu.Lock()
-	s.shuttingDown = true
-	s.mu.Unlock()
+	s.beginShutdown()
+	defer s.endShutdown()
 	listenerErr := s.closeListeners()
 
 	done := make(chan struct{})
@@ -1137,22 +1237,42 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 }
 
-func (s *Server) closeListeners() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+func closeListenerPair(ln, ftpLn net.Listener) error {
 	var ret error
-	if s.ln != nil {
-		if err := s.ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+	if ln != nil {
+		if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			ret = err
 		}
 	}
-	if s.ftpLn != nil {
-		if err := s.ftpLn.Close(); err != nil && !errors.Is(err, net.ErrClosed) && ret == nil {
+	if ftpLn != nil {
+		if err := ftpLn.Close(); err != nil && !errors.Is(err, net.ErrClosed) && ret == nil {
 			ret = err
 		}
 	}
 	return ret
+}
+
+func (s *Server) closeRunListeners(runID uint64, ln, ftpLn net.Listener) error {
+	s.mu.Lock()
+	if s.serveID == runID {
+		s.ln = nil
+		s.ftpLn = nil
+		s.serving = false
+	}
+	s.mu.Unlock()
+	return closeListenerPair(ln, ftpLn)
+}
+
+func (s *Server) closeListeners() error {
+	s.mu.Lock()
+	ln := s.ln
+	ftpLn := s.ftpLn
+	s.ln = nil
+	s.ftpLn = nil
+	s.serving = false
+	s.mu.Unlock()
+
+	return closeListenerPair(ln, ftpLn)
 }
 
 // ListeningAddr returns the actual SFTP network address the server is listening
@@ -1255,9 +1375,7 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 		},
 		PublicKeyAuthAlgorithms: slices.Clone(s.sshPublicKeyAuthAlgorithms),
 		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
-			s.mu.RLock()
-			u, ok := s.users[c.User()]
-			s.mu.RUnlock()
+			u, ok := s.userSnapshot(c.User())
 			// Compare SHA-256 hashes of both passwords so that the comparison
 			// always operates on the same 32-byte length regardless of whether
 			// the username exists or what length the stored password has. A
@@ -1282,9 +1400,7 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 			return permissionsFor(u, c.User(), jailRoot), nil
 		},
 		PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			s.mu.RLock()
-			u, ok := s.users[c.User()]
-			s.mu.RUnlock()
+			u, ok := s.userSnapshot(c.User())
 			keyBytes := key.Marshal()
 			// Hash the presented key's wire-format bytes to a fixed 32-byte
 			// value so that all comparisons in the loop are the same length
@@ -2258,9 +2374,7 @@ func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
 }
 
 func (f *ftpSession) authenticate(pass string) bool {
-	f.server.mu.RLock()
-	u, ok := f.server.users[f.username]
-	f.server.mu.RUnlock()
+	u, ok := f.server.userSnapshot(f.username)
 
 	var storedPw string
 	if ok {
@@ -2291,7 +2405,7 @@ func (f *ftpSession) authenticate(pass string) bool {
 		Root:           jailRoot,
 		CanRead:        u.CanRead,
 		CanWrite:       u.CanWrite,
-		AuthorizedKeys: u.AuthorizedKeys,
+		AuthorizedKeys: slices.Clone(u.AuthorizedKeys),
 	}
 	f.authenticated = true
 	f.cwd = "/"
@@ -2462,7 +2576,9 @@ func (f *ftpSession) acceptDataConn() (net.Conn, error) {
 	defer func() { _ = ln.Close() }()
 
 	if tcpLn, ok := ln.(*net.TCPListener); ok {
-		_ = tcpLn.SetDeadline(time.Now().Add(30 * time.Second))
+		if timeout := f.server.effectiveFTPDataAcceptTimeout(); timeout > 0 {
+			_ = tcpLn.SetDeadline(time.Now().Add(timeout))
+		}
 	}
 
 	dc, err := ln.Accept()

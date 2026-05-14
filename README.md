@@ -180,12 +180,15 @@ config.Users = users
 config.Signer = signer
 config.FtpAddr = ":2121"
 config.FtpPassivePortRange = "5000-5010"
+config.FtpDataAcceptTimeout = 30 * time.Second // zero selects this default
 srv := ironport.NewServer(config)
 ```
 
 When FTP is enabled, only passive mode (`PASV` / `EPSV`) is supported; active
 mode (`PORT` / `EPRT`) is refused, and the data connection peer IP is checked
-against the control connection to prevent passive-port stealing.
+against the control connection to prevent passive-port stealing. Passive data
+listeners wait up to `FtpDataAcceptTimeout` for the client to connect; set it
+negative to disable that deadline.
 
 ## Public-key authentication
 
@@ -229,7 +232,7 @@ srv.RemoveAllUsers()
 waits for every in-flight handler to return. If `ctx` expires first, the
 remaining tracked connections are force-closed and `ctx.Err()` is returned.
 After `Shutdown` returns, `ListenAndServe` will have returned `nil`; the
-server cannot be restarted (construct a new one instead).
+same `Server` can be started again by calling `ListenAndServe`.
 
 ```go
 ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -240,7 +243,9 @@ if err := srv.Shutdown(ctx); err != nil {
 ```
 
 Use `Close()` when you want the legacy behavior of closing the listener
-without waiting for sessions to drain.
+without waiting for sessions to drain. The same `Server` can be started again
+after `Close` returns; existing sessions from the previous run continue until
+they finish or a later `Shutdown(ctx)` drains them.
 
 ## Host key
 
