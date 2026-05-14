@@ -578,13 +578,25 @@ func (s *Server) RemoveUser(username string) {
 	}
 }
 
-// RemoveAllUsers removes every user entry from the server's user map.
-// Active connections are not terminated, and no on-disk user data is removed.
+// RemoveAllUsers removes every user entry from the server's user map and
+// force-closes any connections currently authenticated as one of those users.
+// Connections that have not yet completed authentication are left alone so
+// they can either finish authenticating against the (now empty) user map or
+// be rejected by it. No on-disk user data is removed.
 // It is safe to call concurrently with active connections.
 func (s *Server) RemoveAllUsers() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.users = make(map[string]UserInfo)
+	var toClose []net.Conn
+	for nc, u := range s.activeConns {
+		if u != "" {
+			toClose = append(toClose, nc)
+		}
+	}
+	s.mu.Unlock()
+	for _, c := range toClose {
+		_ = c.Close()
+	}
 }
 
 // AddUserKey appends key to the AuthorizedKeys of an existing user.

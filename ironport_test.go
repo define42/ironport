@@ -2073,6 +2073,85 @@ func TestServer_RemoveUser_DisconnectsActiveFTP(t *testing.T) {
 	}
 }
 
+// TestServer_RemoveAllUsers_DisconnectsActive verifies that RemoveAllUsers
+// force-closes every connection currently authenticated as one of the
+// removed users.
+func TestServer_RemoveAllUsers_DisconnectsActive(t *testing.T) {
+	root1 := t.TempDir()
+	root2 := t.TempDir()
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: root1, CanRead: true, CanWrite: true},
+		"bob":   {Password: "bobpw", Root: root2, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	alice := dialSFTP(t, addr, "alice", "alicepw")
+	bob := dialSFTP(t, addr, "bob", "bobpw")
+
+	srv.RemoveAllUsers()
+
+	assertClientClosed := func(name string, client *sftp.Client) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			if _, err := client.ReadDir("/"); err != nil {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("expected SFTP session for %q to be closed after RemoveAllUsers, but it still serves requests", name)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	assertClientClosed("alice", alice)
+	assertClientClosed("bob", bob)
+}
+
+// TestServer_RemoveAllUsers_LeavesPreAuthAlone verifies that RemoveAllUsers
+// does not close TCP connections that have not yet completed authentication.
+// Such connections will simply fail to authenticate against the now-empty
+// user map; closing them pre-auth could mask client-side error reporting.
+func TestServer_RemoveAllUsers_LeavesPreAuthAlone(t *testing.T) {
+	srv, addr, stop := startTestServer(t, map[string]UserInfo{})
+	t.Cleanup(stop)
+
+	// Open a raw TCP connection but do not start the SSH handshake.
+	preAuth, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("net.DialTimeout: %v", err)
+	}
+	t.Cleanup(func() { _ = preAuth.Close() })
+
+	// Give the server a moment to trackConn the new socket.
+	deadline := time.Now().Add(time.Second)
+	for {
+		srv.mu.RLock()
+		n := len(srv.activeConns)
+		srv.mu.RUnlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected 1 tracked conn before RemoveAllUsers, got %d", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	srv.RemoveAllUsers()
+
+	// The pre-auth connection must still be open. A short-deadline Read
+	// should either time out (no bytes from the server yet) or return >0
+	// bytes (the SSH banner) — both indicate the conn is alive. An EOF or
+	// "connection reset" would mean RemoveAllUsers wrongly kicked it.
+	_ = preAuth.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	buf := make([]byte, 256)
+	n, err := preAuth.Read(buf)
+	if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("pre-auth connection was closed by RemoveAllUsers: err=%v n=%d", err, n)
+	}
+}
+
 // TestServer_AddUser_Replace verifies that AddUser replaces an existing user's info.
 func TestServer_AddUser_Replace(t *testing.T) {
 	root := t.TempDir()
