@@ -313,6 +313,7 @@ func startTestFTPServerWithActive(t *testing.T, users map[string]UserInfo, ftpPa
 	return startTestFTPServerWithConfig(t, newTestFTPConfig(t, users, ftpPassivePortRange, true))
 }
 
+//nolint:gocognit // test harness setup: many optional config knobs to thread through
 func startTestFTPServerWithConfig(t *testing.T, config *Config) (srv *Server, addr string, stop func()) {
 	t.Helper()
 
@@ -742,6 +743,7 @@ func TestNewServer(t *testing.T) {
 	}
 }
 
+//nolint:gocognit,cyclop,funlen // verifies every default field; splitting would just rename the function
 func TestDefaultConfig(t *testing.T) {
 	config := DefaultConfig()
 	if config.SftpAddr != ":2022" {
@@ -1239,6 +1241,7 @@ func TestServerListenFTPData(t *testing.T) {
 	})
 }
 
+//nolint:gocognit,cyclop,funlen // single end-to-end FTP scenario: upload, download, list, verify
 func TestFTPServer_UploadDownloadList(t *testing.T) {
 	root := t.TempDir()
 	users := map[string]UserInfo{
@@ -1325,6 +1328,8 @@ func TestFTPServer_UploadDownloadList(t *testing.T) {
 // uploaded byte count and reject mismatches rather than announce a
 // truncated upload as complete. This is the only way to detect a client
 // that half-closes early in STREAM mode (see cmdStor for the discussion).
+//
+//nolint:funlen // multi-case ALLO/STOR verification flow; splitting would duplicate setup
 func TestFTPServer_AlloSizeVerification(t *testing.T) {
 	root := t.TempDir()
 	users := map[string]UserInfo{
@@ -1602,6 +1607,7 @@ func TestFTPServer_RestBeyondFileSizeRejected(t *testing.T) {
 	}
 }
 
+//nolint:gocognit,cyclop,funlen // covers DELE/MKD/RMD/RNFR/RNTO/MDTM/SIZE in one walking scenario
 func TestFTPServer_FileManagementCommands(t *testing.T) {
 	root := t.TempDir()
 	content := []byte("hello ftp commands")
@@ -1774,6 +1780,7 @@ func TestFTPServer_CommandPermissionDenials(t *testing.T) {
 	client.command(550, "RNTO renamed.txt")
 }
 
+//nolint:gocognit,cyclop,funlen // covers EPSV/EPRT/MLST/MLSD/LANG/HOST in one walking scenario
 func TestFTPServer_ExtendedCommands(t *testing.T) {
 	root := t.TempDir()
 	content := []byte("hello mlsd world")
@@ -2369,6 +2376,8 @@ func TestServer_RemoveAllUsers_ReplacesUserMap(t *testing.T) {
 
 // TestNewSignerFromFile verifies that NewSignerFromFile loads a valid PEM key file
 // and returns a usable signer, and that it returns an error for invalid inputs.
+//
+//nolint:gocognit,funlen // exercises every supported key type and every error branch in one fixture
 func TestNewSignerFromFile(t *testing.T) {
 	t.Run("RSA key file", func(t *testing.T) {
 		dir := t.TempDir()
@@ -2443,6 +2452,8 @@ func TestNewSignerFromFile(t *testing.T) {
 
 // TestSFTPServer_WithFileHostKey verifies that the server works end-to-end when
 // started with a host key loaded from a file via NewSignerFromFile.
+//
+//nolint:funlen // end-to-end host-key file load + handshake assertion is one logical scenario
 func TestSFTPServer_WithFileHostKey(t *testing.T) {
 	dir := t.TempDir()
 	root := t.TempDir()
@@ -2561,6 +2572,8 @@ func TestSFTPServer_JailedWorkingDirectory(t *testing.T) {
 
 // TestSFTPServer_CompletedUploadsQueue verifies that after a file upload finishes
 // the server announces the SFTP path on the CompletedUploads channel.
+//
+//nolint:gocognit // verifies queue semantics under back-pressure across multiple uploads
 func TestSFTPServer_CompletedUploadsQueue(t *testing.T) {
 	root := t.TempDir()
 
@@ -2901,6 +2914,7 @@ func TestSFTPServer_PublicKeyAuth_InvalidKey(t *testing.T) {
 	}
 }
 
+//nolint:gocognit // exhaustively walks symlink/non-dir/relative-path error paths
 func TestCanonicalJailRoot(t *testing.T) {
 	target := t.TempDir()
 	link := filepath.Join(t.TempDir(), "root-link")
@@ -2947,6 +2961,7 @@ func TestCanonicalJailRoot(t *testing.T) {
 	}
 }
 
+//nolint:gocognit // covers each jail-root rejection path against a live SSH handshake
 func TestSFTPServer_PasswordAuth_ValidatesJailRoot(t *testing.T) {
 	target := t.TempDir()
 	filePath := filepath.Join(t.TempDir(), "root-file")
@@ -4174,6 +4189,8 @@ func TestServer_ListenAndServe_EmptySftpAddr(t *testing.T) {
 
 // TestServer_ListenAndServe_NilSignerGeneratesHostKey verifies that
 // ListenAndServe generates an ephemeral host key when sftpSigner is nil.
+//
+//nolint:gocognit // boots a real listener and verifies the generated host key is usable
 func TestServer_ListenAndServe_NilSignerGeneratesHostKey(t *testing.T) {
 	config := DefaultConfig()
 	config.SftpAddr = "127.0.0.1:0"
@@ -4506,6 +4523,8 @@ func TestServer_TempExtensionsNormalisation(t *testing.T) {
 // TestSFTPServer_TempExtensions_SuppressesUploadAndAnnouncesOnRename verifies
 // the end-to-end flow: a file uploaded with a temp extension does NOT produce
 // a CompletedUploads notification, and renaming it to its final name does.
+//
+//nolint:gocognit // upload-then-rename flow with event-channel assertions in a single scenario
 func TestSFTPServer_TempExtensions_SuppressesUploadAndAnnouncesOnRename(t *testing.T) {
 	root := t.TempDir()
 	users := map[string]UserInfo{
@@ -5681,6 +5700,8 @@ func TestSFTPServer_RejectsCRLFInFilenames(t *testing.T) {
 // a new PASV request fails fast with 425 rather than hanging or silently
 // drifting outside the range — and that the session pool recovers when a
 // holder releases its listener.
+//
+//nolint:gocognit // loops over the entire passive port range to verify exhaustion behavior
 func TestFTPServer_PASVExhaustsPortRange(t *testing.T) {
 	root := t.TempDir()
 	users := map[string]UserInfo{
@@ -5754,6 +5775,8 @@ func TestFTPServer_PASVExhaustsPortRange(t *testing.T) {
 // close, read 226. Any goroutine that runs while the range is full gets 425
 // on PASV and retries — the test only requires that every goroutine
 // eventually completes successfully and that the on-disk file matches.
+//
+//nolint:gocognit,cyclop,funlen // concurrency test orchestrating multiple workers across passive transfers
 func TestFTPServer_PASVConcurrentTransfers(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping concurrent PASV stress in -short mode")
@@ -6024,6 +6047,8 @@ func FuzzFtpListLine(f *testing.F) {
 // without losing or merging any of them. Pipelining is not allowed by RFC
 // 959 but is harmless when commands are framed correctly, so the server
 // should still answer each one.
+//
+//nolint:gocognit // pipelined-command race needs the full I/O sequence in one function
 func TestFTPServer_PipelinedCommands(t *testing.T) {
 	root := t.TempDir()
 	users := map[string]UserInfo{
@@ -6156,6 +6181,7 @@ func TestFTPServer_ActiveModeDisabledByDefault(t *testing.T) {
 	client.command(502, "EPRT |1|127.0.0.1|1234|")
 }
 
+//nolint:cyclop,funlen // sequential RETR/STOR/abort transitions; splitting would obscure the protocol flow
 func TestFTPServer_ActiveModeTransfers(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "download.txt"), []byte("retr-data"), 0o600); err != nil {
@@ -6536,6 +6562,8 @@ func TestFTPServer_RestPastEOFThenRETR(t *testing.T) {
 // ABOR control message is observed. Either is acceptable — the test
 // just requires that two well-formed replies arrive and that the
 // session survives.
+//
+//nolint:gocognit,cyclop,funlen // ABOR-during-transfer race; splitting would break the timing relationship
 func TestFTPServer_AborMidTransferRace(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping race iterations in -short mode")
