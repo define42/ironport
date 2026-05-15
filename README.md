@@ -35,6 +35,9 @@ returns an error on older kernels rather than silently degrading the policy.
 
 - Security reports: see [SECURITY.md](SECURITY.md).
 - Release notes: see [CHANGELOG.md](CHANGELOG.md).
+- Compatibility: release versions follow SemVer. While the major version is
+  `v1`, exported Go APIs are backward compatible across minor and patch
+  releases; breaking API changes require a major version bump.
 - Contributions: see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Quick start
