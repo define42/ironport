@@ -6893,7 +6893,7 @@ func TestFTPS_RequireTLSRejectsCleartextLogin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	tp := textproto.NewConn(conn)
 	if _, _, err := tp.ReadResponse(220); err != nil {
 		t.Fatalf("greeting: %v", err)
@@ -6930,7 +6930,7 @@ func TestFTPS_BufferedBytesAttackRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	r := bufio.NewReader(conn)
 	// Read the 220 greeting.
@@ -6996,7 +6996,7 @@ func TestFTPS_DataConnRequiresResumption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial data: %v", err)
 	}
-	defer dc.Close()
+	defer func() { _ = dc.Close() }()
 
 	// Fresh session cache => no ticket presented => handshake fresh.
 	freshCfg := &tls.Config{
