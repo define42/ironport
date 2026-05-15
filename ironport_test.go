@@ -73,7 +73,7 @@ func TestJailFS_RejectsSymlinkComponents(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(root, "real"), 0o750); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "real", "file.txt"), []byte("hi"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "real", "file.txt"), []byte("hi"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -138,7 +138,7 @@ func TestJailFS_RejectsSymlinkComponents(t *testing.T) {
 // they cannot reach a sibling jail or the real filesystem root.
 func TestJailFS_PathTraversalContained(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "inside.txt"), []byte("x"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "inside.txt"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	jfs, err := openJailFS(root)
@@ -283,7 +283,7 @@ func dialSFTP(t *testing.T, addr, user, pass string) *sftp.Client {
 	sshCfg := &ssh.ClientConfig{
 		User:            user,
 		Auth:            []ssh.AuthMethod{ssh.Password(pass)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	conn, err := ssh.Dial("tcp", addr, sshCfg)
 	if err != nil {
@@ -518,10 +518,13 @@ func parseFTPPASVResponse(msg string) (string, int, error) {
 		if err != nil {
 			return "", 0, err
 		}
+		if value < 0 || value > 255 {
+			return "", 0, fmt.Errorf("PASV octet/byte %d out of range: %d", i, value)
+		}
 		values[i] = value
 	}
 
-	host := net.IPv4(byte(values[0]), byte(values[1]), byte(values[2]), byte(values[3])).String()
+	host := net.IPv4(byte(values[0]), byte(values[1]), byte(values[2]), byte(values[3])).String() //nolint:gosec // values bounded to [0,255] above
 	port := values[4]*256 + values[5]
 	return host, port, nil
 }
@@ -567,7 +570,7 @@ func TestSFTPServer_UploadDownload(t *testing.T) {
 func TestSFTPServer_List(t *testing.T) {
 	root := t.TempDir()
 	// Pre-create a file so we have something to list.
-	if err := os.WriteFile(filepath.Join(root, "listed.txt"), []byte("x"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "listed.txt"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -603,7 +606,7 @@ func TestSFTPServer_InvalidCredentials(t *testing.T) {
 	sshCfg := &ssh.ClientConfig{
 		User:            "testuser",
 		Auth:            []ssh.AuthMethod{ssh.Password("wrongpw")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	_, err := ssh.Dial("tcp", addr, sshCfg)
 	if err == nil {
@@ -622,7 +625,7 @@ func TestSFTPServer_AuthEventsLoginSuccessAndLogout(t *testing.T) {
 	sshCfg := &ssh.ClientConfig{
 		User:            "testuser",
 		Auth:            []ssh.AuthMethod{ssh.Password("rightpw")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	conn, err := ssh.Dial("tcp", addr, sshCfg)
 	if err != nil {
@@ -654,7 +657,7 @@ func TestSFTPServer_AuthEventsPasswordLoginFailed(t *testing.T) {
 	sshCfg := &ssh.ClientConfig{
 		User:            "testuser",
 		Auth:            []ssh.AuthMethod{ssh.Password("wrongpw")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	if conn, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
 		_ = conn.Close()
@@ -680,7 +683,7 @@ func TestSFTPServer_AuthEventsPublicKeyLoginFailed(t *testing.T) {
 	sshCfg := &ssh.ClientConfig{
 		User:            "keyuser",
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(wrongSigner)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	if conn, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
 		_ = conn.Close()
@@ -860,7 +863,7 @@ func TestSFTPServer_SSHAlgorithmPinning(t *testing.T) {
 		},
 		User:            "alice",
 		Auth:            []ssh.AuthMethod{ssh.Password("alicepw")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	conn, err := ssh.Dial("tcp", addr, sshCfg)
 	if err != nil {
@@ -890,7 +893,7 @@ func TestSFTPServer_PublicKeyAuthAlgorithmPinning(t *testing.T) {
 	sshCfg := &ssh.ClientConfig{
 		User:            "alice",
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(clientSigner)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	conn, err := ssh.Dial("tcp", addr, sshCfg)
 	if err != nil {
@@ -1263,7 +1266,7 @@ func TestFTPServer_UploadDownloadList(t *testing.T) {
 	_ = uploadConn.Close()
 	client.read(226)
 
-	if got, err := os.ReadFile(filepath.Join(root, "upload.txt")); err != nil {
+	if got, err := os.ReadFile(filepath.Join(root, "upload.txt")); err != nil { //nolint:gosec // path joined under t.TempDir()
 		t.Fatalf("os.ReadFile: %v", err)
 	} else if !bytes.Equal(got, content) {
 		t.Fatalf("uploaded file content = %q; want %q", got, content)
@@ -1413,7 +1416,7 @@ func TestFTPServer_ListStreamsLargeDirectory(t *testing.T) {
 	expected := make(map[string]struct{}, entryCount)
 	for i := 0; i < entryCount; i++ {
 		name := fmt.Sprintf("entry-%05d", i)
-		if err := os.WriteFile(filepath.Join(root, name), []byte{}, 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(root, name), []byte{}, 0o600); err != nil {
 			t.Fatalf("os.WriteFile(%s): %v", name, err)
 		}
 		expected[name] = struct{}{}
@@ -1522,7 +1525,7 @@ func TestFTPServer_AborMidTransfer(t *testing.T) {
 		t.Fatal("timed out waiting for post-abort upload event")
 	}
 
-	if got, err := os.ReadFile(filepath.Join(root, "after.txt")); err != nil {
+	if got, err := os.ReadFile(filepath.Join(root, "after.txt")); err != nil { //nolint:gosec // path joined under t.TempDir()
 		t.Fatalf("os.ReadFile(after.txt): %v", err)
 	} else if !bytes.Equal(got, body) {
 		t.Fatalf("after.txt = %q; want %q", got, body)
@@ -1538,7 +1541,7 @@ func TestFTPServer_RestBeyondFileSizeRejected(t *testing.T) {
 	root := t.TempDir()
 	existing := []byte("abcde") // 5 bytes
 	existingPath := filepath.Join(root, "existing.txt")
-	if err := os.WriteFile(existingPath, existing, 0o644); err != nil {
+	if err := os.WriteFile(existingPath, existing, 0o600); err != nil {
 		t.Fatalf("os.WriteFile: %v", err)
 	}
 
@@ -1563,7 +1566,7 @@ func TestFTPServer_RestBeyondFileSizeRejected(t *testing.T) {
 	_ = rejectConn.Close()
 	client.read(554)
 
-	if got, err := os.ReadFile(existingPath); err != nil {
+	if got, err := os.ReadFile(existingPath); err != nil { //nolint:gosec // path under t.TempDir()
 		t.Fatalf("os.ReadFile(existing) after rejected REST: %v", err)
 	} else if !bytes.Equal(got, existing) {
 		t.Fatalf("existing.txt after rejected REST = %q; want %q (untouched)", got, existing)
@@ -1592,7 +1595,7 @@ func TestFTPServer_RestBeyondFileSizeRejected(t *testing.T) {
 	client.read(226)
 
 	want := append(append([]byte{}, existing...), 'F', 'G', 'H')
-	if got, err := os.ReadFile(existingPath); err != nil {
+	if got, err := os.ReadFile(existingPath); err != nil { //nolint:gosec // path under t.TempDir()
 		t.Fatalf("os.ReadFile(existing) after REST=size: %v", err)
 	} else if !bytes.Equal(got, want) {
 		t.Fatalf("existing.txt after REST=size = %q; want %q", got, want)
@@ -1603,17 +1606,17 @@ func TestFTPServer_FileManagementCommands(t *testing.T) {
 	root := t.TempDir()
 	content := []byte("hello ftp commands")
 	filePath := filepath.Join(root, "file.txt")
-	if err := os.WriteFile(filePath, content, 0o644); err != nil {
+	if err := os.WriteFile(filePath, content, 0o600); err != nil {
 		t.Fatalf("os.WriteFile(file): %v", err)
 	}
 	mtime := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
 	if err := os.Chtimes(filePath, mtime, mtime); err != nil {
 		t.Fatalf("os.Chtimes(file): %v", err)
 	}
-	if err := os.Mkdir(filepath.Join(root, "space dir"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(root, "space dir"), 0o750); err != nil {
 		t.Fatalf("os.Mkdir(space dir): %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "rename-src.txt"), []byte("rename me"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "rename-src.txt"), []byte("rename me"), 0o600); err != nil {
 		t.Fatalf("os.WriteFile(rename-src): %v", err)
 	}
 
@@ -1697,7 +1700,7 @@ func TestFTPServer_FileManagementCommands(t *testing.T) {
 	_ = appendConn.Close()
 	client.read(226)
 	appended := append(append([]byte{}, content...), '!')
-	if got, err := os.ReadFile(filePath); err != nil {
+	if got, err := os.ReadFile(filePath); err != nil { //nolint:gosec // path under t.TempDir()
 		t.Fatalf("os.ReadFile after APPE: %v", err)
 	} else if !bytes.Equal(got, appended) {
 		t.Fatalf("file after APPE = %q; want %q", got, appended)
@@ -1714,7 +1717,7 @@ func TestFTPServer_FileManagementCommands(t *testing.T) {
 	client.read(226)
 	resumed := append([]byte{}, appended...)
 	copy(resumed[5:], []byte("++"))
-	if got, err := os.ReadFile(filePath); err != nil {
+	if got, err := os.ReadFile(filePath); err != nil { //nolint:gosec // path under t.TempDir()
 		t.Fatalf("os.ReadFile after resumed STOR: %v", err)
 	} else if !bytes.Equal(got, resumed) {
 		t.Fatalf("file after resumed STOR = %q; want %q", got, resumed)
@@ -1743,10 +1746,10 @@ func TestFTPServer_FileManagementCommands(t *testing.T) {
 
 func TestFTPServer_CommandPermissionDenials(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "file.txt"), []byte("contents"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "file.txt"), []byte("contents"), 0o600); err != nil {
 		t.Fatalf("os.WriteFile: %v", err)
 	}
-	if err := os.Mkdir(filepath.Join(root, "dir"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(root, "dir"), 0o750); err != nil {
 		t.Fatalf("os.Mkdir: %v", err)
 	}
 
@@ -1774,14 +1777,14 @@ func TestFTPServer_CommandPermissionDenials(t *testing.T) {
 func TestFTPServer_ExtendedCommands(t *testing.T) {
 	root := t.TempDir()
 	content := []byte("hello mlsd world")
-	if err := os.WriteFile(filepath.Join(root, "file.txt"), content, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "file.txt"), content, 0o600); err != nil {
 		t.Fatalf("os.WriteFile: %v", err)
 	}
 	mtime := time.Date(2024, 6, 7, 8, 9, 10, 0, time.UTC)
 	if err := os.Chtimes(filepath.Join(root, "file.txt"), mtime, mtime); err != nil {
 		t.Fatalf("os.Chtimes: %v", err)
 	}
-	if err := os.Mkdir(filepath.Join(root, "sub"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(root, "sub"), 0o750); err != nil {
 		t.Fatalf("os.Mkdir: %v", err)
 	}
 
@@ -1987,7 +1990,7 @@ func TestFTPServer_AuthEventsUserLogsOutPreviousSession(t *testing.T) {
 // list files but cannot upload or delete files.
 func TestSFTPServer_ReadOnlyUser(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "data.txt"), []byte("read me"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "data.txt"), []byte("read me"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2073,7 +2076,7 @@ func TestServer_AddRemoveUser(t *testing.T) {
 	sshCfg := &ssh.ClientConfig{
 		User:            "dynamic",
 		Auth:            []ssh.AuthMethod{ssh.Password("dynpw")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
 		t.Fatal("expected auth failure before AddUser, got nil")
@@ -2246,7 +2249,7 @@ func TestServer_AddUser_Replace(t *testing.T) {
 	sshCfg := &ssh.ClientConfig{
 		User:            "user1",
 		Auth:            []ssh.AuthMethod{ssh.Password("oldpw")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
 		t.Fatal("expected old password to fail after AddUser replace, got nil")
@@ -2271,8 +2274,12 @@ func TestServer_AddUser_ClonesAuthorizedKeys(t *testing.T) {
 		CanRead:        true,
 	})
 
+	// Mutate the caller-owned slice through both its visible length and its
+	// extra capacity to verify AddUser cloned the slice (and not just
+	// captured a reference). keys has len=1, cap=2 so the cap-2 reslice and
+	// index 1 write are in-bounds; gosec G602 does not track cap.
 	keys[0] = pubKey2
-	keys[:2][1] = pubKey2
+	keys[:2][1] = pubKey2 //nolint:gosec // cap=2 reslice; intentional aliasing test
 
 	srv.mu.RLock()
 	got := srv.users["alice"]
@@ -2323,7 +2330,7 @@ func TestServer_RemoveAllUsers(t *testing.T) {
 		sshCfg := &ssh.ClientConfig{
 			User:            username,
 			Auth:            []ssh.AuthMethod{ssh.Password(password)},
-			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+			HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 		}
 		if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
 			t.Fatalf("expected auth failure for %q after RemoveAllUsers, got nil", username)
@@ -2509,7 +2516,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 // but on disk that "/" is mounted to her actual home directory.
 func TestSFTPServer_JailedWorkingDirectory(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "file.txt"), []byte("hello"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "file.txt"), []byte("hello"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2680,7 +2687,7 @@ func TestSFTPServer_OpenFileAppendHonorsAppendFlag(t *testing.T) {
 		t.Fatalf("Close append: %v", err)
 	}
 
-	got, err := os.ReadFile(filepath.Join(root, "append.txt"))
+	got, err := os.ReadFile(filepath.Join(root, "append.txt")) //nolint:gosec // path under t.TempDir()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2715,7 +2722,7 @@ func TestSFTPServer_OpenFileWriteOnlyDoesNotTruncate(t *testing.T) {
 		t.Fatalf("Close plain: %v", err)
 	}
 
-	got, err := os.ReadFile(filepath.Join(root, "plain.txt"))
+	got, err := os.ReadFile(filepath.Join(root, "plain.txt")) //nolint:gosec // path under t.TempDir()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2742,7 +2749,7 @@ func TestSFTPServer_OpenFileExclusiveCreateHonorsExcl(t *testing.T) {
 		_ = f.Close()
 		t.Fatal("OpenFile(O_CREATE|O_EXCL) on existing file succeeded; want error")
 	}
-	got, err := os.ReadFile(filepath.Join(root, "exists.txt"))
+	got, err := os.ReadFile(filepath.Join(root, "exists.txt")) //nolint:gosec // path under t.TempDir()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2761,7 +2768,7 @@ func TestSFTPServer_OpenFileExclusiveCreateHonorsExcl(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatalf("Close new: %v", err)
 	}
-	got, err = os.ReadFile(filepath.Join(root, "new.txt"))
+	got, err = os.ReadFile(filepath.Join(root, "new.txt")) //nolint:gosec // path under t.TempDir()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2792,7 +2799,7 @@ func dialSFTPWithPublicKey(t *testing.T, addr, user string, signer ssh.Signer) *
 	sshCfg := &ssh.ClientConfig{
 		User:            user,
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	conn, err := ssh.Dial("tcp", addr, sshCfg)
 	if err != nil {
@@ -2887,7 +2894,7 @@ func TestSFTPServer_PublicKeyAuth_InvalidKey(t *testing.T) {
 	sshCfg := &ssh.ClientConfig{
 		User:            "keyuser",
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(wrongSigner)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
 		t.Fatal("expected authentication error with wrong key, got nil")
@@ -3050,8 +3057,11 @@ func TestNewServer_ClonesUsersMapAndAuthorizedKeys(t *testing.T) {
 
 	users["alice"] = UserInfo{Password: "pw2", Root: root}
 	delete(users, "alice")
+	// keys has len=1, cap=2 so the cap-2 reslice and index 1 write are
+	// in-bounds; gosec G602 does not track cap. This verifies NewServer
+	// cloned the AuthorizedKeys slice (including the unused capacity).
 	keys[0] = pubKey2
-	keys[:2][1] = pubKey2
+	keys[:2][1] = pubKey2 //nolint:gosec // cap=2 reslice; intentional aliasing test
 
 	srv.mu.RLock()
 	got, ok := srv.users["alice"]
@@ -3087,7 +3097,7 @@ func TestServer_AddUserKey(t *testing.T) {
 	sshCfg := &ssh.ClientConfig{
 		User:            "alice",
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(newSigner)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
 		t.Fatal("expected auth failure before AddUserKey, got nil")
@@ -3172,7 +3182,7 @@ func TestServer_RemoveUserKey(t *testing.T) {
 	sshCfg := &ssh.ClientConfig{
 		User:            "bob",
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer1)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
 		t.Fatal("expected auth failure for removed key, got nil")
@@ -3850,7 +3860,7 @@ func TestServer_ListenAndServe_Close(t *testing.T) {
 	sshCfg := &ssh.ClientConfig{
 		User:            "testuser",
 		Auth:            []ssh.AuthMethod{ssh.Password("testpw")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	conn, err := ssh.Dial("tcp", addr, sshCfg)
 	if err != nil {
@@ -3890,7 +3900,7 @@ func TestServer_ListenAndServe_RestartAfterClose(t *testing.T) {
 	sshCfg := &ssh.ClientConfig{
 		User:            "testuser",
 		Auth:            []ssh.AuthMethod{ssh.Password("testpw")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 
 	errc1 := make(chan error, 1)
@@ -3987,7 +3997,7 @@ func TestServer_Shutdown_DrainsInFlight(t *testing.T) {
 	sshCfg := &ssh.ClientConfig{
 		User:            "alice",
 		Auth:            []ssh.AuthMethod{ssh.Password("alicepw")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	conn, err := ssh.Dial("tcp", addr, sshCfg)
 	if err != nil {
@@ -4053,7 +4063,7 @@ func TestServer_Shutdown_ForceClosesOnContextDeadline(t *testing.T) {
 	sshCfg := &ssh.ClientConfig{
 		User:            "alice",
 		Auth:            []ssh.AuthMethod{ssh.Password("alicepw")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	conn, err := ssh.Dial("tcp", addr, sshCfg)
 	if err != nil {
@@ -4124,7 +4134,7 @@ func TestServer_ListenAndServe_AfterShutdown(t *testing.T) {
 	sshCfg := &ssh.ClientConfig{
 		User:            "alice",
 		Auth:            []ssh.AuthMethod{ssh.Password("alicepw")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	conn, err := ssh.Dial("tcp", addr, sshCfg)
 	if err != nil {
@@ -4259,7 +4269,7 @@ func TestSFTPServer_PasswordAuth_NonExistentUser(t *testing.T) {
 	sshCfg := &ssh.ClientConfig{
 		User:            "nobody",
 		Auth:            []ssh.AuthMethod{ssh.Password("alicepw")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
 		t.Fatal("expected auth failure for non-existent user, got nil")
@@ -4640,7 +4650,7 @@ func TestSFTPServer_EmptyStoredPassword_Rejected(t *testing.T) {
 	sshCfg := &ssh.ClientConfig{
 		User:            "nopw",
 		Auth:            []ssh.AuthMethod{ssh.Password("")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
 		t.Fatal("expected auth failure when both stored and supplied passwords are empty, got nil")
@@ -4661,7 +4671,7 @@ func TestSFTPServer_EmptySuppliedPassword_Rejected(t *testing.T) {
 	sshCfg := &ssh.ClientConfig{
 		User:            "alice",
 		Auth:            []ssh.AuthMethod{ssh.Password("")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
 		t.Fatal("expected auth failure for empty supplied password, got nil")
@@ -4860,7 +4870,7 @@ func TestSFTPServer_Setstat_TruncateAndTimes(t *testing.T) {
 // pretending to succeed.
 func TestSFTPServer_Setstat_PermissionDeniedForReadOnly(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "ro.txt"), []byte("ro"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "ro.txt"), []byte("ro"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	users := map[string]UserInfo{
@@ -5327,7 +5337,7 @@ func TestSFTPServer_SymlinkRejected(t *testing.T) {
 // by a client connection drop would be mis-reported as a complete upload.
 func TestWriteLogger_TransferErrorSuppressesNotification(t *testing.T) {
 	root := t.TempDir()
-	f, err := os.OpenFile(filepath.Join(root, "partial.bin"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(filepath.Join(root, "partial.bin"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600) //nolint:gosec // path under t.TempDir()
 	if err != nil {
 		t.Fatalf("OpenFile: %v", err)
 	}
@@ -5358,7 +5368,7 @@ func TestWriteLogger_TransferErrorSuppressesNotification(t *testing.T) {
 // upload on the CompletedUploads channel.
 func TestWriteLogger_CleanCloseAnnouncesUpload(t *testing.T) {
 	root := t.TempDir()
-	f, err := os.OpenFile(filepath.Join(root, "ok.bin"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(filepath.Join(root, "ok.bin"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600) //nolint:gosec // path under t.TempDir()
 	if err != nil {
 		t.Fatalf("OpenFile: %v", err)
 	}
@@ -5391,7 +5401,7 @@ func TestWriteLogger_CleanCloseAnnouncesUpload(t *testing.T) {
 // call is ignored, so a subsequent clean Close still announces the upload.
 func TestWriteLogger_TransferErrorNilIsNoop(t *testing.T) {
 	root := t.TempDir()
-	f, err := os.OpenFile(filepath.Join(root, "ok2.bin"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(filepath.Join(root, "ok2.bin"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600) //nolint:gosec // path under t.TempDir()
 	if err != nil {
 		t.Fatalf("OpenFile: %v", err)
 	}
@@ -5434,7 +5444,7 @@ func TestSFTPServer_InterruptedUploadNotAnnounced(t *testing.T) {
 	sshCfg := &ssh.ClientConfig{
 		User:            "testuser",
 		Auth:            []ssh.AuthMethod{ssh.Password("testpw")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
 	}
 	conn, err := ssh.Dial("tcp", addr, sshCfg)
 	if err != nil {
@@ -5529,7 +5539,7 @@ func TestFtpQuotePath_SanitizesControlBytes(t *testing.T) {
 func TestFtpListLine_SanitizesName(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "stub")
-	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+	if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(p)
@@ -5553,7 +5563,7 @@ func TestFtpListLine_SanitizesName(t *testing.T) {
 // LIST.
 func TestFTPServer_RejectsCRLFInWriteCommands(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "renameable.txt"), []byte("x"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "renameable.txt"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	users := map[string]UserInfo{
@@ -5589,7 +5599,7 @@ func TestFTPServer_RejectsCRLFInWriteCommands(t *testing.T) {
 func TestFTPServer_LISTSanitizesEmbeddedCRLF(t *testing.T) {
 	root := t.TempDir()
 	const badName = "good\r\nFAKE 200 injected"
-	if err := os.WriteFile(filepath.Join(root, badName), []byte("x"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, badName), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	users := map[string]UserInfo{
@@ -5630,7 +5640,7 @@ func TestFTPServer_LISTSanitizesEmbeddedCRLF(t *testing.T) {
 // echoed back to an FTP client and forge control-channel replies.
 func TestSFTPServer_RejectsCRLFInFilenames(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "src.txt"), []byte("x"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "src.txt"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	users := map[string]UserInfo{
@@ -5883,7 +5893,7 @@ func TestFTPServer_PASVConcurrentTransfers(t *testing.T) {
 
 	for i := 0; i < workers; i++ {
 		name := fmt.Sprintf("file-%02d.bin", i)
-		got, err := os.ReadFile(filepath.Join(root, name))
+		got, err := os.ReadFile(filepath.Join(root, name)) //nolint:gosec // path under t.TempDir()
 		if err != nil {
 			t.Fatalf("os.ReadFile(%s): %v", name, err)
 		}
@@ -5956,7 +5966,7 @@ func FuzzUnquoteFTPPath(f *testing.F) {
 	f.Add(` "leading space" `)
 	f.Add("\"\r\n\"")
 
-	f.Fuzz(func(t *testing.T, p string) {
+	f.Fuzz(func(_ *testing.T, p string) {
 		_ = unquoteFTPPath(p)
 	})
 }
@@ -5986,7 +5996,7 @@ func FuzzListPathArg(f *testing.F) {
 func FuzzFtpListLine(f *testing.F) {
 	dir := f.TempDir()
 	stub := filepath.Join(dir, "stub")
-	if err := os.WriteFile(stub, []byte("x"), 0o644); err != nil {
+	if err := os.WriteFile(stub, []byte("x"), 0o600); err != nil {
 		f.Fatal(err)
 	}
 	info, err := os.Stat(stub)
@@ -6148,7 +6158,7 @@ func TestFTPServer_ActiveModeDisabledByDefault(t *testing.T) {
 
 func TestFTPServer_ActiveModeTransfers(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "download.txt"), []byte("retr-data"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "download.txt"), []byte("retr-data"), 0o600); err != nil {
 		t.Fatalf("os.WriteFile(download): %v", err)
 	}
 	users := map[string]UserInfo{
@@ -6211,7 +6221,7 @@ func TestFTPServer_ActiveModeTransfers(t *testing.T) {
 	_ = storDC.Close()
 	_ = storLn.Close()
 	client.read(226)
-	if got, err := os.ReadFile(filepath.Join(root, "upload.txt")); err != nil {
+	if got, err := os.ReadFile(filepath.Join(root, "upload.txt")); err != nil { //nolint:gosec // path under t.TempDir()
 		t.Fatalf("os.ReadFile(upload): %v", err)
 	} else if !bytes.Equal(got, []byte("stor-data")) {
 		t.Fatalf("upload.txt = %q; want stor-data", got)
@@ -6343,7 +6353,7 @@ func TestFTPServer_ActiveModeAborMidTransfer(t *testing.T) {
 		t.Fatal("timed out waiting for post-abort active upload event")
 	}
 
-	if got, err := os.ReadFile(filepath.Join(root, "after.txt")); err != nil {
+	if got, err := os.ReadFile(filepath.Join(root, "after.txt")); err != nil { //nolint:gosec // path under t.TempDir()
 		t.Fatalf("os.ReadFile(after.txt): %v", err)
 	} else if !bytes.Equal(got, body) {
 		t.Fatalf("after.txt = %q; want %q", got, body)
@@ -6422,7 +6432,7 @@ func TestFTPServer_REINClearsEpsvAll(t *testing.T) {
 // failure so a confused client can recover by issuing PASV.
 func TestFTPServer_STORWithoutPassiveModeFails(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "exists.txt"), []byte("y"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "exists.txt"), []byte("y"), 0o600); err != nil {
 		t.Fatalf("os.WriteFile: %v", err)
 	}
 	users := map[string]UserInfo{
@@ -6457,7 +6467,7 @@ func TestFTPServer_STORWithoutPassiveModeFails(t *testing.T) {
 	_ = dc.Close()
 	client.read(226)
 
-	if got, err := os.ReadFile(filepath.Join(root, "after.txt")); err != nil {
+	if got, err := os.ReadFile(filepath.Join(root, "after.txt")); err != nil { //nolint:gosec // path under t.TempDir()
 		t.Fatalf("os.ReadFile(after.txt): %v", err)
 	} else if !bytes.Equal(got, []byte("ok")) {
 		t.Fatalf("after.txt = %q; want %q", got, "ok")
@@ -6475,7 +6485,7 @@ func TestFTPServer_STORWithoutPassiveModeFails(t *testing.T) {
 func TestFTPServer_RestPastEOFThenRETR(t *testing.T) {
 	root := t.TempDir()
 	existing := []byte("abcde")
-	if err := os.WriteFile(filepath.Join(root, "existing.txt"), existing, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "existing.txt"), existing, 0o600); err != nil {
 		t.Fatalf("os.WriteFile: %v", err)
 	}
 	_, addr, stop := startTestFTPServer(t, map[string]UserInfo{
@@ -6816,7 +6826,7 @@ func TestFTPS_PROTDataConnRoundTrip(t *testing.T) {
 	_ = tc.Close()
 	c.read(226)
 
-	got, err := os.ReadFile(filepath.Join(root, "hello.bin"))
+	got, err := os.ReadFile(filepath.Join(root, "hello.bin")) //nolint:gosec // path under t.TempDir()
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
@@ -6876,7 +6886,7 @@ func TestFTPS_RetrEOFIsCleanTLSShutdown(t *testing.T) {
 	}
 	one := make([]byte, 1)
 	_, err := tc.Read(one)
-	if err != io.EOF {
+	if !errors.Is(err, io.EOF) {
 		t.Fatalf("post-payload Read err = %v; want io.EOF (close_notify)", err)
 	}
 	_ = tc.Close()

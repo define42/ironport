@@ -36,14 +36,6 @@ linters:
         linters:
           - revive
         text: "don't use ALL_CAPS in Go names; use CamelCase"
-      - path: _test\.go$
-        linters:
-          - funlen
-          - gocognit
-          - gosec
-          - cyclop
-          - errorlint
-          - revive
 
 formatters:
   enable:
