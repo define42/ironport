@@ -8,7 +8,15 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
-No unreleased changes.
+- Added explicit FTPS support (RFC 4217). Set `Config.FtpTLSConfig` to enable
+  the `AUTH TLS`, `PBSZ`, and `PROT` commands on the FTP listener; set
+  `Config.FtpRequireTLS` to refuse `USER`/`PASS` until the control connection
+  is wrapped in TLS. `PROT P` data connections are TLS-wrapped using a
+  derived config that requires session resumption from the control channel
+  (defense against data-channel hijack), the buffered-bytes injection attack
+  against `AUTH TLS` is detected and the connection torn down, and every
+  TLS-wrapped data transfer is half-closed with `close_notify` so clients
+  can distinguish a complete transfer from a truncated one.
 
 ## v1.0.10 - 2026-05-14
 

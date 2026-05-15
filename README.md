@@ -9,6 +9,7 @@ A production-ready, embeddable SFTP server and FTP server library for Go with a 
 
 ## Features
 
+- **SFTP and FTP/FTPS in one binary** — a single server hosts both protocols against the same user database, jails, and permission flags. FTPS (explicit TLS via `AUTH TLS`, RFC 4217) opt-in with `FtpTLSConfig`; pair with `FtpRequireTLS` to refuse plaintext logins entirely
 - **SSH public-key and password authentication** — both methods use constant-time comparisons to prevent username enumeration via timing side-channels
 - **Per-user jail (chroot)** — each user is confined to a configurable root directory. Every filesystem operation is performed via Linux `openat2` with `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS`, so the kernel itself rejects path traversal and any symlink anywhere in the lookup
 - **Fine-grained permissions** — independent `CanRead` / `CanWrite` flags per user
@@ -170,13 +171,14 @@ srv := ironport.NewServer(config)
 For RSA host-key signature pinning, pass a signer already restricted with
 `ssh.NewSignerWithAlgorithms`.
 
-## FTP support (plaintext, opt-in)
+## FTP support (opt-in)
 
 This package also exposes an FTP listener that shares the SFTP user database,
-jails, and permission flags. **FTP transmits credentials and
-data in the clear and this server does not implement FTPS.** FTP is therefore
-disabled by default; enable it only on a trusted network segment where you
-control all clients and intermediate hops:
+jails, and permission flags. The listener is disabled by default — set
+`FtpAddr` to enable it. Without `FtpTLSConfig`, FTP transmits credentials and
+data in the clear, so it should only be used on a trusted network segment
+where you control all clients and intermediate hops. To require encryption,
+set `FtpTLSConfig` and `FtpRequireTLS = true` (see [FTPS support](#ftps-support-rfc-4217-explicit-tls) below).
 
 ```go
 config := ironport.DefaultConfig()
@@ -196,6 +198,49 @@ to prevent FTP bounce behavior. Passive data connections are checked against the
 control connection IP to prevent passive-port stealing. Passive listeners and
 active dials wait up to `FtpDataAcceptTimeout`; set it negative to disable that
 deadline.
+
+### FTPS support (RFC 4217, explicit TLS)
+
+Set `FtpTLSConfig` to a `*tls.Config` that carries the server certificate to
+advertise `AUTH TLS`, `PBSZ`, and `PROT` over the FTP listener. Set
+`FtpRequireTLS = true` to refuse `USER`/`PASS` until the control connection
+has been upgraded — this is the recommended mode for any FTP listener that
+faces an untrusted network.
+
+```go
+cert, err := tls.LoadX509KeyPair("ftps.crt", "ftps.key")
+if err != nil {
+    log.Fatal(err)
+}
+config := ironport.DefaultConfig()
+config.Users = users
+config.SftpSigner = signer
+config.FtpAddr = ":2121"
+config.FtpTLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+config.FtpRequireTLS = true
+srv := ironport.NewServer(config)
+```
+
+The implementation covers the three FTPS implementation traps that are easy
+to get wrong:
+
+- **Buffered-bytes injection** — after replying `234` to `AUTH TLS`, the
+  server verifies the receive buffer is empty before starting the TLS
+  handshake. A man-in-the-middle on the plaintext segment cannot pipeline
+  attacker-controlled commands behind the legitimate `AUTH TLS` line.
+- **Data-channel binding** — `PROT P` data connections are required to
+  resume the TLS session from the control channel; the server's
+  data-connection `tls.Config` enforces `DidResume == true` via
+  `VerifyConnection`. A peer that hijacks the data port cannot mount a
+  fresh handshake with its own certificate.
+- **Clean `close_notify` on transfers** — every TLS-wrapped data
+  connection is half-closed with `CloseWrite` before the underlying
+  socket is closed, so the client sees a proper TLS EOF and can
+  distinguish a complete download from a truncated one.
+
+Only explicit FTPS is supported; implicit FTPS (port 990, TLS from byte
+zero) is intentionally not implemented. The `CCC` command is refused —
+once TLS is negotiated, the session stays encrypted.
 
 ## Public-key authentication
 

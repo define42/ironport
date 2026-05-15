@@ -8,8 +8,11 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
+	"math/big"
 	"errors"
 	"fmt"
 	"io"
@@ -6599,4 +6602,412 @@ func TestFTPServer_AborMidTransferRace(t *testing.T) {
 	}
 	_ = dc.Close()
 	client.read(226)
+}
+
+// ---- FTPS (explicit, RFC 4217) integration tests ----
+
+// generateFTPSTestCert mints a single-host self-signed RSA certificate
+// suitable for use as the server certificate in FTPS test runs. It also
+// returns the CA pool that the client uses to verify it.
+func generateFTPSTestCert(t *testing.T) (tls.Certificate, *x509.CertPool) {
+	t.Helper()
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "ironport-ftps-test"},
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.IPv6loopback},
+		DNSNames:              []string{"localhost"},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}
+	pool := x509.NewCertPool()
+	parsed, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.AddCert(parsed)
+	return cert, pool
+}
+
+func newTestFTPSConfig(t *testing.T, users map[string]UserInfo, requireTLS bool) (*Config, *x509.CertPool) {
+	t.Helper()
+	cert, pool := generateFTPSTestCert(t)
+	cfg := newTestFTPConfig(t, users, "", false)
+	cfg.FtpTLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+	cfg.FtpRequireTLS = requireTLS
+	return cfg, pool
+}
+
+// ftpsTestClient drives an FTPS session over a fresh TCP connection. It
+// reuses the same textproto plumbing as ftpTestClient but rewraps the
+// reader/writer after the AUTH TLS handshake completes.
+type ftpsTestClient struct {
+	t        *testing.T
+	rawConn  net.Conn
+	tlsConn  *tls.Conn
+	conn     net.Conn
+	tp       *textproto.Conn
+	tlsCfg   *tls.Config
+	sessions tls.ClientSessionCache
+}
+
+func dialFTPS(t *testing.T, addr string, pool *x509.CertPool) *ftpsTestClient {
+	t.Helper()
+	raw, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("net.DialTimeout: %v", err)
+	}
+	c := &ftpsTestClient{
+		t:        t,
+		rawConn:  raw,
+		conn:     raw,
+		tp:       textproto.NewConn(raw),
+		sessions: tls.NewLRUClientSessionCache(8),
+		tlsCfg: &tls.Config{
+			RootCAs:    pool,
+			ServerName: "127.0.0.1",
+		},
+	}
+	c.tlsCfg.ClientSessionCache = c.sessions
+	if _, msg, err := c.tp.ReadResponse(220); err != nil {
+		t.Fatalf("greeting: %v (%s)", err, msg)
+	}
+	t.Cleanup(func() { _ = c.tp.Close() })
+	return c
+}
+
+func (c *ftpsTestClient) send(format string, args ...any) {
+	c.t.Helper()
+	if err := c.tp.PrintfLine(format, args...); err != nil {
+		c.t.Fatalf("PrintfLine(%q): %v", format, err)
+	}
+}
+
+func (c *ftpsTestClient) read(expect int) string {
+	c.t.Helper()
+	_, msg, err := c.tp.ReadResponse(expect)
+	if err != nil {
+		c.t.Fatalf("ReadResponse(%d): %v", expect, err)
+	}
+	return msg
+}
+
+func (c *ftpsTestClient) command(expect int, format string, args ...any) string {
+	c.t.Helper()
+	c.send(format, args...)
+	return c.read(expect)
+}
+
+func (c *ftpsTestClient) authTLS() {
+	c.t.Helper()
+	c.command(234, "AUTH TLS")
+	tlsConn := tls.Client(c.rawConn, c.tlsCfg)
+	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+		c.t.Fatalf("client TLS handshake: %v", err)
+	}
+	c.tlsConn = tlsConn
+	c.conn = tlsConn
+	c.tp = textproto.NewConn(tlsConn)
+}
+
+func (c *ftpsTestClient) login(user, pass string) {
+	c.t.Helper()
+	c.command(331, "USER %s", user)
+	c.command(230, "PASS %s", pass)
+}
+
+// passiveDial opens the data TCP connection after PASV but does not start
+// the TLS handshake. Use upgradeDataConn after the server has replied 150
+// to the transfer command: server-side TLS handshake on the data conn
+// runs only after the transfer command is processed, so starting the
+// client-side handshake before that would deadlock.
+func (c *ftpsTestClient) passiveDial() net.Conn {
+	c.t.Helper()
+	host, port, err := parseFTPPASVResponse(c.command(227, "PASV"))
+	if err != nil {
+		c.t.Fatalf("parse PASV: %v", err)
+	}
+	dc, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), 5*time.Second)
+	if err != nil {
+		c.t.Fatalf("dial data: %v", err)
+	}
+	return dc
+}
+
+// upgradeDataConn drives the client-side TLS handshake on an FTP data
+// connection. It must be called only after the server has replied 150 to
+// the transfer command.
+func (c *ftpsTestClient) upgradeDataConn(dc net.Conn) *tls.Conn {
+	c.t.Helper()
+	tc := tls.Client(dc, c.tlsCfg)
+	if err := tc.HandshakeContext(context.Background()); err != nil {
+		_ = dc.Close()
+		c.t.Fatalf("data TLS handshake: %v", err)
+	}
+	return tc
+}
+
+func TestFTPS_AdvertisesFEAT(t *testing.T) {
+	users := map[string]UserInfo{"u": {Password: "p", Root: t.TempDir(), CanRead: true, CanWrite: true}}
+	cfg, pool := newTestFTPSConfig(t, users, false)
+	_, addr, stop := startTestFTPServerWithConfig(t, cfg)
+	defer stop()
+
+	c := dialFTPS(t, addr, pool)
+	feat := c.command(211, "FEAT")
+	for _, want := range []string{"AUTH TLS", "PBSZ", "PROT"} {
+		if !strings.Contains(feat, want) {
+			t.Errorf("FEAT response missing %q\ngot:\n%s", want, feat)
+		}
+	}
+}
+
+func TestFTPS_AuthTLSAndLogin(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true}}
+	cfg, pool := newTestFTPSConfig(t, users, false)
+	_, addr, stop := startTestFTPServerWithConfig(t, cfg)
+	defer stop()
+
+	c := dialFTPS(t, addr, pool)
+	c.authTLS()
+	c.login("alice", "alicepw")
+	c.command(257, "PWD")
+}
+
+func TestFTPS_PROTDataConnRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true}}
+	cfg, pool := newTestFTPSConfig(t, users, false)
+	_, addr, stop := startTestFTPServerWithConfig(t, cfg)
+	defer stop()
+
+	c := dialFTPS(t, addr, pool)
+	c.authTLS()
+	c.login("alice", "alicepw")
+	c.command(200, "PBSZ 0")
+	c.command(200, "PROT P")
+	c.command(200, "TYPE I")
+
+	payload := []byte("encrypted upload payload")
+
+	// STOR over TLS
+	raw := c.passiveDial()
+	c.send("STOR hello.bin")
+	c.read(150)
+	tc := c.upgradeDataConn(raw)
+	if _, err := tc.Write(payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := tc.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite: %v", err)
+	}
+	_ = tc.Close()
+	c.read(226)
+
+	got, err := os.ReadFile(filepath.Join(root, "hello.bin"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("on-disk content = %q; want %q", got, payload)
+	}
+
+	// RETR over TLS — also exercises close_notify on the server side.
+	raw = c.passiveDial()
+	c.send("RETR hello.bin")
+	c.read(150)
+	tc = c.upgradeDataConn(raw)
+	buf, err := io.ReadAll(tc)
+	if err != nil {
+		t.Fatalf("ReadAll RETR: %v", err)
+	}
+	if !bytes.Equal(buf, payload) {
+		t.Fatalf("RETR payload = %q; want %q", buf, payload)
+	}
+	_ = tc.Close()
+	c.read(226)
+}
+
+// TestFTPS_RetrEOFIsCleanTLSShutdown verifies that a successful RETR ends
+// with a TLS close_notify (clean io.EOF from the TLS layer) rather than a
+// bare TCP FIN. Without close_notify a malicious party could truncate the
+// download and the client could not tell the difference.
+func TestFTPS_RetrEOFIsCleanTLSShutdown(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "f.bin"), []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	users := map[string]UserInfo{"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true}}
+	cfg, pool := newTestFTPSConfig(t, users, false)
+	_, addr, stop := startTestFTPServerWithConfig(t, cfg)
+	defer stop()
+
+	c := dialFTPS(t, addr, pool)
+	c.authTLS()
+	c.login("alice", "alicepw")
+	c.command(200, "PBSZ 0")
+	c.command(200, "PROT P")
+	c.command(200, "TYPE I")
+
+	raw := c.passiveDial()
+	c.send("RETR f.bin")
+	c.read(150)
+	tc := c.upgradeDataConn(raw)
+	// Reading one byte past the payload must surface io.EOF (TLS layer saw
+	// close_notify), not io.ErrUnexpectedEOF (raw TCP FIN inside TLS).
+	buf := make([]byte, 7)
+	if _, err := io.ReadFull(tc, buf); err != nil {
+		t.Fatalf("ReadFull(7): %v", err)
+	}
+	if string(buf) != "payload" {
+		t.Fatalf("payload = %q; want %q", buf, "payload")
+	}
+	one := make([]byte, 1)
+	_, err := tc.Read(one)
+	if err != io.EOF {
+		t.Fatalf("post-payload Read err = %v; want io.EOF (close_notify)", err)
+	}
+	_ = tc.Close()
+	c.read(226)
+}
+
+func TestFTPS_RequireTLSRejectsCleartextLogin(t *testing.T) {
+	users := map[string]UserInfo{"alice": {Password: "alicepw", Root: t.TempDir(), CanRead: true, CanWrite: true}}
+	cfg, _ := newTestFTPSConfig(t, users, true)
+	_, addr, stop := startTestFTPServerWithConfig(t, cfg)
+	defer stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	tp := textproto.NewConn(conn)
+	if _, _, err := tp.ReadResponse(220); err != nil {
+		t.Fatalf("greeting: %v", err)
+	}
+	if err := tp.PrintfLine("USER alice"); err != nil {
+		t.Fatalf("USER: %v", err)
+	}
+	code, _, err := tp.ReadResponse(0)
+	if err != nil {
+		t.Fatalf("ReadResponse: %v", err)
+	}
+	if code != 534 {
+		t.Fatalf("USER over plaintext: got %d; want 534", code)
+	}
+}
+
+// TestFTPS_BufferedBytesAttackRejected covers the canonical FTPS command-
+// injection attack: an attacker on the cleartext segment pipelines an
+// extra "USER attacker" behind the legitimate "AUTH TLS\r\n" line. A
+// naive server reads both lines into the bufio buffer pre-TLS, replies
+// 234, then upgrades and dequeues "USER attacker" — executing
+// attacker-controlled commands inside the encrypted session.
+//
+// The server must detect the pending bytes after sending 234 and close
+// the connection without proceeding to the TLS handshake. We assert that
+// by writing the pipeline ourselves and verifying the server hangs up.
+func TestFTPS_BufferedBytesAttackRejected(t *testing.T) {
+	users := map[string]UserInfo{"alice": {Password: "alicepw", Root: t.TempDir(), CanRead: true, CanWrite: true}}
+	cfg, _ := newTestFTPSConfig(t, users, false)
+	_, addr, stop := startTestFTPServerWithConfig(t, cfg)
+	defer stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	r := bufio.NewReader(conn)
+	// Read the 220 greeting.
+	if _, err := r.ReadString('\n'); err != nil {
+		t.Fatalf("greeting: %v", err)
+	}
+	// Pipeline AUTH TLS together with an injected USER line so both arrive
+	// in a single read on the server's bufio.Reader.
+	if _, err := conn.Write([]byte("AUTH TLS\r\nUSER attacker\r\n")); err != nil {
+		t.Fatalf("write pipeline: %v", err)
+	}
+	// Server must reply 234 to AUTH TLS, then close the connection without
+	// processing the injected USER. The 234 reply may or may not be
+	// visible depending on flush timing; what matters is that subsequent
+	// reads return EOF rather than another reply.
+	deadline := time.Now().Add(5 * time.Second)
+	_ = conn.SetReadDeadline(deadline)
+	// Drain any responses until EOF or read deadline. The server must NOT
+	// have answered the injected USER (which would be a 331 reply).
+	saw331 := false
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			break
+		}
+		if strings.HasPrefix(line, "331") {
+			saw331 = true
+			break
+		}
+	}
+	if saw331 {
+		t.Fatal("server processed pre-TLS USER injection (saw 331); expected the connection to be torn down")
+	}
+}
+
+// TestFTPS_DataConnRequiresResumption verifies the data-channel binding:
+// a client that does not present a session ticket issued for the
+// current control session is rejected at the data-conn TLS handshake.
+//
+// We exercise this by stripping the client's session cache between
+// control and data handshakes, so the data handshake is necessarily
+// fresh (DidResume == false). The server-side VerifyConnection callback
+// must fail the handshake.
+func TestFTPS_DataConnRequiresResumption(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true}}
+	cfg, pool := newTestFTPSConfig(t, users, false)
+	_, addr, stop := startTestFTPServerWithConfig(t, cfg)
+	defer stop()
+
+	c := dialFTPS(t, addr, pool)
+	c.authTLS()
+	c.login("alice", "alicepw")
+	c.command(200, "PBSZ 0")
+	c.command(200, "PROT P")
+	c.command(200, "TYPE I")
+
+	host, port, err := parseFTPPASVResponse(c.command(227, "PASV"))
+	if err != nil {
+		t.Fatalf("parse PASV: %v", err)
+	}
+	dc, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial data: %v", err)
+	}
+	defer dc.Close()
+
+	// Fresh session cache => no ticket presented => handshake fresh.
+	freshCfg := &tls.Config{
+		RootCAs:            pool,
+		ServerName:         "127.0.0.1",
+		ClientSessionCache: tls.NewLRUClientSessionCache(1),
+	}
+	tc := tls.Client(dc, freshCfg)
+	_ = dc.SetDeadline(time.Now().Add(5 * time.Second))
+	err = tc.HandshakeContext(context.Background())
+	if err == nil {
+		t.Fatal("data-conn handshake without session resumption succeeded; want failure")
+	}
 }

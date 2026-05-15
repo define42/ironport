@@ -14,6 +14,9 @@
 //   - Optional FTP listener sharing the same users, jails, permissions,
 //     temp-extension handling, CompletedUploads stream, and AuthEvents stream as SFTP.
 //     FTP uses passive mode by default; active mode can be enabled explicitly.
+//   - Optional FTPS (RFC 4217 explicit TLS via AUTH TLS) over the FTP
+//     listener. Set Config.FtpTLSConfig to enable it and Config.FtpRequireTLS
+//     to refuse plaintext logins.
 //
 // Typical usage:
 //
@@ -33,6 +36,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -102,6 +106,11 @@ const (
 	// half-open connections (e.g. peer reboot, route loss) as read errors
 	// instead of leaving handler goroutines blocked indefinitely.
 	defaultTCPKeepAlivePeriod = 30 * time.Second
+	// ftpTLSHandshakeTimeout bounds how long the FTP control or data TLS
+	// handshake may take. Without a deadline a peer that opens the TCP
+	// connection and then never sends client-hello bytes would pin the
+	// handler goroutine indefinitely.
+	ftpTLSHandshakeTimeout = 30 * time.Second
 )
 
 const (
@@ -430,6 +439,21 @@ type Server struct {
 	// ftpAllowActiveMode controls whether FTP PORT/EPRT commands may ask the
 	// server to dial an active-mode data connection back to the client IP.
 	ftpAllowActiveMode bool
+	// ftpTLSConfig is the *tls.Config used to upgrade the FTP control
+	// connection via AUTH TLS (RFC 4217) and to wrap data connections when
+	// the client selects PROT P. A nil value disables FTPS — the AUTH
+	// command will be refused with 502.
+	ftpTLSConfig *tls.Config
+	// ftpDataTLSConfig mirrors ftpTLSConfig but additionally requires that
+	// every incoming data-connection handshake resume an existing TLS
+	// session (DidResume == true). Sharing the session-ticket key with
+	// ftpTLSConfig binds data connections to a session this server issued
+	// on the control channel, frustrating data-channel hijack attempts.
+	ftpDataTLSConfig *tls.Config
+	// ftpRequireTLS, when true, refuses USER/PASS until the control
+	// connection has been wrapped with AUTH TLS. Set this for deployments
+	// that expose the FTP listener but want to forbid plaintext logins.
+	ftpRequireTLS bool
 	// users maps usernames to their credentials and jail roots.
 	users map[string]UserInfo
 	// mu protects users, completedUploads, authEvents, and listeners for concurrent reads and writes.
@@ -526,7 +550,20 @@ type Config struct {
 	// FtpAllowActiveMode enables FTP active mode (PORT/EPRT). It defaults to
 	// false because active mode requires outbound connections from the server.
 	// When enabled, this server only dials the same IP as the control connection.
-	FtpAllowActiveMode  bool
+	FtpAllowActiveMode bool
+	// FtpTLSConfig, when non-nil, enables explicit FTPS (RFC 4217). The
+	// AUTH TLS command upgrades the control connection using this config,
+	// and PROT P wraps the data connection. A separate config is derived
+	// internally for data connections to require session resumption from
+	// the control channel; callers should populate Certificates (or a
+	// GetCertificate callback) but otherwise leave session-ticket settings
+	// at their defaults. Leave nil to disable FTPS.
+	FtpTLSConfig *tls.Config
+	// FtpRequireTLS, when true, refuses USER/PASS over the FTP control
+	// connection until AUTH TLS has succeeded. Requires FtpTLSConfig to be
+	// set; otherwise the FTP listener would have no path to authentication
+	// and every login attempt would be rejected.
+	FtpRequireTLS       bool
 	Users               map[string]UserInfo
 	SftpSigner          ssh.Signer
 	CompletedUploadSize int
@@ -701,6 +738,7 @@ func NewServer(config *Config) *Server {
 		ftpPassivePortRange:        config.FtpPassivePortRange,
 		ftpDataAcceptTimeout:       config.FtpDataAcceptTimeout,
 		ftpAllowActiveMode:         config.FtpAllowActiveMode,
+		ftpRequireTLS:              config.FtpRequireTLS,
 		users:                      cloneUsers(config.Users),
 		sftpSigner:                 config.SftpSigner,
 		completedUploads:           newCompletedUploadsChannel(config.CompletedUploadSize),
@@ -715,7 +753,57 @@ func NewServer(config *Config) *Server {
 		sftpAllowChown:             config.SftpAllowChown,
 		activeConns:                make(map[net.Conn]string),
 	}
+	if config.FtpTLSConfig != nil {
+		s.ftpTLSConfig, s.ftpDataTLSConfig = deriveFTPTLSConfigs(config.FtpTLSConfig)
+	}
 	return s
+}
+
+// deriveFTPTLSConfigs returns the *tls.Config used for the control channel
+// and a sibling *tls.Config used for data connections. The two configs share
+// a freshly generated session-ticket key so a ticket issued during the
+// control-channel handshake can be redeemed on the data connection. The
+// data config additionally requires DidResume == true via VerifyConnection,
+// which is the defense against data-channel hijack: only a peer that
+// presents a session ticket this server issued can complete the data
+// handshake, so an attacker who steals the data port cannot mount a fresh
+// handshake with their own certificate.
+//
+// Sharing a key across two Clone()d configs is the only way to bind data
+// sessions to the control session that Go's public TLS API exposes — the
+// stdlib does not surface the control connection's session ticket bytes
+// to the data-conn handshake. We accept that limitation: a successful
+// handshake proves the peer holds *some* ticket from this server, not
+// specifically the ticket from *this* control connection. In practice this
+// is what mainstream FTPS servers do, and it raises the bar significantly
+// over a no-binding implementation.
+func deriveFTPTLSConfigs(base *tls.Config) (control, data *tls.Config) {
+	control = base.Clone()
+	// SessionTicketsDisabled defaults to false (tickets enabled); leave it
+	// alone so callers can opt out if they really need to.
+	if !control.SessionTicketsDisabled {
+		var key [32]byte
+		if _, err := rand.Read(key[:]); err == nil {
+			control.SetSessionTicketKeys([][32]byte{key})
+		}
+	}
+	data = control.Clone()
+	// The control-channel VerifyConnection (if any) still applies via
+	// Clone, but we layer the resumption check on top. Capture the
+	// user-supplied callback so we run it first, then enforce DidResume.
+	userVerify := data.VerifyConnection
+	data.VerifyConnection = func(cs tls.ConnectionState) error {
+		if userVerify != nil {
+			if err := userVerify(cs); err != nil {
+				return err
+			}
+		}
+		if !cs.DidResume {
+			return errors.New("ftps: data connection must resume the control-channel TLS session")
+		}
+		return nil
+	}
+	return control, data
 }
 
 func generateEphemeralSigner() (ssh.Signer, error) {
@@ -2064,7 +2152,16 @@ type ftpSession struct {
 	// a single producer/consumer pair makes ABOR mid-transfer possible:
 	// the transfer helper selects on this channel alongside the transfer
 	// goroutine's completion signal.
-	ctlMsg     chan ftpCtlMsg
+	ctlMsg chan ftpCtlMsg
+	// readerStop, when closed, asks the reader goroutine to exit without
+	// reporting the read error that the close triggers. AUTH TLS uses this
+	// to suspend the reader, drain bookkeeping, swap the underlying reader
+	// for the TLS-wrapped one, and then start a fresh reader.
+	readerStop chan struct{}
+	// readerDone is closed by the reader goroutine on exit so a caller of
+	// stopReader can wait for the goroutine to terminate before touching
+	// shared state (f.r, f.conn, f.ctlMsg).
+	readerDone chan struct{}
 	clientIP   string
 	tempExts   []string
 	uploads    chan<- CompletedUpload
@@ -2073,6 +2170,17 @@ type ftpSession struct {
 	// constructed by authenticate on successful login and released when the
 	// session ends (closeJail). Until login succeeds it is nil.
 	fs *jailFS
+	// tlsConn is non-nil once the control connection has been wrapped via
+	// AUTH TLS. f.conn is set to the same *tls.Conn value in that case;
+	// keeping a typed pointer avoids repeated type assertions in PROT and
+	// data-conn setup paths.
+	tlsConn *tls.Conn
+	// pbszSet records that the client has sent PBSZ. PROT may only be
+	// accepted after PBSZ per RFC 4217 §9.
+	pbszSet bool
+	// dataProt is 'C' (clear / default) or 'P' (private / TLS-wrapped). It
+	// gates whether acceptDataConn TLS-wraps the data connection.
+	dataProt byte
 }
 
 func (s *Server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) {
@@ -2082,19 +2190,22 @@ func (s *Server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- Co
 		r:          bufio.NewReader(nc),
 		w:          bufio.NewWriter(nc),
 		cwd:        "/",
+		dataProt:   'C',
 		clientIP:   remoteIP(nc.RemoteAddr()),
 		tempExts:   tempExts,
 		uploads:    uploads,
 		authEvents: authEvents,
-		ctlMsg:     make(chan ftpCtlMsg, 1),
 	}
-	// Close nc first, then drain the reader so its goroutine can exit.
-	// LIFO defer order means this runs last — after closeDataListener,
-	// closeJail, and logoutIfAuthenticated — so the reader keeps running
-	// in case those handlers want to reply on the control connection.
+	// Close nc first, then drain the current reader's ctlMsg so its goroutine
+	// can exit. The reader may have been restarted by AUTH TLS; sess.ctlMsg
+	// is re-read at defer-execution time so the drain targets whichever
+	// channel is current.
 	defer func() {
 		_ = nc.Close()
-		for range sess.ctlMsg {
+		ctl := sess.ctlMsg
+		if ctl != nil {
+			for range ctl {
+			}
 		}
 	}()
 	defer sess.closeDataEndpoint()
@@ -2105,7 +2216,7 @@ func (s *Server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- Co
 		return
 	}
 
-	go sess.readControlLines()
+	sess.startReader()
 
 	// Capture the configured idle timeout once at session start, matching
 	// the SFTP per-session semantics. A zero value disables the deadline.
@@ -2165,17 +2276,77 @@ func (s *Server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- Co
 	}
 }
 
+// startReader spins up a fresh reader goroutine bound to the session's
+// current bufio.Reader and a fresh ctlMsg channel. It is called once at
+// session start and again after AUTH TLS swaps the underlying transport.
+func (f *ftpSession) startReader() {
+	f.ctlMsg = make(chan ftpCtlMsg, 1)
+	f.readerStop = make(chan struct{})
+	f.readerDone = make(chan struct{})
+	go f.readControlLines()
+}
+
+// stopReader signals the reader goroutine to exit and waits for it to
+// terminate. It interrupts an in-flight read by setting a near-past read
+// deadline on f.conn; the resulting error is suppressed by the reader
+// because readerStop is already closed. After stopReader returns the
+// caller owns f.r and f.conn until startReader is invoked again. The read
+// deadline is restored to the zero value before returning so subsequent
+// reads (on the wrapped or replaced transport) block normally.
+func (f *ftpSession) stopReader() {
+	if f.readerStop == nil {
+		return
+	}
+	close(f.readerStop)
+	// Wake any blocked read in readFTPControlLine without closing the
+	// connection. tls.Conn forwards SetReadDeadline to the underlying
+	// socket, so the same trick works pre- and post-upgrade.
+	_ = f.conn.SetReadDeadline(time.Unix(1, 0))
+	<-f.readerDone
+	_ = f.conn.SetReadDeadline(time.Time{})
+	f.readerStop = nil
+	f.readerDone = nil
+}
+
 // readControlLines is the sole reader of the control connection. It runs
 // from session start until the connection closes (or an oversized line is
 // encountered), delivering each parsed line to ctlMsg and a final error
 // message before closing the channel. Centralising reads here is what
 // lets a long-running data transfer also observe ABOR in real time.
+//
+// Exit paths:
+//   - readerStop closed: return without emitting a final error so the main
+//     loop knows the swap (AUTH TLS) is in progress rather than that the
+//     peer hung up. ctlMsg is still closed so any drainer terminates.
+//   - read error: emit it on ctlMsg and return.
 func (f *ftpSession) readControlLines() {
 	defer close(f.ctlMsg)
+	defer close(f.readerDone)
 	for {
+		select {
+		case <-f.readerStop:
+			return
+		default:
+		}
 		line, err := readFTPControlLine(f.r, ftpMaxControlLineLen)
-		f.ctlMsg <- ftpCtlMsg{line: line, err: err}
 		if err != nil {
+			// If stopReader is what unblocked us, swallow the deadline
+			// error so the main loop does not treat the AUTH TLS swap
+			// as a connection failure.
+			select {
+			case <-f.readerStop:
+				return
+			default:
+			}
+			select {
+			case f.ctlMsg <- ftpCtlMsg{err: err}:
+			case <-f.readerStop:
+			}
+			return
+		}
+		select {
+		case f.ctlMsg <- ftpCtlMsg{line: line}:
+		case <-f.readerStop:
 			return
 		}
 	}
@@ -2230,6 +2401,10 @@ func parseFTPCommand(line string) (string, string) {
 func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
 	switch cmd {
 	case "USER":
+		if f.server.ftpRequireTLS && f.tlsConn == nil {
+			_ = f.reply(534, "AUTH TLS required before login")
+			return false
+		}
 		f.logoutIfAuthenticated()
 		f.username = arg
 		f.authenticated = false
@@ -2238,6 +2413,10 @@ func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
 		return false
 
 	case "PASS":
+		if f.server.ftpRequireTLS && f.tlsConn == nil {
+			_ = f.reply(534, "AUTH TLS required before login")
+			return false
+		}
 		if f.username == "" {
 			_ = f.reply(503, "send USER first")
 			return false
@@ -2281,6 +2460,9 @@ func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
 		if f.server.ftpAllowActiveMode {
 			features = append(features, "EPRT")
 		}
+		if f.server.ftpTLSConfig != nil {
+			features = append(features, "AUTH TLS", "PBSZ", "PROT")
+		}
 		_ = f.multilineReply(211, "Features:", features, "End")
 		return false
 
@@ -2308,9 +2490,53 @@ func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
 		return false
 
 	case "AUTH":
-		// This implementation does not provide FTPS. Keep SFTP enabled for
-		// encrypted transport; expose FTP only where plaintext FTP is acceptable.
-		_ = f.reply(502, "AUTH not supported")
+		f.cmdAuth(arg)
+		return false
+
+	case "PBSZ":
+		if f.tlsConn == nil {
+			_ = f.reply(503, "PBSZ only valid after AUTH TLS")
+			return false
+		}
+		// RFC 4217 §9: PBSZ over TLS is always 0; accept any non-negative
+		// value and reply with 0 so non-conformant clients that send a
+		// non-zero buffer size still proceed.
+		_ = f.reply(200, "PBSZ=0")
+		f.pbszSet = true
+		return false
+
+	case "PROT":
+		if f.tlsConn == nil {
+			_ = f.reply(503, "PROT only valid after AUTH TLS")
+			return false
+		}
+		if !f.pbszSet {
+			_ = f.reply(503, "send PBSZ first")
+			return false
+		}
+		switch strings.ToUpper(strings.TrimSpace(arg)) {
+		case "C":
+			if f.server.ftpRequireTLS {
+				_ = f.reply(534, "PROT C refused; data protection is required")
+				return false
+			}
+			f.dataProt = 'C'
+			_ = f.reply(200, "protection level set to Clear")
+		case "P":
+			f.dataProt = 'P'
+			_ = f.reply(200, "protection level set to Private")
+		case "S", "E":
+			_ = f.reply(536, "protection level not supported")
+		default:
+			_ = f.reply(504, "unknown protection level")
+		}
+		return false
+
+	case "CCC":
+		// RFC 4217 §12.3: refuse downgrade from TLS back to plaintext. A
+		// session that successfully negotiated TLS must remain encrypted
+		// for the duration of the connection.
+		_ = f.reply(534, "CCC refused")
 		return false
 	}
 
@@ -2448,6 +2674,104 @@ func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
 		_ = f.reply(502, "command not implemented")
 	}
 	return false
+}
+
+// cmdAuth handles the AUTH command (RFC 4217 §4). It accepts AUTH TLS,
+// AUTH TLS-C (TLS for control, data protection negotiated later via PROT),
+// and the legacy AUTH SSL alias. After the 234 reply it stops the reader
+// goroutine, performs the buffered-bytes injection check, resets all
+// session state that an attacker could have set pre-TLS, then performs
+// the TLS handshake on the underlying socket and re-arms the reader on
+// the encrypted stream.
+//
+// The buffered-bytes check is the defense against the FTPS "command
+// injection across TLS" attack: an MITM on the cleartext segment can
+// prepend commands (e.g. an extra "USER attacker\r\n") to the AUTH TLS
+// line, and a naive server would re-read those bytes from the bufio
+// reader after the upgrade, executing them inside the encrypted session.
+// We refuse the upgrade if anything is buffered behind the AUTH line.
+func (f *ftpSession) cmdAuth(arg string) {
+	if f.server.ftpTLSConfig == nil {
+		_ = f.reply(502, "AUTH not supported")
+		return
+	}
+	if f.tlsConn != nil {
+		_ = f.reply(503, "already TLS")
+		return
+	}
+	switch strings.ToUpper(strings.TrimSpace(arg)) {
+	case "TLS", "TLS-C", "SSL":
+		// Accepted; fall through.
+	case "":
+		_ = f.reply(501, "AUTH requires a mechanism")
+		return
+	default:
+		_ = f.reply(504, "unsupported AUTH mechanism")
+		return
+	}
+
+	if err := f.reply(234, "ready for TLS"); err != nil {
+		return
+	}
+
+	// Suspend the reader so the next two checks see a stable f.r / f.ctlMsg.
+	f.stopReader()
+
+	// Pending lines in ctlMsg or buffered bytes in f.r at this point came
+	// in over plaintext after the AUTH command — i.e., a man-in-the-middle
+	// could have injected them. Either form is fatal: tear down the
+	// connection rather than re-evaluating attacker-controlled commands
+	// inside the encrypted session.
+	for {
+		select {
+		case msg, ok := <-f.ctlMsg:
+			if !ok {
+				goto drained
+			}
+			if msg.err == nil && strings.TrimSpace(msg.line) != "" {
+				log.Printf("ftp AUTH TLS rejected from=%s: pre-TLS line buffered: %q", f.conn.RemoteAddr(), msg.line)
+				_ = f.conn.Close()
+				return
+			}
+		default:
+			goto drained
+		}
+	}
+drained:
+	if f.r.Buffered() > 0 {
+		log.Printf("ftp AUTH TLS rejected from=%s: %d bytes buffered before TLS handshake", f.conn.RemoteAddr(), f.r.Buffered())
+		_ = f.conn.Close()
+		return
+	}
+
+	// RFC 4217 §4.3: any prior USER state is discarded across AUTH TLS so
+	// the post-TLS session cannot inherit half-finished authentication.
+	f.username = ""
+	f.authenticated = false
+	f.user = UserInfo{}
+	f.rnfrPath = ""
+	f.restartOffset = 0
+	f.expectedUploadSize = 0
+
+	deadline := time.Now().Add(ftpTLSHandshakeTimeout)
+	_ = f.conn.SetDeadline(deadline)
+	tlsConn := tls.Server(f.conn, f.server.ftpTLSConfig)
+	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+		log.Printf("ftp AUTH TLS handshake from=%s: %v", f.conn.RemoteAddr(), err)
+		_ = f.conn.Close()
+		return
+	}
+	_ = f.conn.SetDeadline(time.Time{})
+
+	f.conn = tlsConn
+	f.tlsConn = tlsConn
+	f.r = bufio.NewReader(tlsConn)
+	f.w = bufio.NewWriter(tlsConn)
+
+	cs := tlsConn.ConnectionState()
+	log.Printf("ftp AUTH TLS established from=%s version=%#x cipher=%#x", tlsConn.RemoteAddr(), cs.Version, cs.CipherSuite)
+
+	f.startReader()
 }
 
 func (f *ftpSession) authenticate(pass string) bool {
@@ -2747,6 +3071,33 @@ func parseFTPEPRTArg(arg string) (*net.TCPAddr, error) {
 }
 
 func (f *ftpSession) acceptDataConn() (net.Conn, error) {
+	dc, err := f.dialOrAcceptDataConn()
+	if err != nil {
+		return nil, err
+	}
+	if f.dataProt != 'P' {
+		return dc, nil
+	}
+	// PROT P: wrap the raw data connection in TLS using the server's
+	// data-conn config, which enforces session resumption from the control
+	// channel (see deriveFTPTLSConfigs). A handshake failure tears the
+	// data connection down before any plaintext bytes can be exchanged.
+	if f.server.ftpDataTLSConfig == nil {
+		_ = dc.Close()
+		return nil, errors.New("PROT P requested but FTPS is not configured")
+	}
+	deadline := time.Now().Add(ftpTLSHandshakeTimeout)
+	_ = dc.SetDeadline(deadline)
+	tc := tls.Server(dc, f.server.ftpDataTLSConfig)
+	if err := tc.HandshakeContext(context.Background()); err != nil {
+		_ = dc.Close()
+		return nil, fmt.Errorf("data tls handshake: %w", err)
+	}
+	_ = dc.SetDeadline(time.Time{})
+	return tc, nil
+}
+
+func (f *ftpSession) dialOrAcceptDataConn() (net.Conn, error) {
 	if f.dataLn != nil {
 		ln := f.dataLn
 		f.dataLn = nil
@@ -2785,6 +3136,26 @@ func (f *ftpSession) acceptDataConn() (net.Conn, error) {
 	}
 
 	return nil, errors.New("data connection not prepared")
+}
+
+// closeDataConn closes an FTP data connection. For TLS-wrapped data
+// connections it first sends a close_notify alert via CloseWrite, so the
+// client can distinguish "transfer complete, stream closed cleanly" from
+// "TCP RST mid-stream that may have truncated the payload". This is
+// required by TLS for unambiguous EOF; without it a malicious party that
+// injects a TCP FIN could trick the client into accepting a truncated
+// download as complete.
+//
+// For plain TCP data connections CloseWrite is unnecessary because FTP
+// STREAM mode already conveys EOF via the TCP FIN, and io.Copy on the
+// receiver returns a clean EOF when that arrives. Calling tls.Conn's
+// CloseWrite is best-effort: any error is intentionally ignored because
+// the subsequent Close will tear the connection down anyway.
+func closeDataConn(dc net.Conn) {
+	if tc, ok := dc.(*tls.Conn); ok {
+		_ = tc.CloseWrite()
+	}
+	_ = dc.Close()
 }
 
 func (f *ftpSession) closeDataListener() {
@@ -2864,7 +3235,7 @@ func (f *ftpSession) cmdList(arg string, namesOnly bool) {
 		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
-	defer func() { _ = dc.Close() }()
+	defer closeDataConn(dc)
 
 	// Apply a per-Write idle deadline so a client that opens the data
 	// connection but refuses to read does not pin this goroutine and FD
@@ -2978,7 +3349,7 @@ func (f *ftpSession) cmdRetr(arg string) {
 		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
-	defer func() { _ = dc.Close() }()
+	defer closeDataConn(dc)
 
 	// Apply a per-Write idle deadline so a client that opens the data
 	// connection but refuses to read (filling its TCP receive buffer) does
@@ -3020,7 +3391,7 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
-	defer func() { _ = dc.Close() }()
+	defer closeDataConn(dc)
 
 	flags := os.O_CREATE | os.O_WRONLY
 	switch {
@@ -3211,6 +3582,10 @@ func (f *ftpSession) cmdHost(arg string) {
 // cmdRein answers the REIN command. RFC 959 specifies that REIN flushes any
 // authentication state and returns the session to the pre-login state without
 // closing the control connection. Any pending data transfer is aborted.
+//
+// RFC 4217 §10.1 keeps the TLS control session itself live across REIN, but
+// the data-channel protection level resets to the default (Clear) and PBSZ
+// must be re-issued before a subsequent PROT.
 func (f *ftpSession) cmdRein() {
 	f.closeDataEndpoint()
 	f.logoutIfAuthenticated()
@@ -3220,6 +3595,8 @@ func (f *ftpSession) cmdRein() {
 	f.restartOffset = 0
 	f.expectedUploadSize = 0
 	f.epsvAll = false
+	f.pbszSet = false
+	f.dataProt = 'C'
 	// The session is no longer tied to the previous user; clear the
 	// connection's user association so a RemoveUser for that name does not
 	// kick this now-anonymous session.
@@ -3326,7 +3703,7 @@ func (f *ftpSession) cmdMLSD(arg string) {
 		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
-	defer func() { _ = dc.Close() }()
+	defer closeDataConn(dc)
 
 	idleDC := &idleConn{Conn: dc}
 	idleDC.setWriteTimeout(ftpDataIdleTimeout)
