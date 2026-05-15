@@ -85,7 +85,7 @@ func ensureOpenat2() error { return probeOpenat2() }
 // The jail root itself is represented as ".".
 func cleanRelClientPath(p string) string {
 	p = filepath.ToSlash(p)
-	p = path.Clean("/" + strings.TrimPrefix(p, "/"))
+	p = path.Clean("/" + p)
 	if p == "/" {
 		return "."
 	}

@@ -1498,6 +1498,9 @@ func canonicalJailRoot(root string) (string, error) {
 		return "", err
 	}
 
+	// Resolve the configured root before validating it. Broken symlinks in the
+	// jail root path intentionally reject the login/server start; a jail root
+	// must name a real directory at authentication time.
 	resolved, err := filepath.EvalSymlinks(abs)
 	if err != nil {
 		return "", err
