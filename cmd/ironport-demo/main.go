@@ -1,3 +1,6 @@
+// Command ironport-demo is a runnable library demo for the ironport package.
+// It is not an operator-ready server; production deployments should provide
+// their own user source, logging, and host-key management.
 package main
 
 import (
@@ -10,56 +13,48 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-func main() {
-	// This command is a runnable library demo, not an operator-ready server.
-	// Production deployments should provide their own user source, logging,
-	// metrics, health checks, process supervision, and stable host-key handling.
-	hostKeyPath := flag.String("host-key", "", "path to a PEM-encoded private key file to use as the server host key (generated if not provided)")
-	sftpAddr := flag.String("sftp-addr", ":2022", "TCP address to listen on for SFTP")
-	ftpAddr := flag.String("ftp-addr", "", "TCP address to listen on for FTP/FTPS (empty to disable; credentials are sent in the clear unless -ftps-cert is set, see README)")
-	ftpPassive := flag.String("ftp-passive", "5000-5010", "FTP passive-mode data port range (used only when -ftp-addr is set)")
-	ftpActive := flag.Bool("ftp-active", false, "enable FTP active mode PORT/EPRT (dials back only to the control connection IP)")
-	ftpsCert := flag.String("ftps-cert", "", "path to a PEM-encoded certificate to advertise AUTH TLS (RFC 4217) on the FTP listener; requires -ftps-key")
-	ftpsKey := flag.String("ftps-key", "", "path to the PEM-encoded private key matching -ftps-cert")
-	ftpsRequireTLS := flag.Bool("ftps-require-tls", false, "refuse USER/PASS over the FTP control connection until AUTH TLS has succeeded (requires -ftps-cert)")
-	sshKex := flag.String("ssh-key-exchanges", "", "comma-separated SSH key-exchange algorithms to allow (empty uses defaults)")
-	sshCiphers := flag.String("ssh-ciphers", "", "comma-separated SSH cipher algorithms to allow (empty uses defaults)")
-	sshMACs := flag.String("ssh-macs", "", "comma-separated SSH MAC algorithms to allow (empty uses defaults)")
-	sshPublicKeyAuthAlgorithms := flag.String("ssh-public-key-auth-algorithms", "", "comma-separated public-key auth signature algorithms to allow (empty uses defaults)")
+type flags struct {
+	hostKeyPath                *string
+	sftpAddr                   *string
+	ftpAddr                    *string
+	ftpPassive                 *string
+	ftpActive                  *bool
+	ftpsCert                   *string
+	ftpsKey                    *string
+	ftpsRequireTLS             *bool
+	sshKex                     *string
+	sshCiphers                 *string
+	sshMACs                    *string
+	sshPublicKeyAuthAlgorithms *string
+}
+
+func parseFlags() flags {
+	f := flags{
+		hostKeyPath:                flag.String("host-key", "", "path to a PEM-encoded private key file to use as the server host key (generated if not provided)"),
+		sftpAddr:                   flag.String("sftp-addr", ":2022", "TCP address to listen on for SFTP"),
+		ftpAddr:                    flag.String("ftp-addr", "", "TCP address to listen on for FTP/FTPS (empty to disable; credentials are sent in the clear unless -ftps-cert is set, see README)"),
+		ftpPassive:                 flag.String("ftp-passive", "5000-5010", "FTP passive-mode data port range (used only when -ftp-addr is set)"),
+		ftpActive:                  flag.Bool("ftp-active", false, "enable FTP active mode PORT/EPRT (dials back only to the control connection IP)"),
+		ftpsCert:                   flag.String("ftps-cert", "", "path to a PEM-encoded certificate to advertise AUTH TLS (RFC 4217) on the FTP listener; requires -ftps-key"),
+		ftpsKey:                    flag.String("ftps-key", "", "path to the PEM-encoded private key matching -ftps-cert"),
+		ftpsRequireTLS:             flag.Bool("ftps-require-tls", false, "refuse USER/PASS over the FTP control connection until AUTH TLS has succeeded (requires -ftps-cert)"),
+		sshKex:                     flag.String("ssh-key-exchanges", "", "comma-separated SSH key-exchange algorithms to allow (empty uses defaults)"),
+		sshCiphers:                 flag.String("ssh-ciphers", "", "comma-separated SSH cipher algorithms to allow (empty uses defaults)"),
+		sshMACs:                    flag.String("ssh-macs", "", "comma-separated SSH MAC algorithms to allow (empty uses defaults)"),
+		sshPublicKeyAuthAlgorithms: flag.String("ssh-public-key-auth-algorithms", "", "comma-separated public-key auth signature algorithms to allow (empty uses defaults)"),
+	}
 	flag.Parse()
+	return f
+}
 
-	// Example user DB (replace with your auth source).
-	// WARNING: never hardcode credentials in production; use env vars or a secret store.
-	users := map[string]ironport.UserInfo{
-		"alice": {Password: "alicepw", Root: "/srv/sftp/alice", CanRead: true, CanWrite: true},
-		"bob":   {Password: "bobpw", Root: "/srv/sftp/bob", CanRead: true, CanWrite: false},
-	}
-
-	var signer ssh.Signer
-	if *hostKeyPath != "" {
-		var err error
-		signer, err = ironport.NewSignerFromFile(*hostKeyPath)
-		if err != nil {
-			log.Fatal(err)
-		}
-	}
-
+func buildConfig(f flags, signer ssh.Signer, users map[string]ironport.UserInfo) *ironport.Config {
 	config := ironport.DefaultConfig()
-	config.SftpAddr = *sftpAddr
-	config.FtpAddr = *ftpAddr
-	config.FtpPassivePortRange = *ftpPassive
-	config.FtpAllowActiveMode = *ftpActive
-	if *ftpsCert != "" || *ftpsKey != "" {
-		if *ftpsCert == "" || *ftpsKey == "" {
-			log.Fatal("-ftps-cert and -ftps-key must be supplied together")
-		}
-		cert, err := tls.LoadX509KeyPair(*ftpsCert, *ftpsKey)
-		if err != nil {
-			log.Fatalf("load FTPS certificate: %v", err)
-		}
-		config.FtpTLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
-	}
-	if *ftpsRequireTLS {
+	config.SftpAddr = *f.sftpAddr
+	config.FtpAddr = *f.ftpAddr
+	config.FtpPassivePortRange = *f.ftpPassive
+	config.FtpAllowActiveMode = *f.ftpActive
+	config.FtpTLSConfig = loadFTPSTLSConfig(*f.ftpsCert, *f.ftpsKey)
+	if *f.ftpsRequireTLS {
 		if config.FtpTLSConfig == nil {
 			log.Fatal("-ftps-require-tls requires -ftps-cert and -ftps-key")
 		}
@@ -69,31 +64,78 @@ func main() {
 	config.SftpSigner = signer
 	config.CompletedUploadSize = 64
 	config.AuthEventSize = 64
-	config.SSHKeyExchanges = splitCSV(*sshKex)
-	config.SSHCiphers = splitCSV(*sshCiphers)
-	config.SSHMACs = splitCSV(*sshMACs)
-	config.SSHPublicKeyAuthAlgorithms = splitCSV(*sshPublicKeyAuthAlgorithms)
+	config.SSHKeyExchanges = splitCSV(*f.sshKex)
+	config.SSHCiphers = splitCSV(*f.sshCiphers)
+	config.SSHMACs = splitCSV(*f.sshMACs)
+	config.SSHPublicKeyAuthAlgorithms = splitCSV(*f.sshPublicKeyAuthAlgorithms)
 	// Files written with one of these extensions are considered "still being
 	// written" and won't be announced on CompletedUploads until the client
 	// renames them to a final (non-temp) name.
 	config.TempExtensions = []string{".tmp", ".writing"}
-	srv := ironport.NewServer(config)
+	return config
+}
 
+func loadSigner(path string) ssh.Signer {
+	if path == "" {
+		return nil
+	}
+	signer, err := ironport.NewSignerFromFile(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return signer
+}
+
+func startEventLoggers(srv *ironport.Server) {
 	go func() {
 		for ev := range srv.CompletedUploads() {
 			log.Printf("completed upload: protocol=%q user=%q ip=%q path=%q full=%q",
 				ev.Protocol, ev.Username, ev.ClientIP, ev.FilePath, ev.FullFilePath)
 		}
 	}()
-
 	go func() {
 		for ev := range srv.AuthEvents() {
 			log.Printf("auth event: type=%q protocol=%q user=%q ip=%q",
 				ev.Type, ev.Protocol, ev.Username, ev.ClientIP)
 		}
 	}()
+}
 
+func main() {
+	// This command is a runnable library demo, not an operator-ready server.
+	// Production deployments should provide their own user source, logging,
+	// metrics, health checks, process supervision, and stable host-key handling.
+	f := parseFlags()
+
+	// Example user DB (replace with your auth source).
+	// WARNING: never hardcode credentials in production; use env vars or a secret store.
+	users := map[string]ironport.UserInfo{
+		"alice": {Password: "alicepw", Root: "/srv/sftp/alice", CanRead: true, CanWrite: true},
+		"bob":   {Password: "bobpw", Root: "/srv/sftp/bob", CanRead: true, CanWrite: false},
+	}
+
+	signer := loadSigner(*f.hostKeyPath)
+	config := buildConfig(f, signer, users)
+	srv := ironport.NewServer(config)
+	startEventLoggers(srv)
 	log.Fatal(srv.ListenAndServe())
+}
+
+// loadFTPSTLSConfig builds a *tls.Config from the operator-supplied cert/key
+// pair. Returns nil when neither flag is set; calls log.Fatal when only one
+// of the pair is set or when the key pair cannot be loaded.
+func loadFTPSTLSConfig(certPath, keyPath string) *tls.Config {
+	if certPath == "" && keyPath == "" {
+		return nil
+	}
+	if certPath == "" || keyPath == "" {
+		log.Fatal("-ftps-cert and -ftps-key must be supplied together")
+	}
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		log.Fatalf("load FTPS certificate: %v", err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{cert}}
 }
 
 func splitCSV(value string) []string {

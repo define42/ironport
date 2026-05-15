@@ -567,7 +567,7 @@ func TestSFTPServer_UploadDownload(t *testing.T) {
 func TestSFTPServer_List(t *testing.T) {
 	root := t.TempDir()
 	// Pre-create a file so we have something to list.
-	if err := os.WriteFile(filepath.Join(root, "listed.txt"), []byte("x"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "listed.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1987,7 +1987,7 @@ func TestFTPServer_AuthEventsUserLogsOutPreviousSession(t *testing.T) {
 // list files but cannot upload or delete files.
 func TestSFTPServer_ReadOnlyUser(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "data.txt"), []byte("read me"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "data.txt"), []byte("read me"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2293,10 +2293,10 @@ func TestServer_RemoveAllUsers(t *testing.T) {
 	root2 := t.TempDir()
 	file1 := filepath.Join(root1, "keep.txt")
 	file2 := filepath.Join(root2, "keep.txt")
-	if err := os.WriteFile(file1, []byte("alice data"), 0600); err != nil {
+	if err := os.WriteFile(file1, []byte("alice data"), 0o600); err != nil {
 		t.Fatalf("WriteFile(%q): %v", file1, err)
 	}
-	if err := os.WriteFile(file2, []byte("bob data"), 0600); err != nil {
+	if err := os.WriteFile(file2, []byte("bob data"), 0o600); err != nil {
 		t.Fatalf("WriteFile(%q): %v", file2, err)
 	}
 
@@ -2374,7 +2374,7 @@ func TestNewSignerFromFile(t *testing.T) {
 		}
 		der := x509.MarshalPKCS1PrivateKey(priv)
 		pemData := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: der})
-		if err := os.WriteFile(keyPath, pemData, 0600); err != nil {
+		if err := os.WriteFile(keyPath, pemData, 0o600); err != nil {
 			t.Fatal(err)
 		}
 
@@ -2401,7 +2401,7 @@ func TestNewSignerFromFile(t *testing.T) {
 			t.Fatal(err)
 		}
 		pemData := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der})
-		if err := os.WriteFile(keyPath, pemData, 0600); err != nil {
+		if err := os.WriteFile(keyPath, pemData, 0o600); err != nil {
 			t.Fatal(err)
 		}
 
@@ -2424,7 +2424,7 @@ func TestNewSignerFromFile(t *testing.T) {
 	t.Run("invalid PEM content", func(t *testing.T) {
 		dir := t.TempDir()
 		keyPath := filepath.Join(dir, "bad.pem")
-		if err := os.WriteFile(keyPath, []byte("not a valid PEM file"), 0600); err != nil {
+		if err := os.WriteFile(keyPath, []byte("not a valid PEM file"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		_, err := NewSignerFromFile(keyPath)
@@ -2448,7 +2448,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 	}
 	der := x509.MarshalPKCS1PrivateKey(priv)
 	pemData := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: der})
-	if err := os.WriteFile(keyPath, pemData, 0600); err != nil {
+	if err := os.WriteFile(keyPath, pemData, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2509,7 +2509,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 // but on disk that "/" is mounted to her actual home directory.
 func TestSFTPServer_JailedWorkingDirectory(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "file.txt"), []byte("hello"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "file.txt"), []byte("hello"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2649,14 +2649,14 @@ func TestSFTPServer_UploadFilePermissions(t *testing.T) {
 		t.Fatalf("os.Stat: %v", err)
 	}
 	// Mask to the permission bits only and verify owner-only access (0600).
-	if got := info.Mode().Perm(); got != 0600 {
+	if got := info.Mode().Perm(); got != 0o600 {
 		t.Errorf("file permissions = %04o; want 0600", got)
 	}
 }
 
 func TestSFTPServer_OpenFileAppendHonorsAppendFlag(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "append.txt"), []byte("first"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "append.txt"), []byte("first"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2691,7 +2691,7 @@ func TestSFTPServer_OpenFileAppendHonorsAppendFlag(t *testing.T) {
 
 func TestSFTPServer_OpenFileWriteOnlyDoesNotTruncate(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "plain.txt"), []byte("original"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "plain.txt"), []byte("original"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2726,7 +2726,7 @@ func TestSFTPServer_OpenFileWriteOnlyDoesNotTruncate(t *testing.T) {
 
 func TestSFTPServer_OpenFileExclusiveCreateHonorsExcl(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "exists.txt"), []byte("keep"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "exists.txt"), []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3580,14 +3580,14 @@ func TestSFTPServer_Chmod(t *testing.T) {
 	_ = f.Close()
 
 	// Send a chmod request and verify it was applied on disk.
-	if err := client.Chmod("/chmod_test.txt", 0644); err != nil {
+	if err := client.Chmod("/chmod_test.txt", 0o644); err != nil {
 		t.Fatalf("Chmod: %v", err)
 	}
 	info, err := os.Stat(filepath.Join(root, "chmod_test.txt"))
 	if err != nil {
 		t.Fatalf("os.Stat: %v", err)
 	}
-	if got := info.Mode().Perm(); got != 0644 {
+	if got := info.Mode().Perm(); got != 0o644 {
 		t.Errorf("file mode = %o; want 0644", got)
 	}
 }
@@ -4860,7 +4860,7 @@ func TestSFTPServer_Setstat_TruncateAndTimes(t *testing.T) {
 // pretending to succeed.
 func TestSFTPServer_Setstat_PermissionDeniedForReadOnly(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "ro.txt"), []byte("ro"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "ro.txt"), []byte("ro"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	users := map[string]UserInfo{
@@ -4870,7 +4870,7 @@ func TestSFTPServer_Setstat_PermissionDeniedForReadOnly(t *testing.T) {
 	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "reader", "rpw")
-	if err := client.Chmod("/ro.txt", 0600); err == nil {
+	if err := client.Chmod("/ro.txt", 0o600); err == nil {
 		t.Fatal("expected permission error for Chmod by a read-only user, got nil")
 	}
 }
@@ -5327,7 +5327,7 @@ func TestSFTPServer_SymlinkRejected(t *testing.T) {
 // by a client connection drop would be mis-reported as a complete upload.
 func TestWriteLogger_TransferErrorSuppressesNotification(t *testing.T) {
 	root := t.TempDir()
-	f, err := os.OpenFile(filepath.Join(root, "partial.bin"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	f, err := os.OpenFile(filepath.Join(root, "partial.bin"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		t.Fatalf("OpenFile: %v", err)
 	}
@@ -5358,7 +5358,7 @@ func TestWriteLogger_TransferErrorSuppressesNotification(t *testing.T) {
 // upload on the CompletedUploads channel.
 func TestWriteLogger_CleanCloseAnnouncesUpload(t *testing.T) {
 	root := t.TempDir()
-	f, err := os.OpenFile(filepath.Join(root, "ok.bin"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	f, err := os.OpenFile(filepath.Join(root, "ok.bin"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		t.Fatalf("OpenFile: %v", err)
 	}
@@ -5391,7 +5391,7 @@ func TestWriteLogger_CleanCloseAnnouncesUpload(t *testing.T) {
 // call is ignored, so a subsequent clean Close still announces the upload.
 func TestWriteLogger_TransferErrorNilIsNoop(t *testing.T) {
 	root := t.TempDir()
-	f, err := os.OpenFile(filepath.Join(root, "ok2.bin"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	f, err := os.OpenFile(filepath.Join(root, "ok2.bin"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		t.Fatalf("OpenFile: %v", err)
 	}
@@ -5529,7 +5529,7 @@ func TestFtpQuotePath_SanitizesControlBytes(t *testing.T) {
 func TestFtpListLine_SanitizesName(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "stub")
-	if err := os.WriteFile(p, []byte("x"), 0644); err != nil {
+	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(p)
@@ -5553,7 +5553,7 @@ func TestFtpListLine_SanitizesName(t *testing.T) {
 // LIST.
 func TestFTPServer_RejectsCRLFInWriteCommands(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "renameable.txt"), []byte("x"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "renameable.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	users := map[string]UserInfo{
@@ -5589,7 +5589,7 @@ func TestFTPServer_RejectsCRLFInWriteCommands(t *testing.T) {
 func TestFTPServer_LISTSanitizesEmbeddedCRLF(t *testing.T) {
 	root := t.TempDir()
 	const badName = "good\r\nFAKE 200 injected"
-	if err := os.WriteFile(filepath.Join(root, badName), []byte("x"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, badName), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	users := map[string]UserInfo{
@@ -5630,7 +5630,7 @@ func TestFTPServer_LISTSanitizesEmbeddedCRLF(t *testing.T) {
 // echoed back to an FTP client and forge control-channel replies.
 func TestSFTPServer_RejectsCRLFInFilenames(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "src.txt"), []byte("x"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "src.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	users := map[string]UserInfo{
@@ -5986,7 +5986,7 @@ func FuzzListPathArg(f *testing.F) {
 func FuzzFtpListLine(f *testing.F) {
 	dir := f.TempDir()
 	stub := filepath.Join(dir, "stub")
-	if err := os.WriteFile(stub, []byte("x"), 0644); err != nil {
+	if err := os.WriteFile(stub, []byte("x"), 0o644); err != nil {
 		f.Fatal(err)
 	}
 	info, err := os.Stat(stub)
@@ -6148,7 +6148,7 @@ func TestFTPServer_ActiveModeDisabledByDefault(t *testing.T) {
 
 func TestFTPServer_ActiveModeTransfers(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "download.txt"), []byte("retr-data"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "download.txt"), []byte("retr-data"), 0o644); err != nil {
 		t.Fatalf("os.WriteFile(download): %v", err)
 	}
 	users := map[string]UserInfo{
@@ -6422,7 +6422,7 @@ func TestFTPServer_REINClearsEpsvAll(t *testing.T) {
 // failure so a confused client can recover by issuing PASV.
 func TestFTPServer_STORWithoutPassiveModeFails(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "exists.txt"), []byte("y"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "exists.txt"), []byte("y"), 0o644); err != nil {
 		t.Fatalf("os.WriteFile: %v", err)
 	}
 	users := map[string]UserInfo{

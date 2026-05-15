@@ -42,6 +42,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"os"
 	"path"
@@ -120,6 +121,8 @@ const (
 	CompletedUploadProtocolFTP = "FTP"
 )
 
+// AuthEventType identifies the kind of authentication event delivered on the
+// AuthEvents channel (login success, login failure, or logout).
 type AuthEventType string
 
 const (
@@ -194,6 +197,7 @@ func resolveDur(configured, defaultV time.Duration) time.Duration {
 // idle deadline only on the side they actually use.
 type idleConn struct {
 	net.Conn
+
 	readTimeoutNs  atomic.Int64
 	writeTimeoutNs atomic.Int64
 }
@@ -322,7 +326,9 @@ func sanitizeFTPText(s string) string {
 // and returns an ssh.Signer suitable for use as a server host key.
 // It supports any key type accepted by ssh.ParsePrivateKey (RSA, ECDSA, Ed25519).
 func NewSignerFromFile(path string) (ssh.Signer, error) {
-	data, err := os.ReadFile(path)
+	// The path is supplied by the caller (operator-controlled), which is the
+	// documented contract of this helper.
+	data, err := os.ReadFile(path) //nolint:gosec // operator-supplied host-key path
 	if err != nil {
 		return nil, fmt.Errorf("read host key %q: %w", path, err)
 	}
@@ -670,7 +676,8 @@ func (s *Server) AddUserKey(username string, key ssh.PublicKey) {
 			return // already present
 		}
 	}
-	u.AuthorizedKeys = append(keys, key)
+	keys = append(keys, key)
+	u.AuthorizedKeys = keys
 	s.users[username] = u
 }
 
@@ -1064,41 +1071,59 @@ func (s *Server) ListenAndServe() error {
 	if err != nil {
 		return err
 	}
-	var sftpLn net.Listener
-	var ftpLn net.Listener
 	defer s.finishListenAndServe(runID)
 
+	if err := s.prepareForListen(); err != nil {
+		return err
+	}
+	uploads := s.completedUploadsChan()
+	authEvents := s.authEventsChan()
+	cfg := s.sshServerConfig()
+
+	sftpLn, ftpLn, err := s.openListeners()
+	if err != nil {
+		return err
+	}
+	if !s.publishListeners(runID, sftpLn, ftpLn) {
+		return closeListenerPair(sftpLn, ftpLn)
+	}
+	return s.runListenWorkers(runID, sftpLn, ftpLn, cfg, uploads, authEvents)
+}
+
+// prepareForListen runs the startup checks that must succeed before any
+// listener is opened: a signer is available, and the running kernel supports
+// the openat2 containment primitive.
+func (s *Server) prepareForListen() error {
 	if err := s.ensureSigner(); err != nil {
 		return fmt.Errorf("ironport: %w", err)
 	}
-	// Hard requirement: the package's containment guarantee relies on
+	// The package's containment guarantee relies on
 	// openat2(RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS), available since Linux
 	// 5.6. Fail fast at startup on older kernels rather than silently
 	// degrading the policy at first request.
 	if err := ensureOpenat2(); err != nil {
 		return fmt.Errorf("ironport: %w", err)
 	}
-	uploads := s.completedUploadsChan()
-	authEvents := s.authEventsChan()
-	cfg := s.sshServerConfig()
+	return nil
+}
 
-	sftpLn, err = net.Listen("tcp", s.addr)
+func (s *Server) openListeners() (net.Listener, net.Listener, error) {
+	sftpLn, err := net.Listen("tcp", s.addr)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-
-	if strings.TrimSpace(s.ftpAddr) != "" {
-		ftpLn, err = net.Listen("tcp", s.ftpAddr)
-		if err != nil {
-			_ = sftpLn.Close()
-			return err
-		}
+	if strings.TrimSpace(s.ftpAddr) == "" {
+		return sftpLn, nil, nil
 	}
-
-	if !s.publishListeners(runID, sftpLn, ftpLn) {
-		return closeListenerPair(sftpLn, ftpLn)
+	ftpLn, err := net.Listen("tcp", s.ftpAddr)
+	if err != nil {
+		_ = sftpLn.Close()
+		return nil, nil, err
 	}
+	return sftpLn, ftpLn, nil
+}
 
+func (s *Server) runListenWorkers(runID uint64, sftpLn, ftpLn net.Listener, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) error {
 	log.Printf("SFTP listening on %s", sftpLn.Addr())
 	workers := 1
 	errCh := make(chan error, 2)
@@ -1303,7 +1328,9 @@ func deferRecoverSFTPHandlerPanic(username, clientIP string, r *sftp.Request, er
 func deferRecoverSFTPPanicf(errp *error, onPanic func(), format string, args ...any) func() {
 	return func() {
 		if recovered := recover(); recovered != nil {
-			allArgs := append(args, recovered, debug.Stack())
+			allArgs := make([]any, 0, len(args)+2)
+			allArgs = append(allArgs, args...)
+			allArgs = append(allArgs, recovered, debug.Stack())
 			log.Printf(format, allArgs...)
 			if onPanic != nil {
 				onPanic()
@@ -1471,12 +1498,12 @@ func canonicalJailRoot(root string) (string, error) {
 		return "", err
 	}
 
-	real, err := filepath.EvalSymlinks(abs)
+	resolved, err := filepath.EvalSymlinks(abs)
 	if err != nil {
 		return "", err
 	}
 
-	st, err := os.Stat(real)
+	st, err := os.Stat(resolved)
 	if err != nil {
 		return "", err
 	}
@@ -1484,7 +1511,7 @@ func canonicalJailRoot(root string) (string, error) {
 		return "", syscall.ENOTDIR
 	}
 
-	return real, nil
+	return resolved, nil
 }
 
 // checkPassword performs a SHA-256-normalized constant-time comparison between
@@ -1518,6 +1545,36 @@ func (s *Server) authenticateUser(username string, keyCheck func(stored UserInfo
 		return UserInfo{}, "", false
 	}
 	return u, jailRoot, true
+}
+
+// matchAuthorizedKey reports whether the presented SSH public key matches any
+// entry in authorizedKeys. The comparison is constant-time on a fixed
+// SHA-256 hash, and the total iteration count is padded out to
+// authorizedKeyTimingPad so the response time does not leak (a) whether the
+// user exists, (b) the position of a matching key, or (c) the number of keys
+// the user has configured (up to the pad constant).
+func matchAuthorizedKey(authorizedKeys []ssh.PublicKey, presented ssh.PublicKey) bool {
+	keyHash := sha256.Sum256(presented.Marshal())
+	var zeroHash [sha256.Size]byte
+	matched := false
+	compares := 0
+	for _, authorizedKey := range authorizedKeys {
+		if authorizedKey == nil {
+			continue
+		}
+		authHash := sha256.Sum256(authorizedKey.Marshal())
+		if subtle.ConstantTimeCompare(keyHash[:], authHash[:]) == 1 {
+			matched = true
+		}
+		compares++
+	}
+	// Pad with dummy comparisons against an all-zero hash (which can never
+	// match a real key's SHA-256) so that the total number of constant-time
+	// compares is independent of len(AuthorizedKeys).
+	for ; compares < authorizedKeyTimingPad; compares++ {
+		_ = subtle.ConstantTimeCompare(keyHash[:], zeroHash[:])
+	}
+	return matched
 }
 
 // sshServerConfig builds the SSH server configuration with both password-based
@@ -1568,39 +1625,7 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 		},
 		PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			return completeLogin(c, func(u UserInfo) bool {
-				keyBytes := key.Marshal()
-				// Hash the presented key's wire-format bytes to a fixed 32-byte
-				// value so that all comparisons in the loop are the same length
-				// regardless of key algorithm. RSA, ECDSA, and Ed25519 wire
-				// formats all differ in length; a raw ConstantTimeCompare would
-				// short-circuit on any length mismatch, leaking type information.
-				keyHash := sha256.Sum256(keyBytes)
-				// All comparisons are constant-time on a fixed 32-byte hash and
-				// the total iteration count is padded out to authorizedKeyTimingPad
-				// below so the response time does not leak (a) whether the user
-				// exists, (b) the position of a matching key in AuthorizedKeys, or
-				// (c) the number of keys the user has configured (up to the pad
-				// constant).
-				var zeroHash [sha256.Size]byte
-				matched := false
-				compares := 0
-				for _, authorizedKey := range u.AuthorizedKeys {
-					if authorizedKey == nil {
-						continue
-					}
-					authHash := sha256.Sum256(authorizedKey.Marshal())
-					if subtle.ConstantTimeCompare(keyHash[:], authHash[:]) == 1 {
-						matched = true
-					}
-					compares++
-				}
-				// Pad with dummy comparisons against an all-zero hash (which can
-				// never match a real key's SHA-256) so that the total number of
-				// constant-time compares is independent of len(AuthorizedKeys).
-				for ; compares < authorizedKeyTimingPad; compares++ {
-					_ = subtle.ConstantTimeCompare(keyHash[:], zeroHash[:])
-				}
-				return matched
+				return matchAuthorizedKey(u.AuthorizedKeys, key)
 			})
 		},
 	}
@@ -1797,6 +1822,7 @@ func (j jail) Fileread(r *sftp.Request) (reader io.ReaderAt, err error) {
 // channel; otherwise consumers would treat a partial file as complete.
 type writeLogger struct {
 	*os.File
+
 	filepath     string
 	fullFilepath string
 	username     string
@@ -1893,7 +1919,7 @@ func (j jail) Filewrite(r *sftp.Request) (writer io.WriterAt, err error) {
 	if err != nil {
 		return nil, err
 	}
-	f, err := j.fs.OpenWrite(r.Filepath, openFlags, 0600)
+	f, err := j.fs.OpenWrite(r.Filepath, openFlags, 0o600)
 	if err != nil {
 		return nil, sanitizeSFTPErr(err)
 	}
@@ -1972,7 +1998,7 @@ func (j jail) Filecmd(r *sftp.Request) (err error) {
 		if hasCRLF(r.Filepath) {
 			return syscall.EINVAL
 		}
-		return sanitizeSFTPErr(j.fs.Mkdir(r.Filepath, 0750))
+		return sanitizeSFTPErr(j.fs.Mkdir(r.Filepath, 0o750))
 
 	case "Symlink":
 		// Symlinks are disallowed in the jail: a client-created symlink could
@@ -2050,6 +2076,12 @@ func (j jail) applyAttrs(r *sftp.Request) error {
 		return os.ErrPermission
 	}
 	if flags.Size {
+		// attrs.Size is a uint64 from the SFTP protocol but the underlying
+		// fs API expects int64. Reject sizes that would overflow rather than
+		// silently wrapping into a negative truncation length.
+		if attrs.Size > math.MaxInt64 {
+			return os.ErrInvalid
+		}
 		if err := j.fs.Truncate(r.Filepath, int64(attrs.Size)); err != nil {
 			return err
 		}
@@ -2204,6 +2236,7 @@ func (s *Server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- Co
 		_ = nc.Close()
 		ctl := sess.ctlMsg
 		if ctl != nil {
+			//nolint:revive // empty block intentionally drains the channel until close
 			for range ctl {
 			}
 		}
@@ -2232,47 +2265,64 @@ func (s *Server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- Co
 		defer idleTimer.Stop()
 	}
 	for {
-		if idleTimer != nil {
-			if !idleTimer.Stop() {
-				select {
-				case <-idleTimer.C:
-				default:
-				}
-			}
-			idleTimer.Reset(idleTimeout)
-		}
-		var msg ftpCtlMsg
-		var ok bool
-		select {
-		case msg, ok = <-sess.ctlMsg:
-			if !ok {
-				return
-			}
-		case <-idleC:
-			log.Printf("ftp control idle timeout from=%s", nc.RemoteAddr())
+		resetIdleTimer(idleTimer, idleTimeout)
+		msg, done := sess.nextControlMessage(idleC, nc)
+		if done {
 			return
 		}
-		if msg.err != nil {
-			if errors.Is(msg.err, errFTPLineTooLong) {
-				_ = sess.reply(500, ftpErrMsg(msg.err))
-				log.Printf("ftp control read from=%s: line exceeded %d bytes", nc.RemoteAddr(), ftpMaxControlLineLen)
-				return
-			}
-			if !errors.Is(msg.err, io.EOF) {
-				log.Printf("ftp control read from=%s: %v", nc.RemoteAddr(), msg.err)
-			}
-			return
-		}
-
 		line := strings.TrimRight(msg.line, "\r\n")
 		if line == "" {
 			continue
 		}
 		cmd, arg := parseFTPCommand(line)
-		quit := sess.handleFTPCommand(cmd, arg)
-		if quit {
+		if sess.handleFTPCommand(cmd, arg) {
 			return
 		}
+	}
+}
+
+func resetIdleTimer(t *time.Timer, d time.Duration) {
+	if t == nil {
+		return
+	}
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(d)
+}
+
+// nextControlMessage waits for the next control-channel message or for the
+// idle timer to fire. Returns done=true when the caller should exit the
+// per-session loop (channel closed, idle timeout, or fatal read error); the
+// helper has already logged and replied as needed.
+func (f *ftpSession) nextControlMessage(idleC <-chan time.Time, nc net.Conn) (ftpCtlMsg, bool) {
+	select {
+	case msg, ok := <-f.ctlMsg:
+		if !ok {
+			return ftpCtlMsg{}, true
+		}
+		if msg.err != nil {
+			f.handleControlReadError(msg.err, nc)
+			return ftpCtlMsg{}, true
+		}
+		return msg, false
+	case <-idleC:
+		log.Printf("ftp control idle timeout from=%s", nc.RemoteAddr())
+		return ftpCtlMsg{}, true
+	}
+}
+
+func (f *ftpSession) handleControlReadError(err error, nc net.Conn) {
+	if errors.Is(err, errFTPLineTooLong) {
+		_ = f.reply(500, ftpErrMsg(err))
+		log.Printf("ftp control read from=%s: line exceeded %d bytes", nc.RemoteAddr(), ftpMaxControlLineLen)
+		return
+	}
+	if !errors.Is(err, io.EOF) {
+		log.Printf("ftp control read from=%s: %v", nc.RemoteAddr(), err)
 	}
 }
 
@@ -2368,19 +2418,22 @@ func readFTPControlLine(r *bufio.Reader, maxLen int) (string, error) {
 			return string(buf) + "\n", nil
 		}
 		if len(buf)+1 >= maxLen {
-			// Drain the rest of the offending line so the protocol stream
-			// stays aligned for the caller's error reply.
-			for {
-				b2, err := r.ReadByte()
-				if err != nil {
-					return "", errFTPLineTooLong
-				}
-				if b2 == '\n' {
-					return "", errFTPLineTooLong
-				}
-			}
+			drainFTPControlLine(r)
+			return "", errFTPLineTooLong
 		}
 		buf = append(buf, b)
+	}
+}
+
+// drainFTPControlLine consumes bytes from r up to and including the next '\n'
+// (or EOF) so the protocol stream stays aligned after an over-length command
+// is rejected.
+func drainFTPControlLine(r *bufio.Reader) {
+	for {
+		b, err := r.ReadByte()
+		if err != nil || b == '\n' {
+			return
+		}
 	}
 }
 
@@ -2399,281 +2452,270 @@ func parseFTPCommand(line string) (string, string) {
 }
 
 func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
-	switch cmd {
-	case "USER":
-		if f.server.ftpRequireTLS && f.tlsConn == nil {
-			_ = f.reply(534, "AUTH TLS required before login")
-			return false
-		}
-		f.logoutIfAuthenticated()
-		f.username = arg
-		f.authenticated = false
-		f.user = UserInfo{}
-		_ = f.reply(331, "password required")
-		return false
-
-	case "PASS":
-		if f.server.ftpRequireTLS && f.tlsConn == nil {
-			_ = f.reply(534, "AUTH TLS required before login")
-			return false
-		}
-		if f.username == "" {
-			_ = f.reply(503, "send USER first")
-			return false
-		}
-		if !f.authenticate(arg) {
-			f.announceAuthEvent(AuthEventLoginFailed)
-			_ = f.reply(530, errInvalidCredentials.Error())
-			return false
-		}
-		log.Printf("login protocol=ftp user=%s root=%s from=%s", f.username, f.user.Root, f.conn.RemoteAddr())
-		f.announceAuthEvent(AuthEventLoginSuccess)
-		_ = f.reply(230, "login successful")
-		return false
-
-	case "QUIT":
-		_ = f.reply(221, "goodbye")
-		return true
-
-	case "NOOP":
-		_ = f.reply(200, "ok")
-		return false
-
-	case "SYST":
-		_ = f.reply(215, "UNIX Type: L8")
-		return false
-
-	case "FEAT":
-		features := []string{
-			"UTF8",
-			"EPSV",
-			"PASV",
-			"SIZE",
-			"MDTM",
-			"REST STREAM",
-			"MLST type*;size*;modify*;perm*;unique*;",
-			"MLSD",
-			"TVFS",
-			"LANG en-US*",
-			"HOST",
-		}
-		if f.server.ftpAllowActiveMode {
-			features = append(features, "EPRT")
-		}
-		if f.server.ftpTLSConfig != nil {
-			features = append(features, "AUTH TLS", "PBSZ", "PROT")
-		}
-		_ = f.multilineReply(211, "Features:", features, "End")
-		return false
-
-	case "HELP":
-		f.cmdHelp(arg)
-		return false
-
-	case "STAT":
-		// STAT with no argument is server status and is commonly issued before
-		// login; the path form falls through to the authenticated switch by
-		// reusing cmdStat's own auth checks.
-		f.cmdStat(arg)
-		return false
-
-	case "LANG":
-		f.cmdLang(arg)
-		return false
-
-	case "HOST":
-		f.cmdHost(arg)
-		return false
-
-	case "REIN":
-		f.cmdRein()
-		return false
-
-	case "AUTH":
-		f.cmdAuth(arg)
-		return false
-
-	case "PBSZ":
-		if f.tlsConn == nil {
-			_ = f.reply(503, "PBSZ only valid after AUTH TLS")
-			return false
-		}
-		// RFC 4217 §9: PBSZ over TLS is always 0; accept any non-negative
-		// value and reply with 0 so non-conformant clients that send a
-		// non-zero buffer size still proceed.
-		_ = f.reply(200, "PBSZ=0")
-		f.pbszSet = true
-		return false
-
-	case "PROT":
-		if f.tlsConn == nil {
-			_ = f.reply(503, "PROT only valid after AUTH TLS")
-			return false
-		}
-		if !f.pbszSet {
-			_ = f.reply(503, "send PBSZ first")
-			return false
-		}
-		switch strings.ToUpper(strings.TrimSpace(arg)) {
-		case "C":
-			if f.server.ftpRequireTLS {
-				_ = f.reply(534, "PROT C refused; data protection is required")
-				return false
-			}
-			f.dataProt = 'C'
-			_ = f.reply(200, "protection level set to Clear")
-		case "P":
-			f.dataProt = 'P'
-			_ = f.reply(200, "protection level set to Private")
-		case "S", "E":
-			_ = f.reply(536, "protection level not supported")
-		default:
-			_ = f.reply(504, "unknown protection level")
-		}
-		return false
-
-	case "CCC":
-		// RFC 4217 §12.3: refuse downgrade from TLS back to plaintext. A
-		// session that successfully negotiated TLS must remain encrypted
-		// for the duration of the connection.
-		_ = f.reply(534, "CCC refused")
-		return false
+	handled, quit := f.handlePreAuthCommand(cmd, arg)
+	if handled {
+		return quit
 	}
-
 	if !f.authenticated {
 		_ = f.reply(530, "not logged in")
 		return false
 	}
+	f.handleAuthenticatedCommand(cmd, arg)
+	return false
+}
 
+// handlePreAuthCommand handles the commands that are accepted before
+// authentication (or that have AUTH-TLS-specific gating). Returns
+// handled=true when the command matched a pre-auth case, and quit=true when
+// the session should terminate (only QUIT does this).
+func (f *ftpSession) handlePreAuthCommand(cmd, arg string) (handled, quit bool) {
+	if cmd == "QUIT" {
+		_ = f.reply(221, "goodbye")
+		return true, true
+	}
+	if handler, ok := preAuthFTPHandlers[cmd]; ok {
+		handler(f, arg)
+		return true, false
+	}
+	return false, false
+}
+
+// preAuthFTPHandlers maps each FTP verb that is accepted before
+// authentication to a handler. QUIT is handled inline because it is the only
+// pre-auth command that terminates the session.
+//
+//nolint:gochecknoglobals // immutable dispatch table populated at init
+var preAuthFTPHandlers = map[string]func(*ftpSession, string){
+	"USER": func(f *ftpSession, arg string) { f.cmdUser(arg) },
+	"PASS": func(f *ftpSession, arg string) { f.cmdPass(arg) },
+	"NOOP": func(f *ftpSession, _ string) { _ = f.reply(200, "ok") },
+	"SYST": func(f *ftpSession, _ string) { _ = f.reply(215, "UNIX Type: L8") },
+	"FEAT": func(f *ftpSession, _ string) { f.cmdFeat() },
+	"HELP": func(f *ftpSession, arg string) { f.cmdHelp(arg) },
+	// STAT with no argument is server status and is commonly issued before
+	// login; cmdStat performs its own auth check for the path form.
+	"STAT": func(f *ftpSession, arg string) { f.cmdStat(arg) },
+	"LANG": func(f *ftpSession, arg string) { f.cmdLang(arg) },
+	"HOST": func(f *ftpSession, arg string) { f.cmdHost(arg) },
+	"REIN": func(f *ftpSession, _ string) { f.cmdRein() },
+	"AUTH": func(f *ftpSession, arg string) { f.cmdAuth(arg) },
+	"PBSZ": func(f *ftpSession, _ string) { f.cmdPbsz() },
+	"PROT": func(f *ftpSession, arg string) { f.cmdProt(arg) },
+	// RFC 4217 §12.3: refuse downgrade from TLS back to plaintext.
+	"CCC": func(f *ftpSession, _ string) { _ = f.reply(534, "CCC refused") },
+}
+
+func (f *ftpSession) cmdUser(arg string) {
+	if f.server.ftpRequireTLS && f.tlsConn == nil {
+		_ = f.reply(534, "AUTH TLS required before login")
+		return
+	}
+	f.logoutIfAuthenticated()
+	f.username = arg
+	f.authenticated = false
+	f.user = UserInfo{}
+	_ = f.reply(331, "password required")
+}
+
+func (f *ftpSession) cmdPass(arg string) {
+	if f.server.ftpRequireTLS && f.tlsConn == nil {
+		_ = f.reply(534, "AUTH TLS required before login")
+		return
+	}
+	if f.username == "" {
+		_ = f.reply(503, "send USER first")
+		return
+	}
+	if !f.authenticate(arg) {
+		f.announceAuthEvent(AuthEventLoginFailed)
+		_ = f.reply(530, errInvalidCredentials.Error())
+		return
+	}
+	log.Printf("login protocol=ftp user=%s root=%s from=%s", f.username, f.user.Root, f.conn.RemoteAddr())
+	f.announceAuthEvent(AuthEventLoginSuccess)
+	_ = f.reply(230, "login successful")
+}
+
+func (f *ftpSession) cmdPbsz() {
+	if f.tlsConn == nil {
+		_ = f.reply(503, "PBSZ only valid after AUTH TLS")
+		return
+	}
+	// RFC 4217 §9: PBSZ over TLS is always 0; accept any non-negative
+	// value and reply with 0 so non-conformant clients that send a
+	// non-zero buffer size still proceed.
+	_ = f.reply(200, "PBSZ=0")
+	f.pbszSet = true
+}
+
+func (f *ftpSession) handleAuthenticatedCommand(cmd, arg string) {
+	if handler, ok := authedFTPHandlers[cmd]; ok {
+		handler(f, arg)
+		return
+	}
+	// MFMT/MFCT and SITE need to see the original cmd verb in their reply
+	// (or have a fixed reply), and the rest fall through to the generic
+	// "not implemented" path.
 	switch cmd {
-	case "PWD", "XPWD":
+	case "MFMT", "MFCT":
+		// Setting modification times on jailed files is denied wholesale
+		// by the same policy that rejects SFTP Acmodtime. Reply with the
+		// canonical "command not implemented for that parameter" code so
+		// MFMT-aware clients (backup/sync tools) get a deterministic,
+		// well-formed refusal.
+		_ = f.reply(502, cmd+" not supported")
+	default:
+		_ = f.reply(502, "command not implemented")
+	}
+}
+
+// authedFTPHandlers maps each authenticated-only FTP verb to a handler. Keeping
+// the dispatch table out of handleAuthenticatedCommand keeps the function's
+// cyclomatic complexity at the level of the table lookup rather than the
+// number of supported commands.
+//
+//nolint:gochecknoglobals // immutable dispatch table populated at init
+var authedFTPHandlers = map[string]func(*ftpSession, string){
+	"PWD": func(f *ftpSession, _ string) {
 		_ = f.reply(257, fmt.Sprintf("%s is the current directory", ftpQuotePath(f.cwd)))
-
-	case "CWD":
-		f.cmdCWD(arg)
-
-	case "CDUP":
-		f.cmdCWD("..")
-
-	case "TYPE":
-		// Transfers are binary-safe. Accept ASCII and binary mode for client
-		// compatibility, but do not transform bytes.
-		upper := strings.ToUpper(strings.TrimSpace(arg))
-		if upper == "A" || upper == "A N" || upper == "I" || upper == "L 8" {
-			_ = f.reply(200, "type set")
-		} else {
-			_ = f.reply(504, "unsupported type")
-		}
-
-	case "MODE":
-		if strings.EqualFold(strings.TrimSpace(arg), "S") {
-			_ = f.reply(200, "mode set")
-		} else {
-			_ = f.reply(504, "unsupported mode")
-		}
-
-	case "STRU":
-		if strings.EqualFold(strings.TrimSpace(arg), "F") {
-			_ = f.reply(200, "structure set")
-		} else {
-			_ = f.reply(504, "unsupported structure")
-		}
-
-	case "OPTS":
-		if strings.EqualFold(strings.TrimSpace(arg), "UTF8 ON") {
-			_ = f.reply(200, "UTF8 enabled")
-		} else {
-			_ = f.reply(501, "unsupported option")
-		}
-
-	case "PASV":
-		f.enterPassive(false)
-
-	case "EPSV":
-		if strings.EqualFold(strings.TrimSpace(arg), "ALL") {
-			f.closeDataEndpoint()
-			f.epsvAll = true
-			_ = f.reply(200, "EPSV ALL ok")
-		} else {
-			f.enterPassive(true)
-		}
-
-	case "PORT":
-		f.enterActivePORT(arg)
-
-	case "EPRT":
-		f.enterActiveEPRT(arg)
-
-	case "LIST":
-		f.cmdList(arg, false)
-
-	case "NLST":
-		f.cmdList(arg, true)
-
-	case "RETR":
-		f.cmdRetr(arg)
-
-	case "STOR":
-		f.cmdStor(arg, false)
-
-	case "APPE":
-		f.cmdStor(arg, true)
-
-	case "ALLO":
-		f.cmdAllo(arg)
-
-	case "REST":
-		f.cmdRest(arg)
-
-	case "SIZE":
-		f.cmdSize(arg)
-
-	case "MDTM":
-		f.cmdMDTM(arg)
-
-	case "DELE":
-		f.cmdDelete(arg)
-
-	case "MKD", "XMKD":
-		f.cmdMkdir(arg)
-
-	case "RMD", "XRMD":
-		f.cmdRmdir(arg)
-
-	case "RNFR":
-		f.cmdRnfr(arg)
-
-	case "RNTO":
-		f.cmdRnto(arg)
-
-	case "ABOR":
+	},
+	"XPWD": func(f *ftpSession, _ string) {
+		_ = f.reply(257, fmt.Sprintf("%s is the current directory", ftpQuotePath(f.cwd)))
+	},
+	"CWD":  func(f *ftpSession, arg string) { f.cmdCWD(arg) },
+	"CDUP": func(f *ftpSession, _ string) { f.cmdCWD("..") },
+	"TYPE": func(f *ftpSession, arg string) { f.cmdType(arg) },
+	"MODE": func(f *ftpSession, arg string) { f.cmdMode(arg) },
+	"STRU": func(f *ftpSession, arg string) { f.cmdStru(arg) },
+	"OPTS": func(f *ftpSession, arg string) { f.cmdOpts(arg) },
+	"PASV": func(f *ftpSession, _ string) { f.enterPassive(false) },
+	"EPSV": func(f *ftpSession, arg string) { f.cmdEpsv(arg) },
+	"PORT": func(f *ftpSession, arg string) { f.enterActivePORT(arg) },
+	"EPRT": func(f *ftpSession, arg string) { f.enterActiveEPRT(arg) },
+	"LIST": func(f *ftpSession, arg string) { f.cmdList(arg, false) },
+	"NLST": func(f *ftpSession, arg string) { f.cmdList(arg, true) },
+	"RETR": func(f *ftpSession, arg string) { f.cmdRetr(arg) },
+	"STOR": func(f *ftpSession, arg string) { f.cmdStor(arg, false) },
+	"APPE": func(f *ftpSession, arg string) { f.cmdStor(arg, true) },
+	"ALLO": func(f *ftpSession, arg string) { f.cmdAllo(arg) },
+	"REST": func(f *ftpSession, arg string) { f.cmdRest(arg) },
+	"SIZE": func(f *ftpSession, arg string) { f.cmdSize(arg) },
+	"MDTM": func(f *ftpSession, arg string) { f.cmdMDTM(arg) },
+	"DELE": func(f *ftpSession, arg string) { f.cmdDelete(arg) },
+	"MKD":  func(f *ftpSession, arg string) { f.cmdMkdir(arg) },
+	"XMKD": func(f *ftpSession, arg string) { f.cmdMkdir(arg) },
+	"RMD":  func(f *ftpSession, arg string) { f.cmdRmdir(arg) },
+	"XRMD": func(f *ftpSession, arg string) { f.cmdRmdir(arg) },
+	"RNFR": func(f *ftpSession, arg string) { f.cmdRnfr(arg) },
+	"RNTO": func(f *ftpSession, arg string) { f.cmdRnto(arg) },
+	"ABOR": func(f *ftpSession, _ string) {
 		f.closeDataListener()
 		f.restartOffset = 0
 		f.expectedUploadSize = 0
 		_ = f.reply(226, "abort successful")
-
-	case "MLST":
-		f.cmdMLST(arg)
-
-	case "MLSD":
-		f.cmdMLSD(arg)
-
-	case "SITE":
+	},
+	"MLST": func(f *ftpSession, arg string) { f.cmdMLST(arg) },
+	"MLSD": func(f *ftpSession, arg string) { f.cmdMLSD(arg) },
+	"SITE": func(f *ftpSession, _ string) {
 		// SITE has no portable subcommands here; reply cleanly rather than
 		// the generic 502 so clients can probe without ambiguity.
 		_ = f.reply(502, "SITE command not implemented")
+	},
+}
 
-	case "MFMT", "MFCT":
-		// Setting modification times on jailed files is denied wholesale by the
-		// same policy that rejects SFTP Acmodtime. Reply with the canonical
-		// "command not implemented for that parameter" code so MFMT-aware
-		// clients (backup/sync tools) get a deterministic, well-formed refusal.
-		_ = f.reply(502, cmd+" not supported")
-
-	default:
-		_ = f.reply(502, "command not implemented")
+func (f *ftpSession) cmdType(arg string) {
+	// Transfers are binary-safe. Accept ASCII and binary mode for client
+	// compatibility, but do not transform bytes.
+	upper := strings.ToUpper(strings.TrimSpace(arg))
+	if upper == "A" || upper == "A N" || upper == "I" || upper == "L 8" {
+		_ = f.reply(200, "type set")
+		return
 	}
-	return false
+	_ = f.reply(504, "unsupported type")
+}
+
+func (f *ftpSession) cmdMode(arg string) {
+	if strings.EqualFold(strings.TrimSpace(arg), "S") {
+		_ = f.reply(200, "mode set")
+		return
+	}
+	_ = f.reply(504, "unsupported mode")
+}
+
+func (f *ftpSession) cmdStru(arg string) {
+	if strings.EqualFold(strings.TrimSpace(arg), "F") {
+		_ = f.reply(200, "structure set")
+		return
+	}
+	_ = f.reply(504, "unsupported structure")
+}
+
+func (f *ftpSession) cmdOpts(arg string) {
+	if strings.EqualFold(strings.TrimSpace(arg), "UTF8 ON") {
+		_ = f.reply(200, "UTF8 enabled")
+		return
+	}
+	_ = f.reply(501, "unsupported option")
+}
+
+func (f *ftpSession) cmdEpsv(arg string) {
+	if strings.EqualFold(strings.TrimSpace(arg), "ALL") {
+		f.closeDataEndpoint()
+		f.epsvAll = true
+		_ = f.reply(200, "EPSV ALL ok")
+		return
+	}
+	f.enterPassive(true)
+}
+
+func (f *ftpSession) cmdFeat() {
+	features := []string{
+		"UTF8",
+		"EPSV",
+		"PASV",
+		"SIZE",
+		"MDTM",
+		"REST STREAM",
+		"MLST type*;size*;modify*;perm*;unique*;",
+		"MLSD",
+		"TVFS",
+		"LANG en-US*",
+		"HOST",
+	}
+	if f.server.ftpAllowActiveMode {
+		features = append(features, "EPRT")
+	}
+	if f.server.ftpTLSConfig != nil {
+		features = append(features, "AUTH TLS", "PBSZ", "PROT")
+	}
+	_ = f.multilineReply(211, "Features:", features, "End")
+}
+
+func (f *ftpSession) cmdProt(arg string) {
+	if f.tlsConn == nil {
+		_ = f.reply(503, "PROT only valid after AUTH TLS")
+		return
+	}
+	if !f.pbszSet {
+		_ = f.reply(503, "send PBSZ first")
+		return
+	}
+	switch strings.ToUpper(strings.TrimSpace(arg)) {
+	case "C":
+		if f.server.ftpRequireTLS {
+			_ = f.reply(534, "PROT C refused; data protection is required")
+			return
+		}
+		f.dataProt = 'C'
+		_ = f.reply(200, "protection level set to Clear")
+	case "P":
+		f.dataProt = 'P'
+		_ = f.reply(200, "protection level set to Private")
+	case "S", "E":
+		_ = f.reply(536, "protection level not supported")
+	default:
+		_ = f.reply(504, "unknown protection level")
+	}
 }
 
 // cmdAuth handles the AUTH command (RFC 4217 §4). It accepts AUTH TLS,
@@ -2691,22 +2733,7 @@ func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
 // reader after the upgrade, executing them inside the encrypted session.
 // We refuse the upgrade if anything is buffered behind the AUTH line.
 func (f *ftpSession) cmdAuth(arg string) {
-	if f.server.ftpTLSConfig == nil {
-		_ = f.reply(502, "AUTH not supported")
-		return
-	}
-	if f.tlsConn != nil {
-		_ = f.reply(503, "already TLS")
-		return
-	}
-	switch strings.ToUpper(strings.TrimSpace(arg)) {
-	case "TLS", "TLS-C", "SSL":
-		// Accepted; fall through.
-	case "":
-		_ = f.reply(501, "AUTH requires a mechanism")
-		return
-	default:
-		_ = f.reply(504, "unsupported AUTH mechanism")
+	if !f.validateAuthRequest(arg) {
 		return
 	}
 
@@ -2717,49 +2744,91 @@ func (f *ftpSession) cmdAuth(arg string) {
 	// Suspend the reader so the next two checks see a stable f.r / f.ctlMsg.
 	f.stopReader()
 
-	// Pending lines in ctlMsg or buffered bytes in f.r at this point came
-	// in over plaintext after the AUTH command — i.e., a man-in-the-middle
-	// could have injected them. Either form is fatal: tear down the
-	// connection rather than re-evaluating attacker-controlled commands
-	// inside the encrypted session.
-	for {
-		select {
-		case msg, ok := <-f.ctlMsg:
-			if !ok {
-				goto drained
-			}
-			if msg.err == nil && strings.TrimSpace(msg.line) != "" {
-				log.Printf("ftp AUTH TLS rejected from=%s: pre-TLS line buffered: %q", f.conn.RemoteAddr(), msg.line)
-				_ = f.conn.Close()
-				return
-			}
-		default:
-			goto drained
-		}
-	}
-drained:
-	if f.r.Buffered() > 0 {
-		log.Printf("ftp AUTH TLS rejected from=%s: %d bytes buffered before TLS handshake", f.conn.RemoteAddr(), f.r.Buffered())
+	if !f.preTLSChannelClean() {
 		_ = f.conn.Close()
 		return
 	}
 
 	// RFC 4217 §4.3: any prior USER state is discarded across AUTH TLS so
 	// the post-TLS session cannot inherit half-finished authentication.
+	f.resetSessionStateForAuthTLS()
+
+	if !f.performTLSHandshake() {
+		return
+	}
+	f.startReader()
+}
+
+// validateAuthRequest returns true when AUTH is permitted with the supplied
+// mechanism; otherwise it sends the appropriate FTP reply and returns false.
+func (f *ftpSession) validateAuthRequest(arg string) bool {
+	if f.server.ftpTLSConfig == nil {
+		_ = f.reply(502, "AUTH not supported")
+		return false
+	}
+	if f.tlsConn != nil {
+		_ = f.reply(503, "already TLS")
+		return false
+	}
+	switch strings.ToUpper(strings.TrimSpace(arg)) {
+	case "TLS", "TLS-C", "SSL":
+		return true
+	case "":
+		_ = f.reply(501, "AUTH requires a mechanism")
+		return false
+	default:
+		_ = f.reply(504, "unsupported AUTH mechanism")
+		return false
+	}
+}
+
+// preTLSChannelClean reports whether the control channel is free of buffered
+// plaintext data after AUTH but before the TLS handshake. Pending lines in
+// ctlMsg or buffered bytes in f.r at this point came in over plaintext
+// after the AUTH command — a man-in-the-middle could have injected them, so
+// either form is fatal.
+func (f *ftpSession) preTLSChannelClean() bool {
+	for {
+		select {
+		case msg, ok := <-f.ctlMsg:
+			if !ok {
+				return f.r.Buffered() == 0 || f.logPreTLSBuffered()
+			}
+			if msg.err == nil && strings.TrimSpace(msg.line) != "" {
+				log.Printf("ftp AUTH TLS rejected from=%s: pre-TLS line buffered: %q", f.conn.RemoteAddr(), msg.line)
+				return false
+			}
+		default:
+			if f.r.Buffered() > 0 {
+				return f.logPreTLSBuffered()
+			}
+			return true
+		}
+	}
+}
+
+func (f *ftpSession) logPreTLSBuffered() bool {
+	log.Printf("ftp AUTH TLS rejected from=%s: %d bytes buffered before TLS handshake", f.conn.RemoteAddr(), f.r.Buffered())
+	return false
+}
+
+func (f *ftpSession) resetSessionStateForAuthTLS() {
 	f.username = ""
 	f.authenticated = false
 	f.user = UserInfo{}
 	f.rnfrPath = ""
 	f.restartOffset = 0
 	f.expectedUploadSize = 0
+}
 
+func (f *ftpSession) performTLSHandshake() bool {
 	deadline := time.Now().Add(ftpTLSHandshakeTimeout)
 	_ = f.conn.SetDeadline(deadline)
 	tlsConn := tls.Server(f.conn, f.server.ftpTLSConfig)
 	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
 		log.Printf("ftp AUTH TLS handshake from=%s: %v", f.conn.RemoteAddr(), err)
 		_ = f.conn.Close()
-		return
+		return false
 	}
 	_ = f.conn.SetDeadline(time.Time{})
 
@@ -2770,8 +2839,7 @@ drained:
 
 	cs := tlsConn.ConnectionState()
 	log.Printf("ftp AUTH TLS established from=%s version=%#x cipher=%#x", tlsConn.RemoteAddr(), cs.Version, cs.CipherSuite)
-
-	f.startReader()
+	return true
 }
 
 func (f *ftpSession) authenticate(pass string) bool {
@@ -3030,7 +3098,9 @@ func parseFTPPORTArg(arg string) (*net.TCPAddr, error) {
 		return nil, errors.New("invalid PORT")
 	}
 	return &net.TCPAddr{
-		IP:   net.IPv4(byte(values[0]), byte(values[1]), byte(values[2]), byte(values[3])),
+		// Each value is already validated to be in [0,255] above, so the byte
+		// conversion cannot overflow.
+		IP:   net.IPv4(byte(values[0]), byte(values[1]), byte(values[2]), byte(values[3])), //nolint:gosec // values bounded to [0,255]
 		Port: port,
 	}, nil
 }
@@ -3099,43 +3169,48 @@ func (f *ftpSession) acceptDataConn() (net.Conn, error) {
 
 func (f *ftpSession) dialOrAcceptDataConn() (net.Conn, error) {
 	if f.dataLn != nil {
-		ln := f.dataLn
-		f.dataLn = nil
-		defer func() { _ = ln.Close() }()
-
-		if tcpLn, ok := ln.(*net.TCPListener); ok {
-			if timeout := f.server.effectiveFTPDataAcceptTimeout(); timeout > 0 {
-				_ = tcpLn.SetDeadline(time.Now().Add(timeout))
-			}
-		}
-
-		dc, err := ln.Accept()
-		if err != nil {
-			return nil, err
-		}
-
-		// Prevent passive data-port stealing by requiring the data connection to
-		// originate from the same IP as the control connection.
-		if f.clientIP != "" && remoteIP(dc.RemoteAddr()) != f.clientIP {
-			_ = dc.Close()
-			return nil, fmt.Errorf("data connection from unexpected IP %s", remoteIP(dc.RemoteAddr()))
-		}
-
-		return dc, nil
+		return f.acceptPassiveDataConn()
 	}
-
 	if f.dataAddr != nil {
-		addr := f.dataAddr
-		f.dataAddr = nil
-		dialer := net.Dialer{}
+		return f.dialActiveDataConn()
+	}
+	return nil, errors.New("data connection not prepared")
+}
+
+func (f *ftpSession) acceptPassiveDataConn() (net.Conn, error) {
+	ln := f.dataLn
+	f.dataLn = nil
+	defer func() { _ = ln.Close() }()
+
+	if tcpLn, ok := ln.(*net.TCPListener); ok {
 		if timeout := f.server.effectiveFTPDataAcceptTimeout(); timeout > 0 {
-			dialer.Timeout = timeout
+			_ = tcpLn.SetDeadline(time.Now().Add(timeout))
 		}
-		log.Printf("ftp active data dial user=%s from=%s to=%s", f.username, f.conn.RemoteAddr(), addr)
-		return dialer.Dial("tcp", addr.String())
 	}
 
-	return nil, errors.New("data connection not prepared")
+	dc, err := ln.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	// Prevent passive data-port stealing by requiring the data connection to
+	// originate from the same IP as the control connection.
+	if f.clientIP != "" && remoteIP(dc.RemoteAddr()) != f.clientIP {
+		_ = dc.Close()
+		return nil, fmt.Errorf("data connection from unexpected IP %s", remoteIP(dc.RemoteAddr()))
+	}
+	return dc, nil
+}
+
+func (f *ftpSession) dialActiveDataConn() (net.Conn, error) {
+	addr := f.dataAddr
+	f.dataAddr = nil
+	dialer := net.Dialer{}
+	if timeout := f.server.effectiveFTPDataAcceptTimeout(); timeout > 0 {
+		dialer.Timeout = timeout
+	}
+	log.Printf("ftp active data dial user=%s from=%s to=%s", f.username, f.conn.RemoteAddr(), addr)
+	return dialer.Dial("tcp", addr.String())
 }
 
 // closeDataConn closes an FTP data connection. For TLS-wrapped data
@@ -3296,9 +3371,15 @@ func ftpModeString(mode os.FileMode) string {
 		idx int
 		chr byte
 	}{
-		{0400, 1, 'r'}, {0200, 2, 'w'}, {0100, 3, 'x'},
-		{0040, 4, 'r'}, {0020, 5, 'w'}, {0010, 6, 'x'},
-		{0004, 7, 'r'}, {0002, 8, 'w'}, {0001, 9, 'x'},
+		{0o400, 1, 'r'},
+		{0o200, 2, 'w'},
+		{0o100, 3, 'x'},
+		{0o040, 4, 'r'},
+		{0o020, 5, 'w'},
+		{0o010, 6, 'x'},
+		{0o004, 7, 'r'},
+		{0o002, 8, 'w'},
+		{0o001, 9, 'x'},
 	}
 	for _, b := range bits {
 		if mode&b.bit != 0 {
@@ -3393,6 +3474,25 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 	}
 	defer closeDataConn(dc)
 
+	file, ok := f.openUploadFile(ftpPath, appendMode, restartOffset)
+	if !ok {
+		return
+	}
+
+	log.Printf("upload protocol=ftp path=%q", ftpPath)
+	written, aborted, copyErr, closeErr := f.runUploadCopy(dc, file)
+	if !f.finalizeUploadStatus(ftpPath, written, expectedSize, aborted, copyErr, closeErr) {
+		return
+	}
+	f.announceUpload(ftpPath, f.fs.fullPath(ftpPath))
+	_ = f.reply(226, "transfer complete")
+}
+
+// openUploadFile opens the destination file for STOR/APPE with the
+// appropriate O_TRUNC/O_APPEND semantics and applies the restart offset (for
+// REST + STOR). It sends the appropriate FTP reply on any error and returns
+// ok=false when the caller should bail out.
+func (f *ftpSession) openUploadFile(ftpPath string, appendMode bool, restartOffset int64) (*os.File, bool) {
 	flags := os.O_CREATE | os.O_WRONLY
 	switch {
 	case appendMode:
@@ -3403,88 +3503,88 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 		flags |= os.O_TRUNC
 	}
 
-	file, err := f.fs.OpenWrite(ftpPath, flags, 0600)
+	file, err := f.fs.OpenWrite(ftpPath, flags, 0o600)
 	if err != nil {
 		_ = f.reply(550, ftpErrMsg(err))
-		return
+		return nil, false
 	}
-
 	if restartOffset > 0 && !appendMode {
-		// Reject restart offsets beyond the current end of file. Without
-		// this guard, O_CREATE+seek+write would happily produce a sparse
-		// file with a hole between the previous EOF and restartOffset —
-		// silently corrupting the upload (the hole reads back as NULs,
-		// not as the bytes the client thought it had already sent).
-		// This also covers the "REST N + STOR newfile" case, where the
-		// file is created at size 0 and any positive offset is invalid.
-		st, statErr := file.Stat()
-		if statErr != nil {
-			_ = file.Close()
-			_ = f.reply(550, ftpErrMsg(statErr))
-			return
-		}
-		if restartOffset > st.Size() {
-			offset, size := restartOffset, st.Size()
-			_ = file.Close()
-			_ = f.reply(554, fmt.Sprintf("restart offset %d exceeds file size %d", offset, size))
-			return
-		}
-		if _, err := file.Seek(restartOffset, io.SeekStart); err != nil {
-			_ = file.Close()
-			_ = f.reply(550, ftpErrMsg(err))
-			return
+		if !f.applyRestartOffset(file, restartOffset) {
+			return nil, false
 		}
 	}
+	return file, true
+}
 
-	log.Printf("upload protocol=ftp path=%q", ftpPath)
-	// Wrap the data connection so that every Read enforces a fresh idle
-	// deadline. A stalled client that stops sending bytes but keeps the TCP
-	// connection open will surface as a read error from io.Copy below, which
-	// in turn skips the CompletedUploads notification — partial uploads must
-	// never be announced as complete.
-	//
-	// FTP STREAM mode signals "end of file" by half-closing the data
-	// connection, so a client that uploads N bytes then half-closes is
-	// indistinguishable at the protocol level from a client that intended
-	// to upload exactly N bytes. The only reliable defense is an explicit
-	// size hint from the client (ALLO); when present, the byte count is
-	// verified below and a mismatch is rejected. Without ALLO the idle
-	// deadline still catches stalls, but a deliberate early half-close
-	// will be accepted — that is an inherent limitation of FTP itself,
-	// and downstream consumers of CompletedUploads must treat events from
-	// no-ALLO transfers as best-effort.
+// runUploadCopy performs the STOR data-channel copy and returns the byte
+// count, abort flag, copy error, and close error. It owns the idle-deadline
+// wrapping of the data connection so cmdStor's main flow stays linear.
+//
+// FTP STREAM mode signals "end of file" by half-closing the data
+// connection, so a client that uploads N bytes then half-closes is
+// indistinguishable at the protocol level from a client that intended to
+// upload exactly N bytes. The only reliable defense is an explicit size
+// hint from the client (ALLO); finalizeUploadStatus enforces it.
+func (f *ftpSession) runUploadCopy(dc net.Conn, file *os.File) (written int64, aborted bool, copyErr, closeErr error) {
 	idleDC := &idleConn{Conn: dc}
 	idleDC.setReadTimeout(ftpDataIdleTimeout)
-	var written int64
-	aborted, copyErr := f.runTransfer(dc, func() error {
+	aborted, copyErr = f.runTransfer(dc, func() error {
 		n, err := io.Copy(file, idleDC)
 		written = n
 		return err
 	})
-	closeErr := file.Close()
-	if aborted {
+	closeErr = file.Close()
+	return written, aborted, copyErr, closeErr
+}
+
+// finalizeUploadStatus inspects the outcome of an upload and, on failure,
+// sends the appropriate FTP reply and returns false. It returns true only
+// when the upload should be announced as a successful CompletedUpload.
+func (f *ftpSession) finalizeUploadStatus(ftpPath string, written, expectedSize int64, aborted bool, copyErr, closeErr error) bool {
+	switch {
+	case aborted:
 		log.Printf("upload aborted protocol=ftp path=%q bytes=%d", ftpPath, written)
 		f.replyAborted()
-		return
-	}
-	if copyErr != nil {
+	case copyErr != nil:
 		log.Printf("upload interrupted protocol=ftp path=%q: %v", ftpPath, copyErr)
 		_ = f.reply(426, ftpErrMsg(copyErr))
-		return
-	}
-	if closeErr != nil {
+	case closeErr != nil:
 		log.Printf("upload interrupted protocol=ftp path=%q close: %v", ftpPath, closeErr)
 		_ = f.reply(451, ftpErrMsg(closeErr))
-		return
-	}
-	if expectedSize > 0 && written != expectedSize {
+	case expectedSize > 0 && written != expectedSize:
 		log.Printf("upload size mismatch protocol=ftp path=%q expected=%d got=%d", ftpPath, expectedSize, written)
 		_ = f.reply(551, fmt.Sprintf("expected %d bytes, received %d", expectedSize, written))
-		return
+	default:
+		return true
 	}
+	return false
+}
 
-	f.announceUpload(ftpPath, f.fs.fullPath(ftpPath))
-	_ = f.reply(226, "transfer complete")
+// applyRestartOffset positions an open upload file at restartOffset for
+// resumed transfers. It rejects offsets beyond the current end-of-file
+// (which would otherwise produce a sparse hole that reads back as NULs and
+// silently corrupts the upload), closes the file and sends the appropriate
+// FTP reply on any error, and returns true only when the file is ready for
+// the data copy.
+func (f *ftpSession) applyRestartOffset(file *os.File, restartOffset int64) bool {
+	st, statErr := file.Stat()
+	if statErr != nil {
+		_ = file.Close()
+		_ = f.reply(550, ftpErrMsg(statErr))
+		return false
+	}
+	if restartOffset > st.Size() {
+		offset, size := restartOffset, st.Size()
+		_ = file.Close()
+		_ = f.reply(554, fmt.Sprintf("restart offset %d exceeds file size %d", offset, size))
+		return false
+	}
+	if _, err := file.Seek(restartOffset, io.SeekStart); err != nil {
+		_ = file.Close()
+		_ = f.reply(550, ftpErrMsg(err))
+		return false
+	}
+	return true
 }
 
 // announceUpload publishes the CompletedUpload event for a successful STOR.
@@ -3882,7 +3982,7 @@ func (f *ftpSession) cmdMkdir(arg string) {
 		return
 	}
 	ftpPath := f.cleanPath(arg)
-	if err := f.fs.Mkdir(ftpPath, 0750); err != nil {
+	if err := f.fs.Mkdir(ftpPath, 0o750); err != nil {
 		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}

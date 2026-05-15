@@ -41,6 +41,11 @@ import (
 // race-prone and would silently weaken the policy.
 var errOpenat2Unsupported = errors.New("kernel does not support openat2 (Linux 5.6+ required)")
 
+// One-time probe state for openat2. These are package-level globals so the
+// probe result is cached across all jail instances in the process; openat2
+// availability is a kernel property and cannot change at runtime.
+//
+//nolint:gochecknoglobals // process-wide cache of kernel capability probe
 var (
 	openat2ProbeOnce sync.Once
 	openat2ProbeErr  error
@@ -149,8 +154,10 @@ const resolveFlags = unix.RESOLVE_IN_ROOT | unix.RESOLVE_NO_SYMLINKS
 // openat opens a path relative to the jail root with the given flags and
 // permission. Symlinks in any component cause the call to fail.
 func (j *jailFS) openat(rel string, flags int, perm os.FileMode) (int, error) {
+	// flags is a set of unix open(2) bit constants, never negative; the
+	// conversion to uint64 cannot overflow.
 	fd, err := unix.Openat2(j.rootFd, rel, &unix.OpenHow{
-		Flags:   uint64(flags | unix.O_CLOEXEC),
+		Flags:   uint64(flags | unix.O_CLOEXEC), //nolint:gosec // bitmask, not a signed quantity
 		Mode:    uint64(perm),
 		Resolve: resolveFlags,
 	})
@@ -457,6 +464,7 @@ func (s *statFileInfo) Mode() os.FileMode {
 	}
 	return m
 }
+
 func (s *statFileInfo) ModTime() time.Time {
 	return time.Unix(s.st.Mtim.Sec, s.st.Mtim.Nsec)
 }

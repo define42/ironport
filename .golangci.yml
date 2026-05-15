@@ -1,0 +1,52 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - unused
+    - revive
+    - bodyclose
+    - gocritic
+    - errorlint
+    - nolintlint
+    - misspell
+    - gosec
+    - gochecknoglobals
+    - gochecknoinits
+    - exhaustive
+    - gocognit
+    - nestif
+    - funlen
+    - decorder
+    - embeddedstructfieldcheck
+    - recvcheck
+    - interfacebloat
+    - cyclop
+  settings:
+    gocognit:
+      min-complexity: 15
+    nestif:
+      min-complexity: 4
+    cyclop:
+      max-complexity: 15
+      package-average: 10.0
+  exclusions:
+    rules:
+      - path: (^|.*/)config\.go$
+        linters:
+          - revive
+        text: "don't use ALL_CAPS in Go names; use CamelCase"
+      - path: _test\.go$
+        linters:
+          - funlen
+          - gocognit
+          - gosec
+          - cyclop
+          - errorlint
+          - revive
+
+formatters:
+  enable:
+    - gofmt
+    - gofumpt
+    - goimports
