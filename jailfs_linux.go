@@ -466,7 +466,10 @@ func (s *statFileInfo) Mode() os.FileMode {
 }
 
 func (s *statFileInfo) ModTime() time.Time {
-	return time.Unix(s.st.Mtim.Sec, s.st.Mtim.Nsec)
+	// Timespec.Unix() returns (sec, nsec) as int64 on every platform; using
+	// the raw .Sec/.Nsec fields would fail to compile on 32-bit Linux (arm,
+	// 386) where those fields are int32.
+	return time.Unix(s.st.Mtim.Unix())
 }
 func (s *statFileInfo) IsDir() bool      { return s.Mode().IsDir() }
 func (s *statFileInfo) Sys() interface{} { return &s.st }
