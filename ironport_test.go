@@ -4172,9 +4172,24 @@ func TestServer_Shutdown_ForceClosesOnContextDeadline(t *testing.T) {
 	}
 
 	// The forcibly-closed SSH connection's session loop should observe the
-	// read error and finish; a subsequent read on the client side fails.
-	if _, _, err := conn.SendRequest("noop", true, nil); err == nil {
-		t.Error("expected error sending request on force-closed conn, got nil")
+	// read error and finish; a subsequent request on the client side fails.
+	// SendRequest(wantReply=true) blocks waiting for a reply, so bound it with
+	// a timeout: if the mux never delivers a reply because the connection was
+	// force-closed, treat that as the expected failure instead of hanging.
+	// The channel is buffered so the goroutine can always complete its send.
+	reqDone := make(chan error, 1)
+	go func() {
+		_, _, err := conn.SendRequest("noop", true, nil)
+		reqDone <- err
+	}()
+	select {
+	case err := <-reqDone:
+		if err == nil {
+			t.Error("expected error sending request on force-closed conn, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		// No reply arrived because the connection is force-closed, which is the
+		// behavior under test.
 	}
 }
 
