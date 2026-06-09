@@ -2269,8 +2269,15 @@ type ftpCtlMsg struct {
 }
 
 type ftpSession struct {
-	server        *Server
-	conn          net.Conn
+	server *Server
+	conn   net.Conn
+	// rawConn is the connection exactly as it was accepted and recorded
+	// in Server.activeConns. AUTH TLS replaces conn with the *tls.Conn
+	// wrapper, but activeConns stays keyed by the accepted conn, so user
+	// association updates (setConnUser) must always go through rawConn;
+	// keying on conn after the upgrade misses the map and the session
+	// escapes RemoveUser / RemoveAllUsers eviction.
+	rawConn       net.Conn
 	r             *bufio.Reader
 	w             *bufio.Writer
 	username      string
@@ -2329,6 +2336,7 @@ func (s *Server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- Co
 	sess := &ftpSession{
 		server:     s,
 		conn:       nc,
+		rawConn:    nc,
 		r:          bufio.NewReader(nc),
 		w:          bufio.NewWriter(nc),
 		cwd:        "/",
@@ -2624,6 +2632,11 @@ func (f *ftpSession) cmdUser(arg string) {
 		return
 	}
 	f.logoutIfAuthenticated()
+	// The previous user (if any) is now logged out; drop the connection's
+	// user association so a RemoveUser for that name no longer evicts a
+	// session that is mid-login as someone else. A successful PASS will
+	// re-establish the association for the new user.
+	f.server.setConnUser(f.rawConn, "")
 	f.username = arg
 	f.authenticated = false
 	f.user = UserInfo{}
@@ -2936,12 +2949,20 @@ func (f *ftpSession) logPreTLSBuffered() bool {
 }
 
 func (f *ftpSession) resetSessionStateForAuthTLS() {
+	// RFC 4217 section 4.3 discards any authentication performed before
+	// the TLS upgrade. If a plaintext login preceded AUTH TLS, run the
+	// real logout path so the Logout event is announced and the jail fd
+	// is released (both were previously skipped), and clear the
+	// connection's user association so a RemoveUser for the pre-TLS user
+	// cannot evict the now-anonymous session.
+	f.logoutIfAuthenticated()
 	f.username = ""
 	f.authenticated = false
 	f.user = UserInfo{}
 	f.rnfrPath = ""
 	f.restartOffset = 0
 	f.expectedUploadSize = 0
+	f.server.setConnUser(f.rawConn, "")
 }
 
 func (f *ftpSession) performTLSHandshake() bool {
@@ -2996,8 +3017,10 @@ func (f *ftpSession) authenticate(pass string) bool {
 	f.rnfrPath = ""
 	f.restartOffset = 0
 	// Tie the connection to the authenticated user so RemoveUser can
-	// force-close active FTP sessions if the account is revoked.
-	f.server.setConnUser(f.conn, f.username)
+	// force-close active FTP sessions if the account is revoked. Key on
+	// rawConn: after AUTH TLS, f.conn is the *tls.Conn wrapper, which is
+	// not the conn the accept loop registered in activeConns.
+	f.server.setConnUser(f.rawConn, f.username)
 	return true
 }
 
@@ -3853,7 +3876,7 @@ func (f *ftpSession) cmdRein() {
 	// The session is no longer tied to the previous user; clear the
 	// connection's user association so a RemoveUser for that name does not
 	// kick this now-anonymous session.
-	f.server.setConnUser(f.conn, "")
+	f.server.setConnUser(f.rawConn, "")
 	_ = f.reply(220, "ready for new user")
 }
 
