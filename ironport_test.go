@@ -7130,3 +7130,99 @@ func TestFTPS_DataConnRequiresResumption(t *testing.T) {
 		t.Fatal("data-conn handshake without session resumption succeeded; want failure")
 	}
 }
+
+// TestServer_RemoveUser_DisconnectsActiveFTPS verifies that RemoveUser
+// force-closes a control connection that authenticated after an AUTH TLS
+// upgrade. Regression test: Server.activeConns is keyed by the conn as
+// accepted, but the session's working conn becomes the *tls.Conn after
+// AUTH TLS; recording the association against the wrapper silently missed
+// the map, so revoked users kept their live FTPS sessions.
+func TestServer_RemoveUser_DisconnectsActiveFTPS(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"victim": {Password: "pw", Root: root, CanRead: true, CanWrite: true},
+	}
+	cfg, pool := newTestFTPSConfig(t, users, true)
+	srv, addr, stop := startTestFTPServerWithConfig(t, cfg)
+	defer stop()
+
+	c := dialFTPS(t, addr, pool)
+	c.authTLS()
+	c.login("victim", "pw")
+
+	// White-box: the association must be recorded under the tracked raw
+	// conn even though the session now operates on the TLS wrapper.
+	srv.mu.RLock()
+	associated := false
+	for _, u := range srv.activeConns {
+		if u == "victim" {
+			associated = true
+			break
+		}
+	}
+	srv.mu.RUnlock()
+	if !associated {
+		t.Fatal("no tracked connection is associated with the authenticated FTPS user")
+	}
+
+	srv.RemoveUser("victim")
+
+	// The control connection must have been force-closed. The NOOP write
+	// may itself fail (already proof of closure); if it goes through, the
+	// next read must surface an error instead of a 200 reply.
+	if err := c.tp.PrintfLine("NOOP"); err == nil {
+		_ = c.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, _, err := c.tp.ReadResponse(0); err == nil {
+			t.Fatal("expected FTPS control connection to be closed after RemoveUser, got nil error")
+		}
+	}
+}
+
+// TestServer_RemoveUser_SparesFTPSSessionAfterREIN verifies that REIN
+// clears the user association on the tracked raw conn: revoking the
+// previous user must not evict a session that has already returned to
+// the pre-login state.
+func TestServer_RemoveUser_SparesFTPSSessionAfterREIN(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"victim": {Password: "pw", Root: root, CanRead: true, CanWrite: true},
+	}
+	cfg, pool := newTestFTPSConfig(t, users, true)
+	srv, addr, stop := startTestFTPServerWithConfig(t, cfg)
+	defer stop()
+
+	c := dialFTPS(t, addr, pool)
+	c.authTLS()
+	c.login("victim", "pw")
+	c.command(220, "REIN")
+
+	srv.RemoveUser("victim")
+
+	// The now-anonymous session must survive its former user's revocation.
+	c.command(200, "NOOP")
+}
+
+// TestFTPS_AuthTLSDiscardsPlaintextLogin verifies that when a plaintext
+// login precedes AUTH TLS, the upgrade runs the real logout path: a
+// Logout event is announced and the connection's user association is
+// dropped, so revoking the pre-TLS user does not evict the now-anonymous
+// encrypted session.
+func TestFTPS_AuthTLSDiscardsPlaintextLogin(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"victim": {Password: "pw", Root: root, CanRead: true, CanWrite: true},
+	}
+	cfg, pool := newTestFTPSConfig(t, users, false)
+	srv, addr, stop := startTestFTPServerWithConfig(t, cfg)
+	defer stop()
+
+	c := dialFTPS(t, addr, pool)
+	c.login("victim", "pw")
+	requireAuthEvent(t, srv.AuthEvents(), AuthEventLoginSuccess, "victim", CompletedUploadProtocolFTP)
+
+	c.authTLS()
+	requireAuthEvent(t, srv.AuthEvents(), AuthEventLogout, "victim", CompletedUploadProtocolFTP)
+
+	srv.RemoveUser("victim")
+	c.command(200, "NOOP")
+}
