@@ -186,6 +186,7 @@ config.Users = users
 config.SftpSigner = signer
 config.FtpAddr = ":2121"
 config.FtpPassivePortRange = "5000-5010"
+config.FtpPassiveAdvertisedIP = "203.0.113.7" // advertise this IP in PASV (for NAT); empty uses the local IP
 config.FtpDataAcceptTimeout = 30 * time.Second // zero selects this default
 config.FtpAllowActiveMode = false              // opt in to PORT/EPRT when needed
 srv := ironport.NewServer(config)
@@ -197,7 +198,9 @@ Even then, the server only dials back to the same IP as the control connection
 to prevent FTP bounce behavior. Passive data connections are checked against the
 control connection IP to prevent passive-port stealing. Passive listeners and
 active dials wait up to `FtpDataAcceptTimeout`; set it negative to disable that
-deadline.
+deadline. Behind NAT or a port-forward, set `FtpPassiveAdvertisedIP` to the
+external IPv4 address so the `PASV` reply advertises an address clients can
+reach instead of the server's internal address.
 
 ### FTPS support (RFC 4217, explicit TLS)
 

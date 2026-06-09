@@ -112,6 +112,12 @@ const (
 	// connection and then never sends client-hello bytes would pin the
 	// handler goroutine indefinitely.
 	ftpTLSHandshakeTimeout = 30 * time.Second
+	// maxConsecutiveAcceptErrors caps how many consecutive non-transient
+	// Accept errors the accept loop tolerates before giving up and returning
+	// the error. Transient errors (timeouts, EMFILE/ENFILE, …) reset the
+	// counter and are retried indefinitely; this bound only stops a
+	// permanently poisoned listener fd from spinning and logging forever.
+	maxConsecutiveAcceptErrors = 10
 )
 
 const (
@@ -442,6 +448,10 @@ type Server struct {
 	// after PASV/EPSV and how long active-mode FTP dials may take after
 	// PORT/EPRT. Zero selects the package default; negative disables the deadline.
 	ftpDataAcceptTimeout time.Duration
+	// ftpPassiveAdvertisedIP optionally overrides the IPv4 address sent to
+	// clients in the PASV (227) reply, for deployments behind NAT or a
+	// port-forward. Empty means advertise the control connection's local IP.
+	ftpPassiveAdvertisedIP string
 	// ftpAllowActiveMode controls whether FTP PORT/EPRT commands may ask the
 	// server to dial an active-mode data connection back to the client IP.
 	ftpAllowActiveMode bool
@@ -456,6 +466,11 @@ type Server struct {
 	// ftpTLSConfig binds data connections to a session this server issued
 	// on the control channel, frustrating data-channel hijack attempts.
 	ftpDataTLSConfig *tls.Config
+	// ftpTLSConfigErr records a fatal error encountered while deriving the
+	// FTP TLS configs in NewServer (e.g. the system CSPRNG failing). It is
+	// surfaced at startup by prepareForListen so the server refuses to run
+	// rather than silently serving FTPS with broken session resumption.
+	ftpTLSConfigErr error
 	// ftpRequireTLS, when true, refuses USER/PASS until the control
 	// connection has been wrapped with AUTH TLS. Set this for deployments
 	// that expose the FTP listener but want to forbid plaintext logins.
@@ -569,11 +584,20 @@ type Config struct {
 	// connection until AUTH TLS has succeeded. Requires FtpTLSConfig to be
 	// set; otherwise the FTP listener would have no path to authentication
 	// and every login attempt would be rejected.
-	FtpRequireTLS       bool
-	Users               map[string]UserInfo
-	SftpSigner          ssh.Signer
-	CompletedUploadSize int
-	AuthEventSize       int
+	FtpRequireTLS bool
+	// FtpPassiveAdvertisedIP optionally overrides the IPv4 address sent to
+	// clients in the PASV (227) reply. By default the control connection's
+	// local IP is advertised, which is wrong behind NAT or a port-forward:
+	// the address the server sees on its own socket is the internal one,
+	// not the public address the client must dial. Set this to the
+	// external/advertised IPv4 address in such deployments. It only affects
+	// the PASV reply; EPSV does not carry an address. Leave empty to
+	// advertise the control connection's local IP.
+	FtpPassiveAdvertisedIP string
+	Users                  map[string]UserInfo
+	SftpSigner             ssh.Signer
+	CompletedUploadSize    int
+	AuthEventSize          int
 	// SSHKeyExchanges, SSHCiphers, SSHMACs, and
 	// SSHPublicKeyAuthAlgorithms optionally pin SSH negotiation and public-key
 	// auth signature algorithms. Nil slices use golang.org/x/crypto/ssh
@@ -745,6 +769,7 @@ func NewServer(config *Config) *Server {
 		ftpPassivePortRange:        config.FtpPassivePortRange,
 		ftpDataAcceptTimeout:       config.FtpDataAcceptTimeout,
 		ftpAllowActiveMode:         config.FtpAllowActiveMode,
+		ftpPassiveAdvertisedIP:     strings.TrimSpace(config.FtpPassiveAdvertisedIP),
 		ftpRequireTLS:              config.FtpRequireTLS,
 		users:                      cloneUsers(config.Users),
 		sftpSigner:                 config.SftpSigner,
@@ -761,7 +786,7 @@ func NewServer(config *Config) *Server {
 		activeConns:                make(map[net.Conn]string),
 	}
 	if config.FtpTLSConfig != nil {
-		s.ftpTLSConfig, s.ftpDataTLSConfig = deriveFTPTLSConfigs(config.FtpTLSConfig)
+		s.ftpTLSConfig, s.ftpDataTLSConfig, s.ftpTLSConfigErr = deriveFTPTLSConfigs(config.FtpTLSConfig)
 	}
 	return s
 }
@@ -784,15 +809,21 @@ func NewServer(config *Config) *Server {
 // specifically the ticket from *this* control connection. In practice this
 // is what mainstream FTPS servers do, and it raises the bar significantly
 // over a no-binding implementation.
-func deriveFTPTLSConfigs(base *tls.Config) (control, data *tls.Config) {
+func deriveFTPTLSConfigs(base *tls.Config) (control, data *tls.Config, err error) {
 	control = base.Clone()
 	// SessionTicketsDisabled defaults to false (tickets enabled); leave it
 	// alone so callers can opt out if they really need to.
 	if !control.SessionTicketsDisabled {
 		var key [32]byte
-		if _, err := rand.Read(key[:]); err == nil {
-			control.SetSessionTicketKeys([][32]byte{key})
+		if _, err := rand.Read(key[:]); err != nil {
+			// A CSPRNG failure is catastrophic. Returning an error is far
+			// safer than degrading: if we skipped SetSessionTicketKeys the
+			// two cloned configs would auto-generate independent ticket
+			// keys, DidResume could never be true, and PROT P would break
+			// silently for every data connection.
+			return nil, nil, fmt.Errorf("ftps: generating session ticket key: %w", err)
 		}
+		control.SetSessionTicketKeys([][32]byte{key})
 	}
 	data = control.Clone()
 	// The control-channel VerifyConnection (if any) still applies via
@@ -810,7 +841,7 @@ func deriveFTPTLSConfigs(base *tls.Config) (control, data *tls.Config) {
 		}
 		return nil
 	}
-	return control, data
+	return control, data, nil
 }
 
 func generateEphemeralSigner() (ssh.Signer, error) {
@@ -1094,6 +1125,9 @@ func (s *Server) ListenAndServe() error {
 // listener is opened: a signer is available, and the running kernel supports
 // the openat2 containment primitive.
 func (s *Server) prepareForListen() error {
+	if s.ftpTLSConfigErr != nil {
+		return fmt.Errorf("ironport: %w", s.ftpTLSConfigErr)
+	}
 	if err := s.ensureSigner(); err != nil {
 		return fmt.Errorf("ironport: %w", err)
 	}
@@ -1167,20 +1201,30 @@ func (s *Server) serveFTP(ln net.Listener, uploads chan<- CompletedUpload, authE
 // applies exponential backoff between 5ms and 1s on transient Accept errors
 // so a momentary EMFILE/ENFILE cannot kill the listener. name is used in log
 // messages to distinguish the SFTP and FTP loops.
+//
+// Transient errors (timeouts, EMFILE/ENFILE, ECONNABORTED, EINTR, …) are
+// retried indefinitely. A run of non-transient errors — for example a
+// poisoned listener fd that returns the same hard error on every Accept —
+// is capped: after maxConsecutiveAcceptErrors such errors the loop gives up
+// and returns the error rather than spinning and logging forever.
 func (s *Server) acceptLoop(ln net.Listener, name string, handler func(net.Conn)) error {
 	var backoff time.Duration
+	var permanentErrors int
 	for {
 		nc, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			backoff = nextAcceptBackoff(backoff)
-			log.Printf("%s accept: %v; retrying in %s", name, err, backoff)
-			time.Sleep(backoff)
+			newBackoff, retErr := s.handleAcceptError(name, err, backoff, &permanentErrors)
+			if retErr != nil {
+				return retErr
+			}
+			backoff = newBackoff
 			continue
 		}
 		backoff = 0
+		permanentErrors = 0
 		applyTCPKeepAlive(nc, s.effectiveTCPKeepAlivePeriod())
 		if !s.trackConn(nc) {
 			// Shutdown began between Accept returning and tracking; refuse
@@ -1188,18 +1232,63 @@ func (s *Server) acceptLoop(ln net.Listener, name string, handler func(net.Conn)
 			_ = nc.Close()
 			continue
 		}
-		go func() {
-			defer s.connWG.Done()
-			defer s.untrackConn(nc)
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("%s handler panic from=%s: %v\n%s", name, nc.RemoteAddr(), r, debug.Stack())
-					_ = nc.Close()
-				}
-			}()
-			handler(nc)
-		}()
+		s.spawnConnHandler(name, nc, handler)
 	}
+}
+
+// handleAcceptError processes a non-ErrClosed Accept error: it updates the
+// permanent-error counter, decides whether to give up, logs, and sleeps for
+// the next backoff interval. It returns a non-nil error when the loop should
+// stop; otherwise it returns the new backoff to carry forward.
+func (s *Server) handleAcceptError(name string, err error, backoff time.Duration, permanentErrors *int) (time.Duration, error) {
+	if isTransientAcceptError(err) {
+		*permanentErrors = 0
+	} else {
+		*permanentErrors++
+		if *permanentErrors >= maxConsecutiveAcceptErrors {
+			log.Printf("%s accept: %v; giving up after %d consecutive non-transient errors", name, err, *permanentErrors)
+			return 0, fmt.Errorf("%s accept: %w", name, err)
+		}
+	}
+	backoff = nextAcceptBackoff(backoff)
+	log.Printf("%s accept: %v; retrying in %s", name, err, backoff)
+	time.Sleep(backoff)
+	return backoff, nil
+}
+
+// spawnConnHandler runs handler for an accepted connection in its own
+// goroutine, recovering from handler panics and releasing the connection's
+// shutdown tracking when it returns.
+func (s *Server) spawnConnHandler(name string, nc net.Conn, handler func(net.Conn)) {
+	go func() {
+		defer s.connWG.Done()
+		defer s.untrackConn(nc)
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("%s handler panic from=%s: %v\n%s", name, nc.RemoteAddr(), r, debug.Stack())
+				_ = nc.Close()
+			}
+		}()
+		handler(nc)
+	}()
+}
+
+// isTransientAcceptError reports whether an Accept error is the kind that
+// typically clears on its own (and so is worth retrying indefinitely):
+// timeouts and transient syscall conditions such as running out of file
+// descriptors. Anything else is treated as potentially permanent.
+func isTransientAcceptError(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	var se syscall.Errno
+	if errors.As(err, &se) {
+		return se == syscall.EMFILE || se == syscall.ENFILE ||
+			se == syscall.ECONNABORTED || se == syscall.EINTR ||
+			se == syscall.ENOBUFS || se == syscall.ENOMEM
+	}
+	return false
 }
 
 // nextAcceptBackoff returns the next exponential backoff duration to sleep
@@ -1557,8 +1646,8 @@ func (s *Server) authenticateUser(username string, keyCheck func(stored UserInfo
 // user exists, (b) the position of a matching key, or (c) the number of keys
 // the user has configured (up to the pad constant).
 func matchAuthorizedKey(authorizedKeys []ssh.PublicKey, presented ssh.PublicKey) bool {
-	keyHash := sha256.Sum256(presented.Marshal())
-	var zeroHash [sha256.Size]byte
+	presentedMarshaled := presented.Marshal()
+	keyHash := sha256.Sum256(presentedMarshaled)
 	matched := false
 	compares := 0
 	for _, authorizedKey := range authorizedKeys {
@@ -1571,11 +1660,17 @@ func matchAuthorizedKey(authorizedKeys []ssh.PublicKey, presented ssh.PublicKey)
 		}
 		compares++
 	}
-	// Pad with dummy comparisons against an all-zero hash (which can never
-	// match a real key's SHA-256) so that the total number of constant-time
-	// compares is independent of len(AuthorizedKeys).
+	// Pad with dummy iterations until the loop has executed a fixed number
+	// of times, independent of len(AuthorizedKeys). Each padding iteration
+	// reproduces the full per-key cost of a real iteration — a SHA-256 over
+	// a buffer the size of a marshalled key plus a constant-time compare —
+	// because that hashing cost dominates and would otherwise let response
+	// time scale with the user's key count (including the zero-key case for
+	// an unknown user), leaking username existence. The padding hash can
+	// never set matched: its result is discarded.
 	for ; compares < authorizedKeyTimingPad; compares++ {
-		_ = subtle.ConstantTimeCompare(keyHash[:], zeroHash[:])
+		dummyHash := sha256.Sum256(presentedMarshaled)
+		_ = subtle.ConstantTimeCompare(keyHash[:], dummyHash[:])
 	}
 	return matched
 }
@@ -1682,6 +1777,14 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- C
 	// Discard global requests
 	go ssh.DiscardRequests(reqs)
 
+	// Track the per-channel session goroutines so this function does not
+	// return until they have all finished. handleConn returning is what
+	// triggers untrackConn/connWG.Done in acceptLoop, which Shutdown waits
+	// on; without this wait, Shutdown could return while a jailed file
+	// operation is still in flight and jailFS.Close could race with it.
+	var sessionWG sync.WaitGroup
+	defer sessionWG.Wait()
+
 	for newCh := range chans {
 		if newCh.ChannelType() != "session" {
 			_ = newCh.Reject(ssh.UnknownChannelType, "unknown channel type")
@@ -1694,7 +1797,11 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- C
 			continue
 		}
 
-		go handleSession(ch, inReqs, jailRoot, user, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown)
+		sessionWG.Add(1)
+		go func() {
+			defer sessionWG.Done()
+			handleSession(ch, inReqs, jailRoot, user, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown)
+		}()
 	}
 }
 
@@ -2314,6 +2421,9 @@ func (f *ftpSession) nextControlMessage(idleC <-chan time.Time, nc net.Conn) (ft
 		return msg, false
 	case <-idleC:
 		log.Printf("ftp control idle timeout from=%s", nc.RemoteAddr())
+		// Tell the client why the connection is going away instead of
+		// dropping it silently (which clients see as an unexplained hang-up).
+		_ = f.reply(421, "idle timeout, closing control connection")
 		return ftpCtlMsg{}, true
 	}
 }
@@ -2723,11 +2833,11 @@ func (f *ftpSession) cmdProt(arg string) {
 
 // cmdAuth handles the AUTH command (RFC 4217 §4). It accepts AUTH TLS,
 // AUTH TLS-C (TLS for control, data protection negotiated later via PROT),
-// and the legacy AUTH SSL alias. After the 234 reply it stops the reader
-// goroutine, performs the buffered-bytes injection check, resets all
-// session state that an attacker could have set pre-TLS, then performs
-// the TLS handshake on the underlying socket and re-arms the reader on
-// the encrypted stream.
+// and the legacy AUTH SSL alias. It first stops the reader goroutine,
+// performs the buffered-bytes injection check, sends the 234 reply, resets
+// all session state that an attacker could have set pre-TLS, then performs
+// the TLS handshake on the underlying socket and re-arms the reader on the
+// encrypted stream.
 //
 // The buffered-bytes check is the defense against the FTPS "command
 // injection across TLS" attack: an MITM on the cleartext segment can
@@ -2735,20 +2845,30 @@ func (f *ftpSession) cmdProt(arg string) {
 // line, and a naive server would re-read those bytes from the bufio
 // reader after the upgrade, executing them inside the encrypted session.
 // We refuse the upgrade if anything is buffered behind the AUTH line.
+//
+// Ordering is critical: the reader is stopped and the channel-clean check
+// runs *before* the 234 reply. Once the client sees 234 it immediately
+// sends a TLS ClientHello; if the reader were still running it could
+// consume those handshake bytes (defeating the clean check and corrupting
+// the handshake), and bytes the reader pulled out of f.r would be
+// invisible to preTLSChannelClean. By stopping the reader and validating
+// the channel first, anything buffered before the 234 is provably injected
+// and anything after the 234 is the handshake.
 func (f *ftpSession) cmdAuth(arg string) {
 	if !f.validateAuthRequest(arg) {
 		return
 	}
 
-	if err := f.reply(234, "ready for TLS"); err != nil {
-		return
-	}
-
-	// Suspend the reader so the next two checks see a stable f.r / f.ctlMsg.
+	// Suspend the reader so the channel-clean check sees a stable f.r /
+	// f.ctlMsg and so it cannot consume the client's post-234 ClientHello.
 	f.stopReader()
 
 	if !f.preTLSChannelClean() {
 		_ = f.conn.Close()
+		return
+	}
+
+	if err := f.reply(234, "ready for TLS"); err != nil {
 		return
 	}
 
@@ -3029,9 +3149,25 @@ func (f *ftpSession) enterPassive(epsv bool) {
 	}
 
 	v4 := ip.To4()
+	// Behind NAT the control connection's local IP is the internal address;
+	// advertise the configured external IPv4 address instead when one is set
+	// so the client dials an address it can actually reach.
+	if adv := f.server.passiveAdvertisedIPv4(); adv != nil {
+		v4 = adv
+	}
 	p1 := port / 256
 	p2 := port % 256
 	_ = f.reply(227, fmt.Sprintf("Entering Passive Mode (%d,%d,%d,%d,%d,%d)", v4[0], v4[1], v4[2], v4[3], p1, p2))
+}
+
+// passiveAdvertisedIPv4 returns the configured PASV advertised address as a
+// 4-byte IPv4 value, or nil when none is configured or the configured value
+// is not a valid IPv4 address.
+func (s *Server) passiveAdvertisedIPv4() net.IP {
+	if s.ftpPassiveAdvertisedIP == "" {
+		return nil
+	}
+	return net.ParseIP(s.ftpPassiveAdvertisedIP).To4()
 }
 
 func (f *ftpSession) enterActivePORT(arg string) {
@@ -3467,19 +3603,33 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 	}
 	ftpPath := f.cleanPath(arg)
 
+	// Open the destination file before sending 150 / accepting the data
+	// connection. Opening first means an open failure (permission, path,
+	// restart offset past EOF) is reported with the client still idle,
+	// rather than after it has already begun streaming data.
+	file, ok := f.openUploadFile(ftpPath, appendMode, restartOffset)
+	if !ok {
+		return
+	}
+
 	if err := f.reply(150, "opening data connection"); err != nil {
+		_ = file.Close()
 		return
 	}
 	dc, err := f.acceptDataConn()
 	if err != nil {
+		_ = file.Close()
 		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
 	defer closeDataConn(dc)
 
-	file, ok := f.openUploadFile(ftpPath, appendMode, restartOffset)
-	if !ok {
-		return
+	// When resuming a STOR via REST, ALLO carried the total file size but
+	// only the bytes from restartOffset onward travel on this transfer;
+	// adjust the expected count so a correct resumed upload is not rejected
+	// as a size mismatch. APPE ignores restartOffset, so leave it alone.
+	if !appendMode && restartOffset > 0 && expectedSize > restartOffset {
+		expectedSize -= restartOffset
 	}
 
 	log.Printf("upload protocol=ftp path=%q", ftpPath)

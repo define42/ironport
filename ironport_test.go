@@ -1560,16 +1560,13 @@ func TestFTPServer_RestBeyondFileSizeRejected(t *testing.T) {
 	client.command(200, "TYPE I")
 
 	// REST past EOF of an existing file: STOR must fail with 554 and the
-	// existing bytes must remain untouched.
+	// existing bytes must remain untouched. The destination is opened before
+	// the 150 reply, so the rejection arrives immediately with no 150 and no
+	// data transfer.
 	client.command(350, "REST 99")
 	rejectConn, _ := client.passiveConn()
-	client.send("STOR existing.txt")
-	client.read(150)
-	// The server may close the data connection before reading any bytes
-	// once it rejects the transfer; ignore write errors from the client.
-	_, _ = rejectConn.Write([]byte("XXXX"))
+	client.command(554, "STOR existing.txt")
 	_ = rejectConn.Close()
-	client.read(554)
 
 	if got, err := os.ReadFile(existingPath); err != nil { //nolint:gosec // path under t.TempDir()
 		t.Fatalf("os.ReadFile(existing) after rejected REST: %v", err)
@@ -1581,11 +1578,8 @@ func TestFTPServer_RestBeyondFileSizeRejected(t *testing.T) {
 	// be created at size 0 and writing at offset N would leave a hole.
 	client.command(350, "REST 10")
 	newConn, _ := client.passiveConn()
-	client.send("STOR new.txt")
-	client.read(150)
-	_, _ = newConn.Write([]byte("YYYY"))
+	client.command(554, "STOR new.txt")
 	_ = newConn.Close()
-	client.read(554)
 
 	// REST at exactly EOF is still allowed (equivalent to APPE-style
 	// continuation) — guard against an off-by-one in the size check.
@@ -1605,6 +1599,77 @@ func TestFTPServer_RestBeyondFileSizeRejected(t *testing.T) {
 	} else if !bytes.Equal(got, want) {
 		t.Fatalf("existing.txt after REST=size = %q; want %q", got, want)
 	}
+}
+
+// TestFTPServer_StorOpenFailureBefore150 verifies that when the upload
+// destination cannot be opened (here: the path is an existing directory),
+// the server rejects the STOR with 550 *before* sending any 150 reply and
+// without ever accepting a data connection. Opening the file first means a
+// client never starts streaming into a transfer that is doomed to fail.
+func TestFTPServer_StorOpenFailureBefore150(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "adir"), 0o700); err != nil {
+		t.Fatalf("os.Mkdir: %v", err)
+	}
+
+	_, addr, stop := startTestFTPServer(t, map[string]UserInfo{
+		"ftpuser": {Password: "ftppw", Root: root, CanRead: true, CanWrite: true},
+	}, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("ftpuser", "ftppw")
+	client.command(200, "TYPE I")
+
+	// Set up a passive listener, then STOR onto a directory: openUploadFile
+	// fails and the server must reply 550 directly, never 150.
+	dataConn, _ := client.passiveConn()
+	client.command(550, "STOR adir")
+	_ = dataConn.Close()
+}
+
+// TestFTPServer_PassiveAdvertisedIP verifies that FtpPassiveAdvertisedIP
+// overrides the address echoed in the PASV (227) reply, which is required
+// for deployments behind NAT where the control connection's local IP is the
+// internal address.
+func TestFTPServer_PassiveAdvertisedIP(t *testing.T) {
+	root := t.TempDir()
+	config := newTestFTPConfig(t, map[string]UserInfo{
+		"ftpuser": {Password: "ftppw", Root: root, CanRead: true, CanWrite: true},
+	}, "", false)
+	config.FtpPassiveAdvertisedIP = "203.0.113.7"
+	_, addr, stop := startTestFTPServerWithConfig(t, config)
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("ftpuser", "ftppw")
+
+	host, _, err := parseFTPPASVResponse(client.command(227, "PASV"))
+	if err != nil {
+		t.Fatalf("parse PASV response: %v", err)
+	}
+	if host != "203.0.113.7" {
+		t.Fatalf("PASV advertised host = %q; want %q", host, "203.0.113.7")
+	}
+}
+
+// TestFTPServer_IdleTimeoutSends421 verifies that an idle FTP control
+// connection receives an explicit 421 reply before being dropped, rather
+// than seeing an unexplained hang-up.
+func TestFTPServer_IdleTimeoutSends421(t *testing.T) {
+	root := t.TempDir()
+	config := newTestFTPConfig(t, map[string]UserInfo{
+		"ftpuser": {Password: "ftppw", Root: root, CanRead: true, CanWrite: true},
+	}, "", false)
+	config.IdleTimeout = 250 * time.Millisecond
+	_, addr, stop := startTestFTPServerWithConfig(t, config)
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("ftpuser", "ftppw")
+
+	// Send nothing further; the idle timer must fire and produce a 421.
+	client.read(421)
 }
 
 //nolint:gocognit,cyclop,funlen // covers DELE/MKD/RMD/RNFR/RNTO/MDTM/SIZE in one walking scenario
@@ -6955,7 +7020,7 @@ func TestFTPS_RequireTLSRejectsCleartextLogin(t *testing.T) {
 // 234, then upgrades and dequeues "USER attacker" — executing
 // attacker-controlled commands inside the encrypted session.
 //
-// The server must detect the pending bytes after sending 234 and close
+// The server must detect the pending bytes before sending 234 and close
 // the connection without proceeding to the TLS handshake. We assert that
 // by writing the pipeline ourselves and verifying the server hangs up.
 func TestFTPS_BufferedBytesAttackRejected(t *testing.T) {
@@ -6980,10 +7045,11 @@ func TestFTPS_BufferedBytesAttackRejected(t *testing.T) {
 	if _, err := conn.Write([]byte("AUTH TLS\r\nUSER attacker\r\n")); err != nil {
 		t.Fatalf("write pipeline: %v", err)
 	}
-	// Server must reply 234 to AUTH TLS, then close the connection without
-	// processing the injected USER. The 234 reply may or may not be
-	// visible depending on flush timing; what matters is that subsequent
-	// reads return EOF rather than another reply.
+	// Server must reply 234 only after confirming the channel is clean.
+	// Here the injected USER is buffered, so the server detects it before
+	// replying and closes the connection. What matters is that subsequent
+	// reads return EOF rather than another reply, and crucially that the
+	// server never answers the injected USER (which would be a 331 reply).
 	deadline := time.Now().Add(5 * time.Second)
 	_ = conn.SetReadDeadline(deadline)
 	// Drain any responses until EOF or read deadline. The server must NOT
