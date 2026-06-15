@@ -4736,6 +4736,79 @@ func TestSFTPServer_TempExtensions_PlainUploadStillAnnounced(t *testing.T) {
 	}
 }
 
+// TestSFTPServer_WriterUploadChtimesAndRename verifies the common workflow of
+// uploading to a .writer temp name, setting the final modification time, then
+// renaming away the .writer suffix to announce completion.
+func TestSFTPServer_WriterUploadChtimesAndRename(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	config := newTestConfig("", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+	config.TempExtensions = []string{".writer"}
+	srv, addr, stop := startTestServerWithConfig(t, config)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	tempName := "/report.csv.writer"
+	finalName := "/report.csv"
+	content := []byte("id,name\n1,alice\n")
+	f, err := client.Create(tempName)
+	if err != nil {
+		t.Fatalf("Create(%s): %v", tempName, err)
+	}
+	if _, err = f.Write(content); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	select {
+	case got := <-srv.CompletedUploads():
+		t.Fatalf("CompletedUploads received %+v for a .writer upload; expected suppression", got)
+	case <-time.After(300 * time.Millisecond):
+		// expected
+	}
+
+	wantTime := time.Unix(1_700_000_123, 0)
+	if err := client.Chtimes(tempName, wantTime, wantTime); err != nil {
+		t.Fatalf("Chtimes(%s): %v", tempName, err)
+	}
+	if err := client.Rename(tempName, finalName); err != nil {
+		t.Fatalf("Rename(%s, %s): %v", tempName, finalName, err)
+	}
+
+	info, err := os.Stat(filepath.Join(root, "report.csv"))
+	if err != nil {
+		t.Fatalf("os.Stat(final): %v", err)
+	}
+	if !info.ModTime().Equal(wantTime) {
+		t.Fatalf("final ModTime = %v; want %v", info.ModTime(), wantTime)
+	}
+
+	casePath := filepath.Join(root, "report.csv.writer")
+	if _, err := os.Stat(casePath); !os.IsNotExist(err) {
+		t.Fatalf(".writer temp path still exists or stat failed unexpectedly: %v", err)
+	}
+
+	select {
+	case got := <-srv.CompletedUploads():
+		if got.FilePath != finalName {
+			t.Errorf("CompletedUploads FilePath = %q; want %q", got.FilePath, finalName)
+		}
+		if got.FullFilePath != filepath.Join(root, "report.csv") {
+			t.Errorf("CompletedUploads FullFilePath = %q; want final path", got.FullFilePath)
+		}
+		if got.Protocol != CompletedUploadProtocolSFTP {
+			t.Errorf("CompletedUploads Protocol = %q; want %q", got.Protocol, CompletedUploadProtocolSFTP)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for CompletedUploads for .writer rename")
+	}
+}
+
 // TestSFTPServer_EmptyStoredPassword_Rejected verifies that a user whose
 // stored Password is "" cannot authenticate by sending an empty password.
 func TestSFTPServer_EmptyStoredPassword_Rejected(t *testing.T) {
@@ -4954,13 +5027,16 @@ func TestSFTPServer_Setstat_TruncateAndTimes(t *testing.T) {
 		t.Errorf("size = %d; want 16", info.Size())
 	}
 
-	// Chtimes via Setstat is rejected under the hardened "no symlinks /
-	// fd-relative-only" policy: setting access/modification times on jailed
-	// files is denied wholesale rather than silently succeeding via
-	// path-based os.Chtimes.
 	want := time.Unix(1_700_000_000, 0)
-	if err := client.Chtimes("/setstat.txt", want, want); err == nil {
-		t.Fatal("Chtimes succeeded; expected permission error under hardened policy")
+	if err := client.Chtimes("/setstat.txt", want, want); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+	info, err = os.Stat(filepath.Join(root, "setstat.txt"))
+	if err != nil {
+		t.Fatalf("os.Stat after Chtimes: %v", err)
+	}
+	if !info.ModTime().Equal(want) {
+		t.Errorf("mtime = %v; want %v", info.ModTime(), want)
 	}
 }
 

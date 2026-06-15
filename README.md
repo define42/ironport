@@ -23,7 +23,7 @@ A production-ready, embeddable SFTP server and FTP server library for Go with a 
 - **SSH algorithm pinning** — optionally constrain SSH key exchange, ciphers, MACs, and public-key auth signature algorithms
 - **Idle-session timeout** — configurable via `IdleTimeout` on the config (default 15 minutes); inactive authenticated SFTP sessions are reaped
 - **Empty-password protection** — users whose stored `Password` is empty cannot authenticate via password, and empty supplied passwords are always rejected
-- **Chown opt-in** — `Setstat`/`Fsetstat` requests that try to change file ownership (uid/gid) are rejected with a permission error unless `SftpAllowChown` is explicitly set to `true` on the config. Symlink creation by clients is always refused, and `Setstat`/`Fsetstat` requests that try to change access/modification times (`Chtimes`) are likewise rejected.
+- **Chown opt-in** — `Setstat`/`Fsetstat` requests that try to change file ownership (uid/gid) are rejected with a permission error unless `SftpAllowChown` is explicitly set to `true` on the config. Symlink creation by clients is always refused, while SFTP access/modification time changes (`Chtimes`) are applied through the same fd-relative jail policy.
 
 ## Platform support
 
@@ -129,7 +129,8 @@ non-blocking, caller-drained behavior as `CompletedUploads()`.
 
 ### Deferring completion notifications until final rename
 
-Many clients upload to a temporary filename first (for example `file.txt.tmp`)
+Many clients upload to a temporary filename first (for example `file.txt.tmp`
+or `file.txt.writer`)
 and rename to the final filename only after the upload is fully complete.
 Configure `TempExtensions` to emit `CompletedUploads()` events at that final
 rename boundary:
@@ -138,13 +139,14 @@ rename boundary:
 config := ironport.DefaultConfig()
 config.Users = users
 config.SftpSigner = signer
-config.TempExtensions = []string{".tmp", ".writing"}
+config.TempExtensions = []string{".tmp", ".writing", ".writer"}
 srv := ironport.NewServer(config)
 ```
 
 With this setting:
 
 - uploads that close with a temp extension are not announced yet
+- clients may set the modification time on the temp file with SFTP `Chtimes`
 - renaming from a temp extension to a non-temp name emits the completion event
 
 ### Pinning SSH algorithms

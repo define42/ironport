@@ -2160,17 +2160,14 @@ func (j jail) Filelist(r *sftp.Request) (lister sftp.ListerAt, err error) {
 //     cannot change ownership of jailed files even when the server process
 //     has the privilege to do so)
 //   - Size              → ftruncate via openat2-obtained fd
-//   - Acmodtime         → REJECTED with os.ErrPermission. Setting timestamps
-//     on jailed files is denied wholesale under the hardened policy; clients
-//     get a deterministic permission error rather than a partial success.
+//   - Acmodtime         → utimensat via openat2-obtained fd
 //
-// Policy-level rejections (Acmodtime, and UidGid when sftpAllowChown is false)
-// are evaluated before any mutating operation is performed, so a multi-flag
-// request that violates policy fails atomically rather than leaving the
-// file partially mutated. Remaining mutating operations are then applied in
-// a deterministic order; the first error is returned and subsequent
-// attributes are not applied, mirroring how OpenSSH's sftp-server reports
-// errors.
+// Policy-level rejections (UidGid when sftpAllowChown is false) are evaluated
+// before any mutating operation is performed, so a multi-flag request that
+// violates policy fails atomically rather than leaving the file partially
+// mutated. Remaining mutating operations are then applied in a deterministic
+// order; the first error is returned and subsequent attributes are not applied,
+// mirroring how OpenSSH's sftp-server reports errors.
 func (j jail) applyAttrs(r *sftp.Request) error {
 	flags := r.AttrFlags()
 	attrs := r.Attributes()
@@ -2179,9 +2176,6 @@ func (j jail) applyAttrs(r *sftp.Request) error {
 	}
 	// Reject policy violations up front so they cannot leave the file
 	// half-mutated when combined with Size/Permissions in a single request.
-	if flags.Acmodtime {
-		return os.ErrPermission
-	}
 	if flags.UidGid && !j.sftpAllowChown {
 		return os.ErrPermission
 	}
@@ -2203,6 +2197,11 @@ func (j jail) applyAttrs(r *sftp.Request) error {
 	}
 	if flags.UidGid {
 		if err := j.fs.Chown(r.Filepath, int(attrs.UID), int(attrs.GID)); err != nil {
+			return err
+		}
+	}
+	if flags.Acmodtime {
+		if err := j.fs.Chtimes(r.Filepath, attrs.AccessTime(), attrs.ModTime()); err != nil {
 			return err
 		}
 	}
@@ -2684,8 +2683,7 @@ func (f *ftpSession) handleAuthenticatedCommand(cmd, arg string) {
 	// "not implemented" path.
 	switch cmd {
 	case "MFMT", "MFCT":
-		// Setting modification times on jailed files is denied wholesale
-		// by the same policy that rejects SFTP Acmodtime. Reply with the
+		// FTP timestamp-setting commands are not implemented. Reply with the
 		// canonical "command not implemented for that parameter" code so
 		// MFMT-aware clients (backup/sync tools) get a deterministic,
 		// well-formed refusal.
