@@ -2200,6 +2200,10 @@ func (j jail) applyAttrs(r *sftp.Request) error {
 			return err
 		}
 	}
+	return j.applyTimes(r, flags, attrs)
+}
+
+func (j jail) applyTimes(r *sftp.Request, flags sftp.FileAttrFlags, attrs *sftp.FileStat) error {
 	if flags.Acmodtime {
 		if err := j.fs.Chtimes(r.Filepath, attrs.AccessTime(), attrs.ModTime()); err != nil {
 			return err

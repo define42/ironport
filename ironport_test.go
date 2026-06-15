@@ -4780,7 +4780,8 @@ func TestSFTPServer_WriterUploadChtimesAndRename(t *testing.T) {
 		t.Fatalf("Rename(%s, %s): %v", tempName, finalName, err)
 	}
 
-	info, err := os.Stat(filepath.Join(root, "report.csv"))
+	finalFullPath := filepath.Join(root, "report.csv")
+	info, err := os.Stat(finalFullPath)
 	if err != nil {
 		t.Fatalf("os.Stat(final): %v", err)
 	}
@@ -4793,12 +4794,17 @@ func TestSFTPServer_WriterUploadChtimesAndRename(t *testing.T) {
 		t.Fatalf(".writer temp path still exists or stat failed unexpectedly: %v", err)
 	}
 
+	assertWriterCompletedUpload(t, srv.CompletedUploads(), finalName, finalFullPath)
+}
+
+func assertWriterCompletedUpload(t *testing.T, uploads <-chan CompletedUpload, finalName, finalFullPath string) {
+	t.Helper()
 	select {
-	case got := <-srv.CompletedUploads():
+	case got := <-uploads:
 		if got.FilePath != finalName {
 			t.Errorf("CompletedUploads FilePath = %q; want %q", got.FilePath, finalName)
 		}
-		if got.FullFilePath != filepath.Join(root, "report.csv") {
+		if got.FullFilePath != finalFullPath {
 			t.Errorf("CompletedUploads FullFilePath = %q; want final path", got.FullFilePath)
 		}
 		if got.Protocol != CompletedUploadProtocolSFTP {
