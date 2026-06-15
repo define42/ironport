@@ -118,6 +118,9 @@ const (
 	// counter and are retried indefinitely; this bound only stops a
 	// permanently poisoned listener fd from spinning and logging forever.
 	maxConsecutiveAcceptErrors = 10
+	// ftpTimestampLayout is the UTC timestamp format used by MDTM, MFMT, and
+	// MLST/MLSD modify facts.
+	ftpTimestampLayout = "20060102150405"
 )
 
 const (
@@ -2682,15 +2685,11 @@ func (f *ftpSession) handleAuthenticatedCommand(cmd, arg string) {
 		handler(f, arg)
 		return
 	}
-	// MFMT/MFCT and SITE need to see the original cmd verb in their reply
+	// MFCT and SITE need to see the original cmd verb in their reply
 	// (or have a fixed reply), and the rest fall through to the generic
 	// "not implemented" path.
 	switch cmd {
-	case "MFMT", "MFCT":
-		// FTP timestamp-setting commands are not implemented. Reply with the
-		// canonical "command not implemented for that parameter" code so
-		// MFMT-aware clients (backup/sync tools) get a deterministic,
-		// well-formed refusal.
+	case "MFCT":
 		_ = f.reply(502, cmd+" not supported")
 	default:
 		_ = f.reply(502, "command not implemented")
@@ -2729,6 +2728,7 @@ var authedFTPHandlers = map[string]func(*ftpSession, string){
 	"REST": func(f *ftpSession, arg string) { f.cmdRest(arg) },
 	"SIZE": func(f *ftpSession, arg string) { f.cmdSize(arg) },
 	"MDTM": func(f *ftpSession, arg string) { f.cmdMDTM(arg) },
+	"MFMT": func(f *ftpSession, arg string) { f.cmdMFMT(arg) },
 	"DELE": func(f *ftpSession, arg string) { f.cmdDelete(arg) },
 	"MKD":  func(f *ftpSession, arg string) { f.cmdMkdir(arg) },
 	"XMKD": func(f *ftpSession, arg string) { f.cmdMkdir(arg) },
@@ -2803,6 +2803,7 @@ func (f *ftpSession) cmdFeat() {
 		"PASV",
 		"SIZE",
 		"MDTM",
+		"MFMT",
 		"REST STREAM",
 		"MLST type*;size*;modify*;perm*;unique*;",
 		"MLSD",
@@ -3808,7 +3809,7 @@ func (f *ftpSession) cmdHelp(arg string) {
 		"USER PASS QUIT NOOP SYST FEAT HELP STAT",
 		"PWD CWD CDUP TYPE MODE STRU OPTS REIN",
 		"PASV EPSV LIST NLST MLST MLSD",
-		"RETR STOR APPE ALLO REST SIZE MDTM",
+		"RETR STOR APPE ALLO REST SIZE MDTM MFMT",
 		"DELE MKD RMD RNFR RNTO ABOR",
 		"LANG HOST",
 	}
@@ -4025,7 +4026,7 @@ func mlstFactLine(info os.FileInfo, name string, canWrite bool) string {
 	b.WriteString(";size=")
 	b.WriteString(strconv.FormatInt(info.Size(), 10))
 	b.WriteString(";modify=")
-	b.WriteString(info.ModTime().UTC().Format("20060102150405"))
+	b.WriteString(info.ModTime().UTC().Format(ftpTimestampLayout))
 	b.WriteString(";perm=")
 	b.WriteString(mlstPermFact(info, canWrite))
 	b.WriteString(";unique=")
@@ -4135,7 +4136,38 @@ func (f *ftpSession) cmdMDTM(arg string) {
 		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
-	_ = f.reply(213, st.ModTime().UTC().Format("20060102150405"))
+	_ = f.reply(213, st.ModTime().UTC().Format(ftpTimestampLayout))
+}
+
+func (f *ftpSession) cmdMFMT(arg string) {
+	if !f.user.CanWrite {
+		_ = f.reply(550, "permission denied")
+		return
+	}
+	mtime, rawPath, ok := parseMFMTArg(arg)
+	if !ok {
+		_ = f.reply(501, "syntax: MFMT YYYYMMDDHHMMSS path")
+		return
+	}
+	if err := f.fs.SetModTime(f.cleanPath(rawPath), mtime); err != nil {
+		_ = f.reply(550, ftpErrMsg(err))
+		return
+	}
+	_ = f.reply(213, mtime.UTC().Format(ftpTimestampLayout))
+}
+
+func parseMFMTArg(arg string) (time.Time, string, bool) {
+	arg = strings.TrimSpace(arg)
+	stamp, rawPath, ok := strings.Cut(arg, " ")
+	rawPath = strings.TrimSpace(rawPath)
+	if !ok || len(stamp) != len(ftpTimestampLayout) || rawPath == "" {
+		return time.Time{}, "", false
+	}
+	mtime, err := time.Parse(ftpTimestampLayout, stamp)
+	if err != nil {
+		return time.Time{}, "", false
+	}
+	return mtime, rawPath, true
 }
 
 func (f *ftpSession) cmdDelete(arg string) {

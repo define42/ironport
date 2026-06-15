@@ -447,6 +447,25 @@ func (j *jailFS) Chtimes(clientPath string, atime, mtime time.Time) error {
 	return nil
 }
 
+// SetModTime changes only the modification timestamp of clientPath. The
+// access timestamp is left unchanged by passing UTIME_OMIT to utimensat.
+func (j *jailFS) SetModTime(clientPath string, mtime time.Time) error {
+	rel := cleanRelClientPath(clientPath)
+	fd, err := j.openat(rel, unix.O_PATH, 0)
+	if err != nil {
+		return &os.PathError{Op: "setmodtime", Path: clientPath, Err: err}
+	}
+	defer func() { _ = unix.Close(fd) }()
+	times := []unix.Timespec{
+		{Nsec: unix.UTIME_OMIT},
+		unix.NsecToTimespec(mtime.UnixNano()),
+	}
+	if err := unix.UtimesNanoAt(fd, "", times, unix.AT_EMPTY_PATH); err != nil {
+		return &os.PathError{Op: "setmodtime", Path: clientPath, Err: err}
+	}
+	return nil
+}
+
 // statFileInfo adapts a unix.Stat_t into the os.FileInfo interface so that
 // callers (especially the SFTP listing helpers) can consume it without an
 // extra stat round-trip.

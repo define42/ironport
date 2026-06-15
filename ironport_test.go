@@ -1712,6 +1712,17 @@ func TestFTPServer_FileManagementCommands(t *testing.T) {
 	if got := client.command(213, "MDTM file.txt"); got != "20240102030405" {
 		t.Fatalf("MDTM response = %q; want 20240102030405", got)
 	}
+	wantMFMT := time.Date(2024, 1, 3, 4, 5, 6, 0, time.UTC)
+	if got := client.command(213, "MFMT 20240103040506 file.txt"); got != "20240103040506" {
+		t.Fatalf("MFMT response = %q; want 20240103040506", got)
+	}
+	info, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("os.Stat after MFMT: %v", err)
+	}
+	if !info.ModTime().Equal(wantMFMT) {
+		t.Fatalf("mtime after MFMT = %v; want %v", info.ModTime(), wantMFMT)
+	}
 
 	client.command(250, `CWD "space dir"`)
 	if got := client.command(257, "PWD"); !strings.Contains(got, `"/space dir"`) {
@@ -1838,6 +1849,7 @@ func TestFTPServer_CommandPermissionDenials(t *testing.T) {
 	client.command(550, "STOR upload.txt")
 	client.command(550, "SIZE file.txt")
 	client.command(550, "MDTM file.txt")
+	client.command(550, "MFMT 20240103040506 file.txt")
 	client.command(550, "DELE file.txt")
 	client.command(550, "MKD made")
 	client.command(550, "RMD dir")
@@ -1899,8 +1911,9 @@ func TestFTPServer_ExtendedCommands(t *testing.T) {
 	// SITE refuses cleanly with 502.
 	client.command(502, "SITE CHMOD 600 file.txt")
 
-	// MFMT/MFCT refuse cleanly with 502 (Acmodtime policy).
-	client.command(502, "MFMT 20240101000000 file.txt")
+	// MFMT validates timestamp/path syntax; MFCT remains unsupported.
+	client.command(501, "MFMT 20240101000000")
+	client.command(501, "MFMT not-a-time file.txt")
 	client.command(502, "MFCT 20240101000000 file.txt")
 
 	// MLST returns a single-entry multi-line 250 reply.
@@ -6984,6 +6997,33 @@ func TestFTPS_AuthTLSAndLogin(t *testing.T) {
 	c.authTLS()
 	c.login("alice", "alicepw")
 	c.command(257, "PWD")
+}
+
+func TestFTPS_MFMTSetsModificationTime(t *testing.T) {
+	root := t.TempDir()
+	filePath := filepath.Join(root, "file.txt")
+	if err := os.WriteFile(filePath, []byte("hello"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile: %v", err)
+	}
+	users := map[string]UserInfo{"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true}}
+	cfg, pool := newTestFTPSConfig(t, users, true)
+	_, addr, stop := startTestFTPServerWithConfig(t, cfg)
+	defer stop()
+
+	c := dialFTPS(t, addr, pool)
+	c.authTLS()
+	c.login("alice", "alicepw")
+	if got := c.command(213, "MFMT 20240607080910 file.txt"); got != "20240607080910" {
+		t.Fatalf("MFMT response = %q; want 20240607080910", got)
+	}
+	info, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("os.Stat after MFMT: %v", err)
+	}
+	want := time.Date(2024, 6, 7, 8, 9, 10, 0, time.UTC)
+	if !info.ModTime().Equal(want) {
+		t.Fatalf("mtime after MFMT = %v; want %v", info.ModTime(), want)
+	}
 }
 
 func TestFTPS_PROTDataConnRoundTrip(t *testing.T) {

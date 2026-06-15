@@ -204,6 +204,10 @@ deadline. Behind NAT or a port-forward, set `FtpPassiveAdvertisedIP` to the
 external IPv4 address so the `PASV` reply advertises an address clients can
 reach instead of the server's internal address.
 
+FTP and FTPS clients can read modification times with `MDTM` or the `modify`
+fact in `MLST`/`MLSD`, and can set file modification times with `MFMT
+YYYYMMDDHHMMSS path`.
+
 ### FTPS support (RFC 4217, explicit TLS)
 
 Set `FtpTLSConfig` to a `*tls.Config` that carries the server certificate to
