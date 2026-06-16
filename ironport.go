@@ -4167,6 +4167,9 @@ func parseMFMTArg(arg string) (time.Time, string, bool) {
 	if err != nil {
 		return time.Time{}, "", false
 	}
+	if mtime.Before(time.Unix(0, math.MinInt64)) || mtime.After(time.Unix(0, math.MaxInt64)) {
+		return time.Time{}, "", false
+	}
 	return mtime, rawPath, true
 }
 
