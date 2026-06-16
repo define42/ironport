@@ -27,10 +27,11 @@ A production-ready, embeddable SFTP server and FTP server library for Go with a 
 
 ## Platform support
 
-This package is **Linux-only**. The path-containment guarantee depends on the
-`openat2` syscall with `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS`, available
-since Linux 5.6. `ListenAndServe` probes for `openat2` at startup and
-returns an error on older kernels rather than silently degrading the policy.
+This package is **Linux-only**. The filesystem policy depends on the `openat2`
+syscall with `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS` and
+`utimensat(..., AT_EMPTY_PATH)`, both available together since Linux 5.8.
+`ListenAndServe` probes for these primitives at startup and returns an error on
+older kernels rather than silently degrading the policy.
 
 ## Project policy
 

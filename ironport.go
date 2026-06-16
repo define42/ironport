@@ -1126,7 +1126,7 @@ func (s *Server) ListenAndServe() error {
 
 // prepareForListen runs the startup checks that must succeed before any
 // listener is opened: a signer is available, and the running kernel supports
-// the openat2 containment primitive.
+// the required filesystem primitives.
 func (s *Server) prepareForListen() error {
 	if s.ftpTLSConfigErr != nil {
 		return fmt.Errorf("ironport: %w", s.ftpTLSConfigErr)
@@ -1134,11 +1134,11 @@ func (s *Server) prepareForListen() error {
 	if err := s.ensureSigner(); err != nil {
 		return fmt.Errorf("ironport: %w", err)
 	}
-	// The package's containment guarantee relies on
-	// openat2(RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS), available since Linux
-	// 5.6. Fail fast at startup on older kernels rather than silently
-	// degrading the policy at first request.
-	if err := ensureOpenat2(); err != nil {
+	// The package's filesystem policy relies on openat2 containment and
+	// utimensat(..., AT_EMPTY_PATH), both available together since Linux 5.8.
+	// Fail fast at startup on older kernels rather than silently degrading the
+	// policy at first request.
+	if err := ensureKernelSupport(); err != nil {
 		return fmt.Errorf("ironport: %w", err)
 	}
 	return nil

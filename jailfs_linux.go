@@ -35,49 +35,64 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// errOpenat2Unsupported is returned when the running kernel lacks the
-// openat2 syscall (added in Linux 5.6). The package requires openat2 for
-// its symlink-safety guarantee; falling back to older syscalls would be
-// race-prone and would silently weaken the policy.
-var errOpenat2Unsupported = errors.New("kernel does not support openat2 (Linux 5.6+ required)")
+// errKernelUnsupported is returned when the running kernel lacks the required
+// filesystem primitives. The package requires openat2 for its symlink-safety
+// guarantee and utimensat(..., AT_EMPTY_PATH) for timestamp updates; falling
+// back to older syscalls would be race-prone and would silently weaken the
+// policy.
+var errKernelUnsupported = errors.New("kernel does not support required filesystem primitives (Linux 5.8+ required)")
 
-// One-time probe state for openat2. These are package-level globals so the
-// probe result is cached across all jail instances in the process; openat2
-// availability is a kernel property and cannot change at runtime.
+// One-time probe state for required kernel filesystem primitives. These are
+// package-level globals so the probe result is cached across all jail instances
+// in the process; kernel capability cannot change at runtime.
 //
 //nolint:gochecknoglobals // process-wide cache of kernel capability probe
 var (
-	openat2ProbeOnce sync.Once
-	openat2ProbeErr  error
+	kernelSupportProbeOnce sync.Once
+	kernelSupportProbeErr  error
 )
 
-// probeOpenat2 verifies that openat2 is available by issuing a harmless call
-// against /. The result is cached after the first successful probe. Callers
-// that need this guarantee at startup (e.g. before reporting a configured
-// jail root) can invoke it directly; it is also invoked transparently by
-// openJailFS on every jail creation.
-func probeOpenat2() error {
-	openat2ProbeOnce.Do(func() {
+// probeKernelSupport verifies that the kernel supports the filesystem
+// primitives required for the jail policy. The result is cached after the first
+// probe. Callers that need this guarantee at startup (e.g. before reporting a
+// configured jail root) can invoke it directly; it is also invoked
+// transparently by openJailFS on every jail creation.
+func probeKernelSupport() error {
+	kernelSupportProbeOnce.Do(func() {
 		fd, err := unix.Openat2(unix.AT_FDCWD, "/", &unix.OpenHow{
 			Flags:   unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC,
 			Resolve: 0,
 		})
 		if err != nil {
 			if errors.Is(err, syscall.ENOSYS) {
-				openat2ProbeErr = errOpenat2Unsupported
+				kernelSupportProbeErr = errKernelUnsupported
 				return
 			}
-			openat2ProbeErr = fmt.Errorf("openat2 probe: %w", err)
+			kernelSupportProbeErr = fmt.Errorf("openat2 probe: %w", err)
 			return
 		}
-		_ = unix.Close(fd)
+		defer func() { _ = unix.Close(fd) }()
+
+		times := []unix.Timespec{
+			{Nsec: unix.UTIME_OMIT},
+			{Nsec: unix.UTIME_OMIT},
+		}
+		if err := unix.UtimesNanoAt(fd, "", times, unix.AT_EMPTY_PATH); err != nil {
+			if errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOENT) {
+				kernelSupportProbeErr = errKernelUnsupported
+				return
+			}
+			kernelSupportProbeErr = fmt.Errorf("utimensat AT_EMPTY_PATH probe: %w", err)
+			return
+		}
 	})
-	return openat2ProbeErr
+	return kernelSupportProbeErr
 }
 
-// ensureOpenat2 is exposed for callers that want to fail at startup rather
-// than at first request when openat2 is unavailable.
-func ensureOpenat2() error { return probeOpenat2() }
+// ensureKernelSupport is exposed for callers that want to fail at startup
+// rather than at first request when required filesystem primitives are
+// unavailable.
+func ensureKernelSupport() error { return probeKernelSupport() }
 
 // cleanRelClientPath normalises a client-supplied path into a slash-separated,
 // jail-relative path suitable for openat2(rootFd, ...). The result never
@@ -123,10 +138,10 @@ type jailFS struct {
 // O_PATH|O_DIRECTORY|O_NOFOLLOW so the root itself cannot be substituted by
 // a symlink at construction time.
 //
-// openat2 availability is verified on first use; if the running kernel does
-// not support it the call returns errOpenat2Unsupported.
+// Required kernel filesystem primitives are verified on first use; if the
+// running kernel does not support them the call returns errKernelUnsupported.
 func openJailFS(root string) (*jailFS, error) {
-	if err := probeOpenat2(); err != nil {
+	if err := probeKernelSupport(); err != nil {
 		return nil, err
 	}
 	fd, err := unix.Open(root, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
