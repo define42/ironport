@@ -1914,6 +1914,8 @@ func TestFTPServer_ExtendedCommands(t *testing.T) {
 	// MFMT validates timestamp/path syntax; MFCT remains unsupported.
 	client.command(501, "MFMT 20240101000000")
 	client.command(501, "MFMT not-a-time file.txt")
+	client.command(501, "MFMT 00010101000000 file.txt")
+	client.command(501, "MFMT 99990101000000 file.txt")
 	client.command(502, "MFCT 20240101000000 file.txt")
 
 	// MLST returns a single-entry multi-line 250 reply.
