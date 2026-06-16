@@ -1712,6 +1712,17 @@ func TestFTPServer_FileManagementCommands(t *testing.T) {
 	if got := client.command(213, "MDTM file.txt"); got != "20240102030405" {
 		t.Fatalf("MDTM response = %q; want 20240102030405", got)
 	}
+	wantMFMT := time.Date(2024, 1, 3, 4, 5, 6, 0, time.UTC)
+	if got := client.command(213, "MFMT 20240103040506 file.txt"); got != "20240103040506" {
+		t.Fatalf("MFMT response = %q; want 20240103040506", got)
+	}
+	info, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("os.Stat after MFMT: %v", err)
+	}
+	if !info.ModTime().Equal(wantMFMT) {
+		t.Fatalf("mtime after MFMT = %v; want %v", info.ModTime(), wantMFMT)
+	}
 
 	client.command(250, `CWD "space dir"`)
 	if got := client.command(257, "PWD"); !strings.Contains(got, `"/space dir"`) {
@@ -1838,6 +1849,7 @@ func TestFTPServer_CommandPermissionDenials(t *testing.T) {
 	client.command(550, "STOR upload.txt")
 	client.command(550, "SIZE file.txt")
 	client.command(550, "MDTM file.txt")
+	client.command(550, "MFMT 20240103040506 file.txt")
 	client.command(550, "DELE file.txt")
 	client.command(550, "MKD made")
 	client.command(550, "RMD dir")
@@ -1899,8 +1911,9 @@ func TestFTPServer_ExtendedCommands(t *testing.T) {
 	// SITE refuses cleanly with 502.
 	client.command(502, "SITE CHMOD 600 file.txt")
 
-	// MFMT/MFCT refuse cleanly with 502 (Acmodtime policy).
-	client.command(502, "MFMT 20240101000000 file.txt")
+	// MFMT validates timestamp/path syntax; MFCT remains unsupported.
+	client.command(501, "MFMT 20240101000000")
+	client.command(501, "MFMT not-a-time file.txt")
 	client.command(502, "MFCT 20240101000000 file.txt")
 
 	// MLST returns a single-entry multi-line 250 reply.
@@ -4736,6 +4749,85 @@ func TestSFTPServer_TempExtensions_PlainUploadStillAnnounced(t *testing.T) {
 	}
 }
 
+// TestSFTPServer_WriterUploadChtimesAndRename verifies the common workflow of
+// uploading to a .writer temp name, setting the final modification time, then
+// renaming away the .writer suffix to announce completion.
+func TestSFTPServer_WriterUploadChtimesAndRename(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	config := newTestConfig("", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+	config.TempExtensions = []string{".writer"}
+	srv, addr, stop := startTestServerWithConfig(t, config)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	tempName := "/report.csv.writer"
+	finalName := "/report.csv"
+	content := []byte("id,name\n1,alice\n")
+	f, err := client.Create(tempName)
+	if err != nil {
+		t.Fatalf("Create(%s): %v", tempName, err)
+	}
+	if _, err = f.Write(content); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	select {
+	case got := <-srv.CompletedUploads():
+		t.Fatalf("CompletedUploads received %+v for a .writer upload; expected suppression", got)
+	case <-time.After(300 * time.Millisecond):
+		// expected
+	}
+
+	wantTime := time.Unix(1_700_000_123, 0)
+	if err := client.Chtimes(tempName, wantTime, wantTime); err != nil {
+		t.Fatalf("Chtimes(%s): %v", tempName, err)
+	}
+	if err := client.Rename(tempName, finalName); err != nil {
+		t.Fatalf("Rename(%s, %s): %v", tempName, finalName, err)
+	}
+
+	finalFullPath := filepath.Join(root, "report.csv")
+	info, err := os.Stat(finalFullPath)
+	if err != nil {
+		t.Fatalf("os.Stat(final): %v", err)
+	}
+	if !info.ModTime().Equal(wantTime) {
+		t.Fatalf("final ModTime = %v; want %v", info.ModTime(), wantTime)
+	}
+
+	casePath := filepath.Join(root, "report.csv.writer")
+	if _, err := os.Stat(casePath); !os.IsNotExist(err) {
+		t.Fatalf(".writer temp path still exists or stat failed unexpectedly: %v", err)
+	}
+
+	assertWriterCompletedUpload(t, srv.CompletedUploads(), finalName, finalFullPath)
+}
+
+func assertWriterCompletedUpload(t *testing.T, uploads <-chan CompletedUpload, finalName, finalFullPath string) {
+	t.Helper()
+	select {
+	case got := <-uploads:
+		if got.FilePath != finalName {
+			t.Errorf("CompletedUploads FilePath = %q; want %q", got.FilePath, finalName)
+		}
+		if got.FullFilePath != finalFullPath {
+			t.Errorf("CompletedUploads FullFilePath = %q; want final path", got.FullFilePath)
+		}
+		if got.Protocol != CompletedUploadProtocolSFTP {
+			t.Errorf("CompletedUploads Protocol = %q; want %q", got.Protocol, CompletedUploadProtocolSFTP)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for CompletedUploads for .writer rename")
+	}
+}
+
 // TestSFTPServer_EmptyStoredPassword_Rejected verifies that a user whose
 // stored Password is "" cannot authenticate by sending an empty password.
 func TestSFTPServer_EmptyStoredPassword_Rejected(t *testing.T) {
@@ -4954,13 +5046,16 @@ func TestSFTPServer_Setstat_TruncateAndTimes(t *testing.T) {
 		t.Errorf("size = %d; want 16", info.Size())
 	}
 
-	// Chtimes via Setstat is rejected under the hardened "no symlinks /
-	// fd-relative-only" policy: setting access/modification times on jailed
-	// files is denied wholesale rather than silently succeeding via
-	// path-based os.Chtimes.
 	want := time.Unix(1_700_000_000, 0)
-	if err := client.Chtimes("/setstat.txt", want, want); err == nil {
-		t.Fatal("Chtimes succeeded; expected permission error under hardened policy")
+	if err := client.Chtimes("/setstat.txt", want, want); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+	info, err = os.Stat(filepath.Join(root, "setstat.txt"))
+	if err != nil {
+		t.Fatalf("os.Stat after Chtimes: %v", err)
+	}
+	if !info.ModTime().Equal(want) {
+		t.Errorf("mtime = %v; want %v", info.ModTime(), want)
 	}
 }
 
@@ -6902,6 +6997,33 @@ func TestFTPS_AuthTLSAndLogin(t *testing.T) {
 	c.authTLS()
 	c.login("alice", "alicepw")
 	c.command(257, "PWD")
+}
+
+func TestFTPS_MFMTSetsModificationTime(t *testing.T) {
+	root := t.TempDir()
+	filePath := filepath.Join(root, "file.txt")
+	if err := os.WriteFile(filePath, []byte("hello"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile: %v", err)
+	}
+	users := map[string]UserInfo{"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true}}
+	cfg, pool := newTestFTPSConfig(t, users, true)
+	_, addr, stop := startTestFTPServerWithConfig(t, cfg)
+	defer stop()
+
+	c := dialFTPS(t, addr, pool)
+	c.authTLS()
+	c.login("alice", "alicepw")
+	if got := c.command(213, "MFMT 20240607080910 file.txt"); got != "20240607080910" {
+		t.Fatalf("MFMT response = %q; want 20240607080910", got)
+	}
+	info, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("os.Stat after MFMT: %v", err)
+	}
+	want := time.Date(2024, 6, 7, 8, 9, 10, 0, time.UTC)
+	if !info.ModTime().Equal(want) {
+		t.Fatalf("mtime after MFMT = %v; want %v", info.ModTime(), want)
+	}
 }
 
 func TestFTPS_PROTDataConnRoundTrip(t *testing.T) {

@@ -15,8 +15,8 @@
 // not a string pre-check — enforces containment, eliminating the TOCTOU
 // window between the pre-check and the action.
 //
-// Setting access/modification times (SFTP Acmodtime) is rejected outright per
-// the hardened policy.
+// Setting access/modification times (SFTP Acmodtime) is performed through an
+// openat2-obtained fd, so timestamp updates follow the same containment policy.
 
 package ironport
 
@@ -423,6 +423,45 @@ func (j *jailFS) Truncate(clientPath string, size int64) error {
 	defer func() { _ = unix.Close(fd) }()
 	if err := unix.Ftruncate(fd, size); err != nil {
 		return &os.PathError{Op: "truncate", Path: clientPath, Err: err}
+	}
+	return nil
+}
+
+// Chtimes changes the access and modification timestamps of clientPath. The
+// lookup goes through openat2 with RESOLVE_NO_SYMLINKS, then utimensat with
+// AT_EMPTY_PATH applies the timestamps to that fd without reopening by path.
+func (j *jailFS) Chtimes(clientPath string, atime, mtime time.Time) error {
+	rel := cleanRelClientPath(clientPath)
+	fd, err := j.openat(rel, unix.O_PATH, 0)
+	if err != nil {
+		return &os.PathError{Op: "chtimes", Path: clientPath, Err: err}
+	}
+	defer func() { _ = unix.Close(fd) }()
+	times := []unix.Timespec{
+		unix.NsecToTimespec(atime.UnixNano()),
+		unix.NsecToTimespec(mtime.UnixNano()),
+	}
+	if err := unix.UtimesNanoAt(fd, "", times, unix.AT_EMPTY_PATH); err != nil {
+		return &os.PathError{Op: "chtimes", Path: clientPath, Err: err}
+	}
+	return nil
+}
+
+// SetModTime changes only the modification timestamp of clientPath. The
+// access timestamp is left unchanged by passing UTIME_OMIT to utimensat.
+func (j *jailFS) SetModTime(clientPath string, mtime time.Time) error {
+	rel := cleanRelClientPath(clientPath)
+	fd, err := j.openat(rel, unix.O_PATH, 0)
+	if err != nil {
+		return &os.PathError{Op: "setmodtime", Path: clientPath, Err: err}
+	}
+	defer func() { _ = unix.Close(fd) }()
+	times := []unix.Timespec{
+		{Nsec: unix.UTIME_OMIT},
+		unix.NsecToTimespec(mtime.UnixNano()),
+	}
+	if err := unix.UtimesNanoAt(fd, "", times, unix.AT_EMPTY_PATH); err != nil {
+		return &os.PathError{Op: "setmodtime", Path: clientPath, Err: err}
 	}
 	return nil
 }

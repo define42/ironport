@@ -118,6 +118,9 @@ const (
 	// counter and are retried indefinitely; this bound only stops a
 	// permanently poisoned listener fd from spinning and logging forever.
 	maxConsecutiveAcceptErrors = 10
+	// ftpTimestampLayout is the UTC timestamp format used by MDTM, MFMT, and
+	// MLST/MLSD modify facts.
+	ftpTimestampLayout = "20060102150405"
 )
 
 const (
@@ -2160,17 +2163,14 @@ func (j jail) Filelist(r *sftp.Request) (lister sftp.ListerAt, err error) {
 //     cannot change ownership of jailed files even when the server process
 //     has the privilege to do so)
 //   - Size              → ftruncate via openat2-obtained fd
-//   - Acmodtime         → REJECTED with os.ErrPermission. Setting timestamps
-//     on jailed files is denied wholesale under the hardened policy; clients
-//     get a deterministic permission error rather than a partial success.
+//   - Acmodtime         → utimensat via openat2-obtained fd
 //
-// Policy-level rejections (Acmodtime, and UidGid when sftpAllowChown is false)
-// are evaluated before any mutating operation is performed, so a multi-flag
-// request that violates policy fails atomically rather than leaving the
-// file partially mutated. Remaining mutating operations are then applied in
-// a deterministic order; the first error is returned and subsequent
-// attributes are not applied, mirroring how OpenSSH's sftp-server reports
-// errors.
+// Policy-level rejections (UidGid when sftpAllowChown is false) are evaluated
+// before any mutating operation is performed, so a multi-flag request that
+// violates policy fails atomically rather than leaving the file partially
+// mutated. Remaining mutating operations are then applied in a deterministic
+// order; the first error is returned and subsequent attributes are not applied,
+// mirroring how OpenSSH's sftp-server reports errors.
 func (j jail) applyAttrs(r *sftp.Request) error {
 	flags := r.AttrFlags()
 	attrs := r.Attributes()
@@ -2179,9 +2179,6 @@ func (j jail) applyAttrs(r *sftp.Request) error {
 	}
 	// Reject policy violations up front so they cannot leave the file
 	// half-mutated when combined with Size/Permissions in a single request.
-	if flags.Acmodtime {
-		return os.ErrPermission
-	}
 	if flags.UidGid && !j.sftpAllowChown {
 		return os.ErrPermission
 	}
@@ -2203,6 +2200,15 @@ func (j jail) applyAttrs(r *sftp.Request) error {
 	}
 	if flags.UidGid {
 		if err := j.fs.Chown(r.Filepath, int(attrs.UID), int(attrs.GID)); err != nil {
+			return err
+		}
+	}
+	return j.applyTimes(r, flags, attrs)
+}
+
+func (j jail) applyTimes(r *sftp.Request, flags sftp.FileAttrFlags, attrs *sftp.FileStat) error {
+	if flags.Acmodtime {
+		if err := j.fs.Chtimes(r.Filepath, attrs.AccessTime(), attrs.ModTime()); err != nil {
 			return err
 		}
 	}
@@ -2679,16 +2685,11 @@ func (f *ftpSession) handleAuthenticatedCommand(cmd, arg string) {
 		handler(f, arg)
 		return
 	}
-	// MFMT/MFCT and SITE need to see the original cmd verb in their reply
+	// MFCT and SITE need to see the original cmd verb in their reply
 	// (or have a fixed reply), and the rest fall through to the generic
 	// "not implemented" path.
 	switch cmd {
-	case "MFMT", "MFCT":
-		// Setting modification times on jailed files is denied wholesale
-		// by the same policy that rejects SFTP Acmodtime. Reply with the
-		// canonical "command not implemented for that parameter" code so
-		// MFMT-aware clients (backup/sync tools) get a deterministic,
-		// well-formed refusal.
+	case "MFCT":
 		_ = f.reply(502, cmd+" not supported")
 	default:
 		_ = f.reply(502, "command not implemented")
@@ -2727,6 +2728,7 @@ var authedFTPHandlers = map[string]func(*ftpSession, string){
 	"REST": func(f *ftpSession, arg string) { f.cmdRest(arg) },
 	"SIZE": func(f *ftpSession, arg string) { f.cmdSize(arg) },
 	"MDTM": func(f *ftpSession, arg string) { f.cmdMDTM(arg) },
+	"MFMT": func(f *ftpSession, arg string) { f.cmdMFMT(arg) },
 	"DELE": func(f *ftpSession, arg string) { f.cmdDelete(arg) },
 	"MKD":  func(f *ftpSession, arg string) { f.cmdMkdir(arg) },
 	"XMKD": func(f *ftpSession, arg string) { f.cmdMkdir(arg) },
@@ -2801,6 +2803,7 @@ func (f *ftpSession) cmdFeat() {
 		"PASV",
 		"SIZE",
 		"MDTM",
+		"MFMT",
 		"REST STREAM",
 		"MLST type*;size*;modify*;perm*;unique*;",
 		"MLSD",
@@ -3806,7 +3809,7 @@ func (f *ftpSession) cmdHelp(arg string) {
 		"USER PASS QUIT NOOP SYST FEAT HELP STAT",
 		"PWD CWD CDUP TYPE MODE STRU OPTS REIN",
 		"PASV EPSV LIST NLST MLST MLSD",
-		"RETR STOR APPE ALLO REST SIZE MDTM",
+		"RETR STOR APPE ALLO REST SIZE MDTM MFMT",
 		"DELE MKD RMD RNFR RNTO ABOR",
 		"LANG HOST",
 	}
@@ -4023,7 +4026,7 @@ func mlstFactLine(info os.FileInfo, name string, canWrite bool) string {
 	b.WriteString(";size=")
 	b.WriteString(strconv.FormatInt(info.Size(), 10))
 	b.WriteString(";modify=")
-	b.WriteString(info.ModTime().UTC().Format("20060102150405"))
+	b.WriteString(info.ModTime().UTC().Format(ftpTimestampLayout))
 	b.WriteString(";perm=")
 	b.WriteString(mlstPermFact(info, canWrite))
 	b.WriteString(";unique=")
@@ -4133,7 +4136,38 @@ func (f *ftpSession) cmdMDTM(arg string) {
 		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
-	_ = f.reply(213, st.ModTime().UTC().Format("20060102150405"))
+	_ = f.reply(213, st.ModTime().UTC().Format(ftpTimestampLayout))
+}
+
+func (f *ftpSession) cmdMFMT(arg string) {
+	if !f.user.CanWrite {
+		_ = f.reply(550, "permission denied")
+		return
+	}
+	mtime, rawPath, ok := parseMFMTArg(arg)
+	if !ok {
+		_ = f.reply(501, "syntax: MFMT YYYYMMDDHHMMSS path")
+		return
+	}
+	if err := f.fs.SetModTime(f.cleanPath(rawPath), mtime); err != nil {
+		_ = f.reply(550, ftpErrMsg(err))
+		return
+	}
+	_ = f.reply(213, mtime.UTC().Format(ftpTimestampLayout))
+}
+
+func parseMFMTArg(arg string) (time.Time, string, bool) {
+	arg = strings.TrimSpace(arg)
+	stamp, rawPath, ok := strings.Cut(arg, " ")
+	rawPath = strings.TrimSpace(rawPath)
+	if !ok || len(stamp) != len(ftpTimestampLayout) || rawPath == "" {
+		return time.Time{}, "", false
+	}
+	mtime, err := time.Parse(ftpTimestampLayout, stamp)
+	if err != nil {
+		return time.Time{}, "", false
+	}
+	return mtime, rawPath, true
 }
 
 func (f *ftpSession) cmdDelete(arg string) {
