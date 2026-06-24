@@ -152,7 +152,9 @@ With this setting:
 In addition to configured temp extensions, files whose name begins with a dot
 (for example `.in-progress` or `.foo.txt`) are always treated as in-progress:
 their completion notification is deferred until the file is renamed to a
-non-dot, non-temp name. This applies even when `TempExtensions` is empty.
+non-dot, non-temp name. This applies even when `TempExtensions` is empty. Only
+renames whose destination is a regular file are announced, so renaming a hidden
+directory (for example `.staging` to `staging`) never emits a completion event.
 
 ### Pinning SSH algorithms
 

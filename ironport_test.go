@@ -4714,6 +4714,40 @@ func TestSFTPServer_Dotfile_SuppressesUploadAndAnnouncesOnRename(t *testing.T) {
 	}
 }
 
+// TestSFTPServer_DotDirectoryRename_NotAnnounced verifies that renaming a
+// hidden directory (for example /.staging -> /staging) is NOT announced on
+// CompletedUploads. jailFS.Rename permits directory renames, and the leading
+// dot would otherwise mark the source as deferred; the destination being a
+// directory rather than a regular file must suppress the upload event.
+func TestSFTPServer_DotDirectoryRename_NotAnnounced(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	config := newTestConfig("", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+	srv, addr, stop := startTestServerWithConfig(t, config)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	dotDir := "/.staging"
+	if err := client.Mkdir(dotDir); err != nil {
+		t.Fatalf("client.Mkdir(%q): %v", dotDir, err)
+	}
+
+	finalDir := "/staging"
+	if err := client.Rename(dotDir, finalDir); err != nil {
+		t.Fatalf("client.Rename(%q, %q): %v", dotDir, finalDir, err)
+	}
+
+	select {
+	case got := <-srv.CompletedUploads():
+		t.Fatalf("CompletedUploads received %+v for a directory rename; expected suppression", got)
+	case <-time.After(300 * time.Millisecond):
+		// expected: nothing
+	}
+}
+
 // TestSFTPServer_TempExtensions_SuppressesUploadAndAnnouncesOnRename verifies
 // the end-to-end flow: a file uploaded with a temp extension does NOT produce
 // a CompletedUploads notification, and renaming it to its final name does.

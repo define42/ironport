@@ -175,10 +175,18 @@ func publishUpload(uploads chan<- CompletedUpload, evt CompletedUpload) {
 // maybeAnnounceTempRename publishes a CompletedUpload event when a file is
 // renamed from a deferred (temp-suffixed or dotfile) name to a final name that
 // is neither (matching is case-insensitive and the extension list comes from
-// Config.TempExtensions). It is a no-op in every other case, so both protocols
-// share the same "rename completes an upload" decision and log line.
-func maybeAnnounceTempRename(uploads chan<- CompletedUpload, tempExts []string, oldPath string, evt CompletedUpload) {
+// Config.TempExtensions). The rename is only treated as a completed upload when
+// the destination is a regular file: jailFS.Rename also permits directory
+// renames (for example /.staging -> /staging), and announcing those as uploads
+// would deliver a false CompletedUpload event for a directory. destInfo is the
+// stat of the destination after the rename (nil if it could not be stat'd). It
+// is a no-op in every other case, so both protocols share the same "rename
+// completes an upload" decision and log line.
+func maybeAnnounceTempRename(uploads chan<- CompletedUpload, tempExts []string, oldPath string, destInfo os.FileInfo, evt CompletedUpload) {
 	if !shouldDeferCompletion(oldPath, tempExts) || shouldDeferCompletion(evt.FilePath, tempExts) {
+		return
+	}
+	if destInfo == nil || !destInfo.Mode().IsRegular() {
 		return
 	}
 	log.Printf("upload complete via rename: %q -> %q", oldPath, evt.FilePath)
@@ -2112,7 +2120,8 @@ func (j jail) Filecmd(r *sftp.Request) (err error) {
 		// completes and announce the new SFTP path on uploads.
 		oldClientPath := cleanSFTPClientPath(r.Filepath)
 		newClientPath := cleanSFTPClientPath(r.Target)
-		maybeAnnounceTempRename(j.uploads, j.tempExts, oldClientPath, CompletedUpload{
+		destInfo, _ := j.fs.Stat(r.Target)
+		maybeAnnounceTempRename(j.uploads, j.tempExts, oldClientPath, destInfo, CompletedUpload{
 			Username:     j.username,
 			FullFilePath: j.fs.fullPath(r.Target),
 			FilePath:     newClientPath,
@@ -4271,7 +4280,8 @@ func (f *ftpSession) cmdRnto(arg string) {
 		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
-	maybeAnnounceTempRename(f.uploads, f.tempExts, oldPath, CompletedUpload{
+	destInfo, _ := f.fs.Stat(newPath)
+	maybeAnnounceTempRename(f.uploads, f.tempExts, oldPath, destInfo, CompletedUpload{
 		Username:     f.username,
 		FullFilePath: f.fs.fullPath(newPath),
 		FilePath:     newPath,
