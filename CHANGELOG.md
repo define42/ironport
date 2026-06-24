@@ -8,6 +8,11 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
+- Fixed a false `CompletedUploads` event when a hidden directory was renamed
+  (for example `/.staging` to `/staging`): the leading dot marked the source as
+  a deferred upload, so the rename was announced even though the destination is
+  a directory. The rename completion is now only announced when the destination
+  is a regular file.
 - Hardened the `AUTH TLS` upgrade against a buffered-bytes race: the reader
   is now stopped and the channel-clean check runs *before* the `234` reply,
   so the client's post-`234` TLS `ClientHello` can never be consumed (or
