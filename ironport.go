@@ -173,12 +173,12 @@ func publishUpload(uploads chan<- CompletedUpload, evt CompletedUpload) {
 }
 
 // maybeAnnounceTempRename publishes a CompletedUpload event when a file is
-// renamed from a temp-suffixed name to a non-temp name (matching is
-// case-insensitive and the extension list comes from Config.TempExtensions).
-// It is a no-op in every other case, so both protocols share the same
-// "rename completes an upload" decision and log line.
+// renamed from a deferred (temp-suffixed or dotfile) name to a final name that
+// is neither (matching is case-insensitive and the extension list comes from
+// Config.TempExtensions). It is a no-op in every other case, so both protocols
+// share the same "rename completes an upload" decision and log line.
 func maybeAnnounceTempRename(uploads chan<- CompletedUpload, tempExts []string, oldPath string, evt CompletedUpload) {
-	if !hasTempExt(oldPath, tempExts) || hasTempExt(evt.FilePath, tempExts) {
+	if !shouldDeferCompletion(oldPath, tempExts) || shouldDeferCompletion(evt.FilePath, tempExts) {
 		return
 	}
 	log.Printf("upload complete via rename: %q -> %q", oldPath, evt.FilePath)
@@ -1450,6 +1450,26 @@ func hasTempExt(name string, tempExts []string) bool {
 	return false
 }
 
+// hasDotPrefix reports whether the final path element of name begins with a
+// dot (a "dotfile"). Such names are treated as still-in-progress uploads, the
+// same way temp extensions are, so their completion notification is deferred
+// until the client renames them to a final, non-dot name.
+func hasDotPrefix(name string) bool {
+	if name == "" {
+		return false
+	}
+	return strings.HasPrefix(path.Base(name), ".")
+}
+
+// shouldDeferCompletion reports whether an upload to name should have its
+// CompletedUploads notification deferred until a later rename. This holds for
+// names ending in a configured temp extension and for dotfiles (names whose
+// final path element begins with "."). Temp-extension matching is
+// case-insensitive.
+func shouldDeferCompletion(name string, tempExts []string) bool {
+	return hasDotPrefix(name) || hasTempExt(name, tempExts)
+}
+
 // Close stops both listeners, causing ListenAndServe to return nil. It is safe
 // to call concurrently with active connections; in-flight connections are not
 // terminated, and the server can be started again after Close returns. Calling
@@ -1998,10 +2018,10 @@ func (w *writeLogger) Close() (err error) {
 	}
 	if err == nil {
 		log.Printf("upload complete: %q", w.filepath)
-		if hasTempExt(w.filepath, w.tempExts) {
+		if shouldDeferCompletion(w.filepath, w.tempExts) {
 			// File is still considered "in progress"; defer notification
 			// until the client renames it to its final (non-temp) name.
-			log.Printf("upload complete: %q has temp extension, deferring CompletedUploads notification", w.filepath)
+			log.Printf("upload complete: %q is a deferred name (temp extension or dotfile), deferring CompletedUploads notification", w.filepath)
 			return nil
 		}
 		// Announce the completed upload on the queue; non-blocking so a slow
@@ -3776,8 +3796,8 @@ func (f *ftpSession) applyRestartOffset(file *os.File, restartOffset int64) bool
 // failure and its presence is not proof of byte-level integrity.
 func (f *ftpSession) announceUpload(ftpPath, fullPath string) {
 	log.Printf("upload complete: %q", ftpPath)
-	if hasTempExt(ftpPath, f.tempExts) {
-		log.Printf("upload complete: %q has temp extension, deferring CompletedUploads notification", ftpPath)
+	if shouldDeferCompletion(ftpPath, f.tempExts) {
+		log.Printf("upload complete: %q is a deferred name (temp extension or dotfile), deferring CompletedUploads notification", ftpPath)
 		return
 	}
 	publishUpload(f.uploads, CompletedUpload{

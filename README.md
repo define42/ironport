@@ -16,7 +16,7 @@ A production-ready, embeddable SFTP server and FTP server library for Go with a 
 - **Dynamic user management** — add, remove, and update users and their authorized keys at runtime without restarting the server
 - **Upload notifications** — a buffered `CompletedUploads()` stream delivers a `CompletedUpload` struct (protocol, username, full on-disk path, jail-relative path, and client IP) for every successfully closed upload
 - **Auth notifications** — a buffered `AuthEvents()` stream delivers `LoginSuccess`, `LoginFailed`, and `Logout` events for SFTP and FTP sessions
-- **Temp-file aware completion** — optionally set `TempExtensions` on the config (for example, `.tmp`, `.writing`) to suppress completion notifications for temporary upload names and emit the notification when the file is renamed to a non-temp name
+- **Temp-file aware completion** — optionally set `TempExtensions` on the config (for example, `.tmp`, `.writing`) to suppress completion notifications for temporary upload names and emit the notification when the file is renamed to a non-temp name. Dotfiles (names beginning with `.`) are always treated as temporary in the same way
 - **Graceful shutdown** — `Close()` stops the listener immediately and lets in-flight sessions finish on their own. `Shutdown(ctx)` stops the listener AND waits for in-flight sessions to finish, force-closing any that remain when `ctx` expires
 - **Thread-safe runtime APIs** — user-management helpers and listener lifecycle methods are safe to call while the server is running
 - **Handshake timeout** — connections that do not complete the SSH handshake within 30 seconds are dropped
@@ -148,6 +148,11 @@ With this setting:
 - uploads that close with a temp extension are not announced yet
 - clients may set the modification time on the temp file with SFTP `Chtimes`
 - renaming from a temp extension to a non-temp name emits the completion event
+
+In addition to configured temp extensions, files whose name begins with a dot
+(for example `.in-progress` or `.foo.txt`) are always treated as in-progress:
+their completion notification is deferred until the file is renamed to a
+non-dot, non-temp name. This applies even when `TempExtensions` is empty.
 
 ### Pinning SSH algorithms
 

@@ -4573,6 +4573,51 @@ func TestHasTempExt(t *testing.T) {
 	}
 }
 
+// TestHasDotPrefix covers detection of dotfiles (names whose final path
+// element begins with ".").
+func TestHasDotPrefix(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{".hidden", true},
+		{"/.hidden", true},
+		{"/path/to/.hidden", true},
+		{".foo.txt", true},
+		{"foo.txt", false},
+		{"/path/to/foo.txt", false},
+		{"/", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := hasDotPrefix(c.name); got != c.want {
+			t.Errorf("hasDotPrefix(%q) = %v; want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestShouldDeferCompletion verifies that completion is deferred for both temp
+// extensions and dotfiles, including when no temp extensions are configured.
+func TestShouldDeferCompletion(t *testing.T) {
+	exts := []string{".tmp"}
+	cases := []struct {
+		name string
+		exts []string
+		want bool
+	}{
+		{"foo.tmp", exts, true},
+		{"/path/.hidden", exts, true},
+		{"/path/.hidden", nil, true},
+		{"foo.txt", exts, false},
+		{"foo.txt", nil, false},
+	}
+	for _, c := range cases {
+		if got := shouldDeferCompletion(c.name, c.exts); got != c.want {
+			t.Errorf("shouldDeferCompletion(%q, %v) = %v; want %v", c.name, c.exts, got, c.want)
+		}
+	}
+}
+
 func TestCleanSFTPClientPath(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -4612,6 +4657,60 @@ func TestServer_TempExtensionsNormalisation(t *testing.T) {
 		if got[i] != w {
 			t.Errorf("configuredTempExtensions()[%d] = %q; want %q", i, got[i], w)
 		}
+	}
+}
+
+// TestSFTPServer_Dotfile_SuppressesUploadAndAnnouncesOnRename verifies that a
+// file uploaded with a leading-dot name is not announced on CompletedUploads,
+// and that renaming it to a non-dot name produces the notification. No temp
+// extensions are configured, proving dotfile handling is independent.
+func TestSFTPServer_Dotfile_SuppressesUploadAndAnnouncesOnRename(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	config := newTestConfig("", "", "", users, testSigner(t), defaultCompletedUploadsSize)
+	srv, addr, stop := startTestServerWithConfig(t, config)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	// Upload a dotfile — must NOT be announced.
+	dotName := "/.foo.txt"
+	f, err := client.Create(dotName)
+	if err != nil {
+		t.Fatalf("client.Create(%q): %v", dotName, err)
+	}
+	if _, err = f.Write([]byte("hello")); err != nil {
+		t.Fatalf("f.Write: %v", err)
+	}
+	if err = f.Close(); err != nil {
+		t.Fatalf("f.Close: %v", err)
+	}
+
+	select {
+	case got := <-srv.CompletedUploads():
+		t.Fatalf("CompletedUploads received %+v for a dotfile upload; expected suppression", got)
+	case <-time.After(300 * time.Millisecond):
+		// expected: nothing
+	}
+
+	// Rename to non-dot name — must announce the new path.
+	finalName := "/foo.txt"
+	if err := client.Rename(dotName, finalName); err != nil {
+		t.Fatalf("client.Rename(%q, %q): %v", dotName, finalName, err)
+	}
+
+	select {
+	case got := <-srv.CompletedUploads():
+		if got.FilePath != finalName {
+			t.Errorf("CompletedUploads FilePath = %q; want %q", got.FilePath, finalName)
+		}
+		if got.Protocol != CompletedUploadProtocolSFTP {
+			t.Errorf("CompletedUploads Protocol = %q; want %q", got.Protocol, CompletedUploadProtocolSFTP)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for CompletedUploads signal for renamed file %q", finalName)
 	}
 }
 
