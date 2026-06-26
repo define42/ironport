@@ -7535,3 +7535,315 @@ func TestFTPS_AuthTLSDiscardsPlaintextLogin(t *testing.T) {
 	srv.RemoveUser("victim")
 	c.command(200, "NOOP")
 }
+
+// errListener is a net.Listener whose Close returns a configurable error, used
+// to exercise the listener-cleanup paths without a real socket.
+type errListener struct {
+	closeErr error
+	closed   bool
+}
+
+func (l *errListener) Accept() (net.Conn, error) { return nil, net.ErrClosed }
+func (l *errListener) Close() error {
+	l.closed = true
+	return l.closeErr
+}
+func (l *errListener) Addr() net.Addr { return &net.TCPAddr{} }
+
+// ---- isTransientAcceptError ----
+
+// TestIsTransientAcceptError verifies that timeout and the recognised transient
+// syscall errors are classified as transient, while a plain or non-transient
+// error is not.
+func TestIsTransientAcceptError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "plain", err: errors.New("boom"), want: false},
+		{name: "timeout", err: timeoutErr{}, want: true},
+		{name: "EMFILE", err: syscall.EMFILE, want: true},
+		{name: "ENFILE", err: syscall.ENFILE, want: true},
+		{name: "ECONNABORTED", err: syscall.ECONNABORTED, want: true},
+		{name: "EINTR", err: syscall.EINTR, want: true},
+		{name: "ENOBUFS", err: syscall.ENOBUFS, want: true},
+		{name: "ENOMEM", err: syscall.ENOMEM, want: true},
+		{name: "EACCES", err: syscall.EACCES, want: false},
+		{name: "wrapped EMFILE", err: fmt.Errorf("accept: %w", syscall.EMFILE), want: true},
+		{name: "OpError timeout", err: &net.OpError{Op: "accept", Err: timeoutErr{}}, want: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isTransientAcceptError(tc.err); got != tc.want {
+				t.Fatalf("isTransientAcceptError(%v) = %v; want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// timeoutErr is a net.Error that reports a timeout, used to drive the
+// net.Error/Timeout() branch of isTransientAcceptError.
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "i/o timeout" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return true }
+
+// ---- handleAcceptError ----
+
+// TestHandleAcceptError_TransientResetsCounter verifies that a transient error
+// resets the permanent-error counter, advances the backoff, and never asks the
+// loop to stop.
+func TestHandleAcceptError_TransientResetsCounter(t *testing.T) {
+	s := &Server{}
+	permanent := 5
+	backoff, err := s.handleAcceptError("sftp", syscall.EMFILE, 0, &permanent)
+	if err != nil {
+		t.Fatalf("handleAcceptError returned err = %v; want nil for transient error", err)
+	}
+	if permanent != 0 {
+		t.Fatalf("permanentErrors = %d; want 0 after transient error", permanent)
+	}
+	if backoff != 5*time.Millisecond {
+		t.Fatalf("backoff = %v; want 5ms (first step)", backoff)
+	}
+}
+
+// TestHandleAcceptError_NonTransientIncrements verifies that a non-transient
+// error increments the counter and keeps the loop running while under the cap.
+func TestHandleAcceptError_NonTransientIncrements(t *testing.T) {
+	s := &Server{}
+	permanent := 0
+	backoff, err := s.handleAcceptError("ftp", errors.New("nope"), 10*time.Millisecond, &permanent)
+	if err != nil {
+		t.Fatalf("handleAcceptError returned err = %v; want nil while under the cap", err)
+	}
+	if permanent != 1 {
+		t.Fatalf("permanentErrors = %d; want 1 after one non-transient error", permanent)
+	}
+	if backoff != 20*time.Millisecond {
+		t.Fatalf("backoff = %v; want 20ms (doubled)", backoff)
+	}
+}
+
+// TestHandleAcceptError_GivesUpAtCap verifies that reaching
+// maxConsecutiveAcceptErrors consecutive non-transient errors makes the helper
+// return a non-nil error wrapping the underlying cause, signalling the accept
+// loop to stop.
+func TestHandleAcceptError_GivesUpAtCap(t *testing.T) {
+	s := &Server{}
+	cause := errors.New("listener wedged")
+	permanent := maxConsecutiveAcceptErrors - 1
+	backoff, err := s.handleAcceptError("sftp", cause, time.Millisecond, &permanent)
+	if err == nil {
+		t.Fatalf("handleAcceptError returned nil err; want a give-up error at the cap")
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("give-up error = %v; want it to wrap the underlying cause", err)
+	}
+	if permanent != maxConsecutiveAcceptErrors {
+		t.Fatalf("permanentErrors = %d; want %d", permanent, maxConsecutiveAcceptErrors)
+	}
+	if backoff != 0 {
+		t.Fatalf("backoff = %v; want 0 on give-up", backoff)
+	}
+}
+
+// ---- closeRunListeners ----
+
+// TestCloseRunListeners_ClearsStateForMatchingRun verifies that when the run ID
+// matches the server's current serveID, the listener fields are cleared and
+// serving is reset, and both listeners are closed.
+func TestCloseRunListeners_ClearsStateForMatchingRun(t *testing.T) {
+	ln := &errListener{}
+	ftpLn := &errListener{}
+	s := &Server{serveID: 7, serving: true, ln: ln, ftpLn: ftpLn}
+
+	if err := s.closeRunListeners(7, ln, ftpLn); err != nil {
+		t.Fatalf("closeRunListeners returned err = %v; want nil", err)
+	}
+	if s.ln != nil || s.ftpLn != nil {
+		t.Fatalf("listener fields not cleared: ln=%v ftpLn=%v", s.ln, s.ftpLn)
+	}
+	if s.serving {
+		t.Fatalf("serving = true; want false after closing the active run")
+	}
+	if !ln.closed || !ftpLn.closed {
+		t.Fatalf("listeners not closed: sftp=%v ftp=%v", ln.closed, ftpLn.closed)
+	}
+}
+
+// TestCloseRunListeners_LeavesStateForStaleRun verifies that a cleanup from a
+// superseded run (its runID no longer matches serveID) still closes the
+// listeners it was handed but does not disturb the current run's server state.
+func TestCloseRunListeners_LeavesStateForStaleRun(t *testing.T) {
+	staleLn := &errListener{}
+	staleFtpLn := &errListener{}
+	currentLn := &errListener{}
+	s := &Server{serveID: 8, serving: true, ln: currentLn, ftpLn: currentLn}
+
+	if err := s.closeRunListeners(7, staleLn, staleFtpLn); err != nil {
+		t.Fatalf("closeRunListeners returned err = %v; want nil", err)
+	}
+	if s.ln != currentLn || s.ftpLn != currentLn {
+		t.Fatalf("stale cleanup clobbered current run's listeners")
+	}
+	if !s.serving {
+		t.Fatalf("serving = false; stale cleanup must not stop the current run")
+	}
+	if !staleLn.closed || !staleFtpLn.closed {
+		t.Fatalf("stale listeners not closed: sftp=%v ftp=%v", staleLn.closed, staleFtpLn.closed)
+	}
+}
+
+// TestCloseRunListeners_NilFTPListener verifies the FTP-disabled case (ftpLn is
+// nil) closes only the SFTP listener without panicking.
+func TestCloseRunListeners_NilFTPListener(t *testing.T) {
+	ln := &errListener{}
+	s := &Server{serveID: 1, serving: true, ln: ln}
+
+	if err := s.closeRunListeners(1, ln, nil); err != nil {
+		t.Fatalf("closeRunListeners returned err = %v; want nil", err)
+	}
+	if !ln.closed {
+		t.Fatalf("sftp listener not closed")
+	}
+}
+
+// TestCloseRunListeners_PropagatesCloseError verifies that a real Close error
+// (not net.ErrClosed) is surfaced to the caller.
+func TestCloseRunListeners_PropagatesCloseError(t *testing.T) {
+	closeErr := errors.New("close failed")
+	ln := &errListener{closeErr: closeErr}
+	s := &Server{serveID: 1, ln: ln}
+
+	if err := s.closeRunListeners(1, ln, nil); !errors.Is(err, closeErr) {
+		t.Fatalf("closeRunListeners err = %v; want it to wrap %v", err, closeErr)
+	}
+}
+
+// TestCloseRunListeners_IgnoresErrClosed verifies that a net.ErrClosed from
+// Close (the listener was already closed) is treated as success.
+func TestCloseRunListeners_IgnoresErrClosed(t *testing.T) {
+	ln := &errListener{closeErr: net.ErrClosed}
+	s := &Server{serveID: 1, ln: ln}
+
+	if err := s.closeRunListeners(1, ln, nil); err != nil {
+		t.Fatalf("closeRunListeners err = %v; want nil for net.ErrClosed", err)
+	}
+}
+
+// ---- cmdMode / cmdStru / cmdOpts ----
+
+// newReplyCaptureSession returns an ftpSession whose control replies are
+// captured in buf. flush is required because reply() writes through a
+// bufio.Writer.
+func newReplyCaptureSession(buf *bytes.Buffer) *ftpSession {
+	return &ftpSession{w: bufio.NewWriter(buf)}
+}
+
+// TestFTPSession_CmdMode verifies that only STREAM mode ("S", case-insensitive,
+// surrounding whitespace ignored) is accepted; anything else is refused with
+// 504.
+func TestFTPSession_CmdMode(t *testing.T) {
+	tests := []struct {
+		name string
+		arg  string
+		want string
+	}{
+		{name: "stream", arg: "S", want: "200 mode set\r\n"},
+		{name: "stream lowercase", arg: "s", want: "200 mode set\r\n"},
+		{name: "stream padded", arg: "  S  ", want: "200 mode set\r\n"},
+		{name: "block", arg: "B", want: "504 unsupported mode\r\n"},
+		{name: "compressed", arg: "C", want: "504 unsupported mode\r\n"},
+		{name: "empty", arg: "", want: "504 unsupported mode\r\n"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			newReplyCaptureSession(&buf).cmdMode(tc.arg)
+			if got := buf.String(); got != tc.want {
+				t.Fatalf("cmdMode(%q) reply = %q; want %q", tc.arg, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFTPSession_CmdStru verifies that only FILE structure ("F",
+// case-insensitive, whitespace ignored) is accepted; anything else is refused
+// with 504.
+func TestFTPSession_CmdStru(t *testing.T) {
+	tests := []struct {
+		name string
+		arg  string
+		want string
+	}{
+		{name: "file", arg: "F", want: "200 structure set\r\n"},
+		{name: "file lowercase", arg: "f", want: "200 structure set\r\n"},
+		{name: "file padded", arg: " F ", want: "200 structure set\r\n"},
+		{name: "record", arg: "R", want: "504 unsupported structure\r\n"},
+		{name: "page", arg: "P", want: "504 unsupported structure\r\n"},
+		{name: "empty", arg: "", want: "504 unsupported structure\r\n"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			newReplyCaptureSession(&buf).cmdStru(tc.arg)
+			if got := buf.String(); got != tc.want {
+				t.Fatalf("cmdStru(%q) reply = %q; want %q", tc.arg, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFTPSession_CmdOpts verifies that only "UTF8 ON" (case-insensitive,
+// whitespace ignored) is accepted; any other option string is refused with 501.
+func TestFTPSession_CmdOpts(t *testing.T) {
+	tests := []struct {
+		name string
+		arg  string
+		want string
+	}{
+		{name: "utf8 on", arg: "UTF8 ON", want: "200 UTF8 enabled\r\n"},
+		{name: "utf8 on lowercase", arg: "utf8 on", want: "200 UTF8 enabled\r\n"},
+		{name: "utf8 on padded", arg: "  UTF8 ON  ", want: "200 UTF8 enabled\r\n"},
+		{name: "utf8 off", arg: "UTF8 OFF", want: "501 unsupported option\r\n"},
+		{name: "other", arg: "MLST", want: "501 unsupported option\r\n"},
+		{name: "empty", arg: "", want: "501 unsupported option\r\n"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			newReplyCaptureSession(&buf).cmdOpts(tc.arg)
+			if got := buf.String(); got != tc.want {
+				t.Fatalf("cmdOpts(%q) reply = %q; want %q", tc.arg, got, tc.want)
+			}
+		})
+	}
+}
+
+// ---- ftpPathBase ----
+
+// TestFTPPathBase verifies that ftpPathBase returns "/" for the root and empty
+// string and the basename otherwise, including trailing-slash and nested cases.
+func TestFTPPathBase(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{in: "/", want: "/"},
+		{in: "", want: "/"},
+		{in: "/file.txt", want: "file.txt"},
+		{in: "/dir/sub/file.txt", want: "file.txt"},
+		{in: "file.txt", want: "file.txt"},
+		{in: "/dir/", want: "dir"},
+		{in: "/dir/sub/", want: "sub"},
+		{in: "/a/b/c", want: "c"},
+	}
+	for _, tc := range tests {
+		if got := ftpPathBase(tc.in); got != tc.want {
+			t.Errorf("ftpPathBase(%q) = %q; want %q", tc.in, got, tc.want)
+		}
+	}
+}
