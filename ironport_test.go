@@ -63,26 +63,25 @@ func TestCleanRelClientPath(t *testing.T) {
 // of whether its target lies inside or outside the jail. The same fixture
 // exercises read, write, stat, list, chmod, truncate, mkdir, remove, and
 // rename, so a regression in any helper is caught here.
-func TestJailFS_RejectsSymlinkComponents(t *testing.T) {
+// symlinkRejectFixture builds a jail containing a real subdir+file, an
+// escaping symlink ("escape" → outside the jail) and an internal directory
+// symlink ("real_link" → "real"). It returns the opened jailFS and the
+// outside directory whose target must never be created. The symlink creation
+// is best-effort: on filesystems that forbid symlinks the test is skipped.
+func symlinkRejectFixture(t *testing.T) (*jailFS, string) {
+	t.Helper()
 	root := t.TempDir()
 	outside := t.TempDir()
 
-	// Create a real subdir and a regular file inside the jail so that
-	// "innocent" calls succeed and we know the failures below are caused
-	// by the symlink, not by a misconfigured fixture.
 	if err := os.Mkdir(filepath.Join(root, "real"), 0o750); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "real", "file.txt"), []byte("hi"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-
-	// Symlink whose target escapes the jail.
 	if err := os.Symlink(filepath.Join(outside, "missing.txt"), filepath.Join(root, "escape")); err != nil {
 		t.Skipf("symlink: %v", err)
 	}
-	// Symlink to a directory inside the jail. Even an "internal" symlink is
-	// rejected so the policy does not depend on resolving the target.
 	if err := os.Symlink("real", filepath.Join(root, "real_link")); err != nil {
 		t.Skipf("symlink: %v", err)
 	}
@@ -92,6 +91,11 @@ func TestJailFS_RejectsSymlinkComponents(t *testing.T) {
 		t.Fatalf("openJailFS: %v", err)
 	}
 	t.Cleanup(func() { _ = jfs.Close() })
+	return jfs, outside
+}
+
+func TestJailFS_RejectsSymlinkComponents(t *testing.T) {
+	jfs, outside := symlinkRejectFixture(t)
 
 	type op struct {
 		name string
@@ -115,6 +119,12 @@ func TestJailFS_RejectsSymlinkComponents(t *testing.T) {
 		{"Rename dst middle", func() error { return jfs.Rename("/real/file.txt", "/real_link/x") }},
 		{"Chmod final", func() error { return jfs.Chmod("/escape", 0o600) }},
 		{"Truncate final", func() error { return jfs.Truncate("/escape", 0) }},
+		{"Chown final", func() error { return jfs.Chown("/escape", -1, -1) }},
+		{"Chown middle", func() error { return jfs.Chown("/real_link/file.txt", -1, -1) }},
+		{"Chtimes final", func() error { return jfs.Chtimes("/escape", time.Now(), time.Now()) }},
+		{"Chtimes middle", func() error { return jfs.Chtimes("/real_link/file.txt", time.Now(), time.Now()) }},
+		{"SetModTime final", func() error { return jfs.SetModTime("/escape", time.Now()) }},
+		{"SetModTime middle", func() error { return jfs.SetModTime("/real_link/file.txt", time.Now()) }},
 	}
 	for _, o := range ops {
 		err := o.run()
