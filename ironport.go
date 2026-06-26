@@ -1843,11 +1843,21 @@ func remoteIP(addr net.Addr) string {
 	if addr == nil {
 		return ""
 	}
-	s := addr.String()
-	if host, _, err := net.SplitHostPort(s); err == nil {
+	return hostFromAddr(addr.String())
+}
+
+// hostFromAddr returns the host portion of a "host:port" address string,
+// without the port. It returns the input unchanged when it carries no port and
+// "" for an empty input. It backs both remoteIP (net.Addr) and the HTTP
+// endpoint's client-IP extraction from http.Request.RemoteAddr.
+func hostFromAddr(addr string) string {
+	if addr == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(addr); err == nil {
 		return host
 	}
-	return s
+	return addr
 }
 
 func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool) {

@@ -8,6 +8,23 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
+- Added an HTTP upload endpoint: `Server.HttpIngest()` returns an
+  `http.HandlerFunc` that callers mount on their own router. It accepts a
+  `multipart/form-data` POST with the file under the `file` field (`key=file`),
+  authenticates with HTTP Basic auth using the same credentials and
+  constant-time password comparison as SFTP/FTP/FTPS, requires `CanWrite`, and
+  streams the file into the user's `openat2` jail. A nested upload name such as
+  `reports/2026/q2.csv` is stored at that path, creating any missing parent
+  directories (via a new jailed `MkdirAll`); `..` segments are collapsed and
+  contained within the jail. A request may carry several `file` parts (a
+  standard multi-file form); each is stored independently and announced
+  separately, the reply is `201` only when all succeed, and on any failure an
+  error status carries a per-file summary so partial failures are never silent.
+  Successful uploads are announced on `CompletedUploads()` with the new
+  `CompletedUploadProtocolHTTP` (`"HTTP"`) protocol and honour
+  `TempExtensions`/dotfile deferral; auth outcomes are reported on
+  `AuthEvents()`. The endpoint runs no listener of its own, so TLS termination
+  and routing stay with the caller.
 - Fixed a false `CompletedUploads` event when a hidden directory was renamed
   (for example `/.staging` to `/staging`): the leading dot marked the source as
   a deferred upload, so the rename was announced even though the destination is

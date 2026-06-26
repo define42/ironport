@@ -7,7 +7,9 @@ import (
 	"crypto/tls"
 	"flag"
 	"log"
+	"net/http"
 	"strings"
+	"time"
 
 	"github.com/define42/ironport"
 	"golang.org/x/crypto/ssh"
@@ -17,6 +19,7 @@ type flags struct {
 	hostKeyPath                *string
 	sftpAddr                   *string
 	ftpAddr                    *string
+	httpAddr                   *string
 	ftpPassive                 *string
 	ftpActive                  *bool
 	ftpsCert                   *string
@@ -33,6 +36,7 @@ func parseFlags() flags {
 		hostKeyPath:                flag.String("host-key", "", "path to a PEM-encoded private key file to use as the server host key (generated if not provided)"),
 		sftpAddr:                   flag.String("sftp-addr", ":2022", "TCP address to listen on for SFTP"),
 		ftpAddr:                    flag.String("ftp-addr", "", "TCP address to listen on for FTP/FTPS (empty to disable; credentials are sent in the clear unless -ftps-cert is set, see README)"),
+		httpAddr:                   flag.String("http-addr", "", "TCP address to listen on for HTTP uploads at POST /upload (empty to disable; Basic-auth credentials are sent in the clear, put this behind TLS, see README)"),
 		ftpPassive:                 flag.String("ftp-passive", "5000-5010", "FTP passive-mode data port range (used only when -ftp-addr is set)"),
 		ftpActive:                  flag.Bool("ftp-active", false, "enable FTP active mode PORT/EPRT (dials back only to the control connection IP)"),
 		ftpsCert:                   flag.String("ftps-cert", "", "path to a PEM-encoded certificate to advertise AUTH TLS (RFC 4217) on the FTP listener; requires -ftps-key"),
@@ -118,7 +122,29 @@ func main() {
 	config := buildConfig(f, signer, users)
 	srv := ironport.NewServer(config)
 	startEventLoggers(srv)
+	startHTTPIngest(srv, *f.httpAddr)
 	log.Fatal(srv.ListenAndServe())
+}
+
+// startHTTPIngest exposes the HTTP upload endpoint on addr in a background
+// goroutine when addr is non-empty. The demo serves it in the clear; a real
+// deployment should terminate TLS here (http.ListenAndServeTLS) or in front of
+// it so the Basic-auth credential is not sent unencrypted.
+func startHTTPIngest(srv *ironport.Server, addr string) {
+	if addr == "" {
+		return
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/upload", srv.HttpIngest())
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		log.Printf("HTTP upload endpoint listening on %s (POST multipart key=file to /upload)", addr)
+		log.Fatal(server.ListenAndServe())
+	}()
 }
 
 // loadFTPSTLSConfig builds a *tls.Config from the operator-supplied cert/key

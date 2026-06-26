@@ -172,6 +172,48 @@ func TestJailFS_PathTraversalContained(t *testing.T) {
 	_ = f.Close()
 }
 
+func TestJailFS_MkdirAll(t *testing.T) {
+	root := t.TempDir()
+	jfs, err := openJailFS(root)
+	if err != nil {
+		t.Fatalf("openJailFS: %v", err)
+	}
+	t.Cleanup(func() { _ = jfs.Close() })
+
+	if err := jfs.MkdirAll("a/b/c", 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if info, err := os.Stat(filepath.Join(root, "a", "b", "c")); err != nil || !info.IsDir() {
+		t.Fatalf("expected dir a/b/c; info=%v err=%v", info, err)
+	}
+	// Idempotent: existing directories are not an error.
+	if err := jfs.MkdirAll("a/b/c", 0o700); err != nil {
+		t.Fatalf("MkdirAll (repeat): %v", err)
+	}
+	// The jail root is a no-op.
+	if err := jfs.MkdirAll("/", 0o700); err != nil {
+		t.Fatalf("MkdirAll(/): %v", err)
+	}
+	// A component that exists as a regular file is rejected (ENOTDIR).
+	if err := os.WriteFile(filepath.Join(root, "file"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := jfs.MkdirAll("file/sub", 0o700); err == nil {
+		t.Fatal("MkdirAll under a regular file should fail")
+	}
+	// A symlinked component is rejected: openat2 refuses symlink traversal, so
+	// directories cannot be created through a symlink that points outside.
+	if err := os.Symlink(t.TempDir(), filepath.Join(root, "link")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	if err := jfs.MkdirAll("link/sub", 0o700); err == nil {
+		t.Fatal("MkdirAll through a symlink component should fail")
+	}
+	if _, err := os.Stat(filepath.Join(root, "link", "sub")); err == nil {
+		t.Fatal("MkdirAll created a directory through a symlink")
+	}
+}
+
 func TestJailFilewriteRejectsBrokenSymlinkEscape(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()

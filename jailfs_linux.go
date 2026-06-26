@@ -308,6 +308,35 @@ func (j *jailFS) Mkdir(clientPath string, perm os.FileMode) error {
 	return nil
 }
 
+// MkdirAll creates clientPath together with any missing parent directories,
+// like os.MkdirAll, but confined to the jail: every level is created with
+// Mkdir, which resolves the parent through openat2 with RESOLVE_NO_SYMLINKS, so
+// no component may be reached through a symlink and the path cannot escape the
+// jail. Directories that already exist are left untouched; it is an error if a
+// component along the path exists as a non-directory. Passing the jail root
+// (".", "" or "/") is a no-op.
+func (j *jailFS) MkdirAll(clientPath string, perm os.FileMode) error {
+	rel := cleanRelClientPath(clientPath)
+	if rel == "." || rel == "" {
+		return nil
+	}
+	prefix := ""
+	for _, segment := range strings.Split(rel, "/") {
+		if prefix == "" {
+			prefix = segment
+		} else {
+			prefix += "/" + segment
+		}
+		// A pre-existing directory yields EEXIST, which is not an error for
+		// MkdirAll; any other failure (ENOTDIR on a file component, ELOOP on a
+		// symlink, EACCES) is fatal and returned to the caller.
+		if err := j.Mkdir(prefix, perm); err != nil && !errors.Is(err, syscall.EEXIST) {
+			return err
+		}
+	}
+	return nil
+}
+
 // removeAt is the shared implementation of Remove and Rmdir; flags is either
 // 0 (file unlink) or unix.AT_REMOVEDIR (directory unlink).
 func (j *jailFS) removeAt(clientPath string, flags int, op string) error {

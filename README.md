@@ -10,12 +10,13 @@ A production-ready, embeddable SFTP server and FTP server library for Go with a 
 ## Features
 
 - **SFTP and FTP/FTPS in one binary** — a single server hosts both protocols against the same user database, jails, and permission flags. FTPS (explicit TLS via `AUTH TLS`, RFC 4217) opt-in with `FtpTLSConfig`; pair with `FtpRequireTLS` to refuse plaintext logins entirely
+- **HTTP upload endpoint** — `HttpIngest()` returns an `http.HandlerFunc` you mount on your own router (`mux.HandleFunc("/upload", srv.HttpIngest())`). It accepts a `multipart/form-data` POST with the file under the `file` field (`key=file`), authenticates with HTTP Basic auth using the **same** username/password as SFTP/FTP/FTPS, and stores the file in the user's jail — sharing the same permission flags, `CompletedUploads`, and `AuthEvents` streams. Put it behind TLS (your own `http.Server`/reverse proxy), since Basic credentials are otherwise sent in the clear
 - **SSH public-key and password authentication** — both methods use constant-time comparisons to prevent username enumeration via timing side-channels
 - **Per-user jail (chroot)** — each user is confined to a configurable root directory. Every filesystem operation is performed via Linux `openat2` with `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS`, so the kernel itself rejects path traversal and any symlink anywhere in the lookup
 - **Fine-grained permissions** — independent `CanRead` / `CanWrite` flags per user
 - **Dynamic user management** — add, remove, and update users and their authorized keys at runtime without restarting the server
-- **Upload notifications** — a buffered `CompletedUploads()` stream delivers a `CompletedUpload` struct (protocol, username, full on-disk path, jail-relative path, and client IP) for every successfully closed upload
-- **Auth notifications** — a buffered `AuthEvents()` stream delivers `LoginSuccess`, `LoginFailed`, and `Logout` events for SFTP and FTP sessions
+- **Upload notifications** — a buffered `CompletedUploads()` stream delivers a `CompletedUpload` struct (protocol — `SFTP`, `FTP`, or `HTTP` — username, full on-disk path, jail-relative path, and client IP) for every successfully closed upload
+- **Auth notifications** — a buffered `AuthEvents()` stream delivers `LoginSuccess`, `LoginFailed`, and `Logout` events for SFTP and FTP sessions; HTTP uploads emit `LoginSuccess`/`LoginFailed` per authenticated request
 - **Temp-file aware completion** — optionally set `TempExtensions` on the config (for example, `.tmp`, `.writing`) to suppress completion notifications for temporary upload names and emit the notification when the file is renamed to a non-temp name. Dotfiles (names beginning with `.`) are always treated as temporary in the same way
 - **Graceful shutdown** — `Close()` stops the listener immediately and lets in-flight sessions finish on their own. `Shutdown(ctx)` stops the listener AND waits for in-flight sessions to finish, force-closing any that remain when `ctx` expires
 - **Thread-safe runtime APIs** — user-management helpers and listener lifecycle methods are safe to call while the server is running
@@ -257,6 +258,82 @@ to get wrong:
 Only explicit FTPS is supported; implicit FTPS (port 990, TLS from byte
 zero) is intentionally not implemented. The `CCC` command is refused —
 once TLS is negotiated, the session stays encrypted.
+
+## HTTP upload endpoint (opt-in)
+
+In addition to SFTP and FTP, the server can accept uploads over HTTP. Unlike
+the SFTP/FTP listeners, the HTTP endpoint does **not** run its own listener:
+`HttpIngest()` returns an `http.HandlerFunc` that you mount on your own
+`*http.ServeMux` (or any router), so the upload URL lives inside your existing
+HTTP application and you control the TLS termination, middleware, and routing.
+
+```go
+srv := ironport.NewServer(config)
+
+mux := http.NewServeMux()
+mux.HandleFunc("/upload", srv.HttpIngest())
+
+// Terminate TLS yourself — HTTP Basic credentials are otherwise in the clear.
+log.Fatal(http.ListenAndServeTLS(":8443", "server.crt", "server.key", mux))
+```
+
+The endpoint accepts one or more files per request:
+
+- **Method** — `POST` only; anything else is answered with `405` and an
+  `Allow: POST` header.
+- **Authentication** — HTTP Basic auth. The username and password are the
+  **same** credentials used for SFTP/FTP/FTPS, validated with the same
+  constant-time password comparison. A missing or wrong credential returns
+  `401` with a `WWW-Authenticate` challenge. Because Basic auth sends the
+  credential on every request, run this endpoint over TLS (your own
+  `http.Server` or a TLS-terminating reverse proxy).
+- **Permission** — the authenticated user must have `CanWrite`, or the request
+  is rejected with `403`.
+- **Body** — `multipart/form-data` carrying one or more parts under the form
+  field `file` (i.e. `key=file`). Each part's filename becomes the destination
+  path, relative to the user's jail root. A nested name such as
+  `reports/2026/q2.csv` (or `/reports/2026/q2.csv`) is stored at that path,
+  creating any missing parent directories. The path is resolved through the same
+  `openat2` no-symlink jail as SFTP/FTP, so `..` segments are collapsed and
+  contained and a crafted filename (for example `../../etc/passwd`) can neither
+  escape the jail nor follow a symlink.
+- **Multiple files** — repeating the `file` field (a standard
+  `<input type="file" name="file" multiple>` form, or `curl -F file=@a -F
+  file=@b`) stores every part. Each file is written independently and announced
+  separately, and one file's failure does not abort the others.
+- **Success** — each file is stored (creating or overwriting) and streamed
+  straight to disk (not buffered whole in memory or staged in a temp directory),
+  and a `CompletedUpload` with `Protocol == "HTTP"` is announced per file on
+  `CompletedUploads()`. The handler replies `201 Created` when at least one file
+  was stored and none failed.
+- **Partial/total failure** — if any file fails, the reply is an error status
+  (`400` for client errors such as an invalid filename or no `file` part, `500`
+  for a server-side write error) with a plain-text body listing each file's
+  outcome (`stored <path>` / `failed <path> (<reason>)`), so a partial failure
+  is never silent. Files that did store are kept.
+
+`TempExtensions` and dotfile handling apply exactly as they do for SFTP/FTP: an
+upload whose name ends in a configured temp extension, or begins with a dot, is
+written but its completion is deferred. Because a single HTTP request has no
+later rename step, such a deferred upload is only announced if the file is later
+renamed to a final name over SFTP/FTP.
+
+A quick upload with `curl`:
+
+```sh
+# Stored at the jail root as report.csv.
+curl -u alice:alicepw -F file=@./report.csv https://host:8443/upload
+
+# Stored at <jail>/reports/2026/q2.csv; the reports/2026 directories are created.
+curl -u alice:alicepw -F 'file=@./q2.csv;filename=reports/2026/q2.csv' https://host:8443/upload
+
+# Several files in one request — each part is stored and announced separately.
+curl -u alice:alicepw -F file=@./a.csv -F file=@./b.csv https://host:8443/upload
+```
+
+The handler imposes no upload-size limit of its own (matching SFTP/FTP); wrap it
+with `http.MaxBytesReader`, or bound the request body at your reverse proxy, if
+you need a cap.
 
 ## Public-key authentication
 
