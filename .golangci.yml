@@ -1,5 +1,14 @@
 version: "2"
 
+run:
+  # golangci-lint v2.12.2 is built with Go 1.25, so its analysis cannot target
+  # a newer Go version. go.mod pins toolchain go1.26.4, which would otherwise
+  # make the linter abort with "the Go language version used to build
+  # golangci-lint is lower than the targeted Go version". Cap the targeted
+  # version at 1.25 to match the linter until a release built with Go >= 1.26
+  # is available.
+  go: "1.25"
+
 linters:
   default: none
   enable:
