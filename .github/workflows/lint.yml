@@ -30,8 +30,7 @@ jobs:
         uses: golangci/golangci-lint-action@v9
         with:
           # Pin to a known-good release of golangci-lint so the lint rules
-          # don't silently change underneath us. The default linter set
-          # (errcheck, gosimple, govet, ineffassign, staticcheck, unused)
-          # is sufficient for this codebase.
-          version: v2.12.2
+          # don't silently change underneath us. .golangci.yml is the source
+          # of truth for the enabled rules.
+          version: v2.14.0
           args: --timeout=5m

@@ -471,21 +471,12 @@ type Server struct {
 	// ftpAllowActiveMode controls whether FTP PORT/EPRT commands may ask the
 	// server to dial an active-mode data connection back to the client IP.
 	ftpAllowActiveMode bool
-	// ftpTLSConfig is the *tls.Config used to upgrade the FTP control
-	// connection via AUTH TLS (RFC 4217) and to wrap data connections when
-	// the client selects PROT P. A nil value disables FTPS — the AUTH
-	// command will be refused with 502.
+	// ftpTLSConfig is the immutable template used to derive a private pair of
+	// control/data TLS configs for each FTP session that issues AUTH TLS. A nil
+	// value disables FTPS — the AUTH command will be refused with 502.
 	ftpTLSConfig *tls.Config
-	// ftpDataTLSConfig mirrors ftpTLSConfig but additionally requires that
-	// every incoming data-connection handshake resume an existing TLS
-	// session (DidResume == true). Sharing the session-ticket key with
-	// ftpTLSConfig binds data connections to a session this server issued
-	// on the control channel, frustrating data-channel hijack attempts.
-	ftpDataTLSConfig *tls.Config
-	// ftpTLSConfigErr records a fatal error encountered while deriving the
-	// FTP TLS configs in NewServer (e.g. the system CSPRNG failing). It is
-	// surfaced at startup by prepareForListen so the server refuses to run
-	// rather than silently serving FTPS with broken session resumption.
+	// ftpTLSConfigErr records a fatal validation error in the supplied FTP TLS
+	// template. It is surfaced at startup by prepareForListen.
 	ftpTLSConfigErr error
 	// ftpRequireTLS, when true, refuses USER/PASS until the control connection
 	// has been wrapped with AUTH TLS and refuses data transfers until the client
@@ -590,11 +581,13 @@ type Config struct {
 	FtpAllowActiveMode bool
 	// FtpTLSConfig, when non-nil, enables explicit FTPS (RFC 4217). The
 	// AUTH TLS command upgrades the control connection using this config,
-	// and PROT P wraps the data connection. A separate config is derived
-	// internally for data connections to require session resumption from
-	// the control channel; callers should populate Certificates (or a
-	// GetCertificate callback) but otherwise leave session-ticket settings
-	// at their defaults. Leave nil to disable FTPS.
+	// and PROT P wraps the data connection. A private config pair and ticket
+	// key are derived for each control session so data connections can only
+	// resume that control session. Callers should populate Certificates (or a
+	// GetCertificate callback) but otherwise leave session-ticket settings at
+	// their defaults. Custom WrapSession and UnwrapSession callbacks are not
+	// supported because they can bypass the control-session binding. Leave nil
+	// to disable FTPS.
 	FtpTLSConfig *tls.Config
 	// FtpRequireTLS, when true, refuses USER/PASS over the FTP control
 	// connection until AUTH TLS has succeeded and refuses data-transfer
@@ -803,62 +796,82 @@ func NewServer(config *Config) *Server {
 		activeConns:                make(map[net.Conn]string),
 	}
 	if config.FtpTLSConfig != nil {
-		s.ftpTLSConfig, s.ftpDataTLSConfig, s.ftpTLSConfigErr = deriveFTPTLSConfigs(config.FtpTLSConfig)
+		s.ftpTLSConfig = config.FtpTLSConfig.Clone()
+		s.ftpTLSConfigErr = validateFTPTLSSessionCallbacks(s.ftpTLSConfig)
 	}
 	return s
 }
 
-// deriveFTPTLSConfigs returns the *tls.Config used for the control channel
-// and a sibling *tls.Config used for data connections. The two configs share
-// a freshly generated session-ticket key so a ticket issued during the
-// control-channel handshake can be redeemed on the data connection. The
-// data config additionally requires DidResume == true via VerifyConnection,
-// which is the defense against data-channel hijack: only a peer that
-// presents a session ticket this server issued can complete the data
-// handshake, so an attacker who steals the data port cannot mount a fresh
-// handshake with their own certificate.
-//
-// Sharing a key across two Clone()d configs is the only way to bind data
-// sessions to the control session that Go's public TLS API exposes — the
-// stdlib does not surface the control connection's session ticket bytes
-// to the data-conn handshake. We accept that limitation: a successful
-// handshake proves the peer holds *some* ticket from this server, not
-// specifically the ticket from *this* control connection. In practice this
-// is what mainstream FTPS servers do, and it raises the bar significantly
-// over a no-binding implementation.
-func deriveFTPTLSConfigs(base *tls.Config) (control, data *tls.Config, err error) {
-	control = base.Clone()
-	// SessionTicketsDisabled defaults to false (tickets enabled); leave it
-	// alone so callers can opt out if they really need to.
-	if !control.SessionTicketsDisabled {
-		var key [32]byte
-		if _, err := rand.Read(key[:]); err != nil {
-			// A CSPRNG failure is catastrophic. Returning an error is far
-			// safer than degrading: if we skipped SetSessionTicketKeys the
-			// two cloned configs would auto-generate independent ticket
-			// keys, DidResume could never be true, and PROT P would break
-			// silently for every data connection.
-			return nil, nil, fmt.Errorf("ftps: generating session ticket key: %w", err)
-		}
-		control.SetSessionTicketKeys([][32]byte{key})
+// deriveFTPSessionTLSConfigs returns a private control/data config pair for a
+// single FTP control session. Both configs receive the same freshly generated
+// ticket key, while every other control session gets a different key. A data
+// handshake can therefore resume only a TLS session minted for its own control
+// connection, even when an attacker shares the same source IP.
+func deriveFTPSessionTLSConfigs(base *tls.Config) (control, data *tls.Config, err error) {
+	var key [32]byte
+	if _, err := rand.Read(key[:]); err != nil {
+		return nil, nil, fmt.Errorf("ftps: generating control-session ticket key: %w", err)
 	}
-	data = control.Clone()
-	// The control-channel VerifyConnection (if any) still applies via
-	// Clone, but we layer the resumption check on top. Capture the
-	// user-supplied callback so we run it first, then enforce DidResume.
-	userVerify := data.VerifyConnection
-	data.VerifyConnection = func(cs tls.ConnectionState) error {
+
+	control, err = bindFTPTLSConfigToSession(base, key, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	data, err = bindFTPTLSConfigToSession(base, key, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	return control, data, nil
+}
+
+// bindFTPTLSConfigToSession clones base, installs the session-specific ticket
+// key, and optionally requires resumption. GetConfigForClient needs special
+// handling because a config returned by that callback replaces VerifyConnection
+// and may carry its own ticket keys; clone and harden every returned config too.
+func bindFTPTLSConfigToSession(base *tls.Config, key [32]byte, requireResume bool) (*tls.Config, error) {
+	if err := validateFTPTLSSessionCallbacks(base); err != nil {
+		return nil, err
+	}
+
+	config := base.Clone()
+	config.SetSessionTicketKeys([][32]byte{key})
+	if requireResume {
+		requireFTPTLSResumption(config)
+	}
+
+	userGetConfig := config.GetConfigForClient
+	if userGetConfig != nil {
+		config.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			selected, err := userGetConfig(hello)
+			if err != nil || selected == nil {
+				return selected, err
+			}
+			return bindFTPTLSConfigToSession(selected, key, requireResume)
+		}
+	}
+	return config, nil
+}
+
+func validateFTPTLSSessionCallbacks(config *tls.Config) error {
+	if config.WrapSession != nil || config.UnwrapSession != nil {
+		return errors.New("ftps: custom TLS session wrapping is incompatible with control-session data binding")
+	}
+	return nil
+}
+
+func requireFTPTLSResumption(config *tls.Config) {
+	userVerify := config.VerifyConnection
+	config.VerifyConnection = func(state tls.ConnectionState) error {
 		if userVerify != nil {
-			if err := userVerify(cs); err != nil {
+			if err := userVerify(state); err != nil {
 				return err
 			}
 		}
-		if !cs.DidResume {
-			return errors.New("ftps: data connection must resume the control-channel TLS session")
+		if !state.DidResume {
+			return errors.New("ftps: data connection must resume its control-channel TLS session")
 		}
 		return nil
 	}
-	return control, data, nil
 }
 
 func generateEphemeralSigner() (ssh.Signer, error) {
@@ -1139,8 +1152,8 @@ func (s *Server) ListenAndServe() error {
 }
 
 // prepareForListen runs the startup checks that must succeed before any
-// listener is opened: a signer is available, and the running kernel supports
-// the openat2 containment primitive.
+// listener is opened: the FTPS config is valid, a signer is available, and the
+// running kernel supports the openat2 containment primitive.
 func (s *Server) prepareForListen() error {
 	if s.ftpTLSConfigErr != nil {
 		return fmt.Errorf("ironport: %w", s.ftpTLSConfigErr)
@@ -2375,6 +2388,12 @@ type ftpSession struct {
 	// keeping a typed pointer avoids repeated type assertions in PROT and
 	// data-conn setup paths.
 	tlsConn *tls.Conn
+	// controlTLSConfig and dataTLSConfig form a capability private to this
+	// control connection. They share one random ticket key that no other FTP
+	// session receives; the data config also requires successful resumption.
+	// The pair is retained across REIN because REIN does not replace the
+	// current TLS control transport.
+	controlTLSConfig, dataTLSConfig *tls.Config
 	// pbszSet records that the client has sent PBSZ. PROT may only be
 	// accepted after PBSZ per RFC 4217 §9.
 	pbszSet bool
@@ -2405,7 +2424,6 @@ func (s *Server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- Co
 		_ = nc.Close()
 		ctl := sess.ctlMsg
 		if ctl != nil {
-			//nolint:revive // empty block intentionally drains the channel until close
 			for range ctl {
 			}
 		}
@@ -2941,6 +2959,16 @@ func (f *ftpSession) cmdAuth(arg string) {
 		return
 	}
 
+	// Derive the private ticket key before sending 234. Once the client sees
+	// that reply it immediately sends a ClientHello, so setup failures after
+	// that point can only be handled by tearing down the connection.
+	controlConfig, dataConfig, err := deriveFTPSessionTLSConfigs(f.server.ftpTLSConfig)
+	if err != nil {
+		log.Printf("ftp AUTH TLS setup from=%s: %v", f.conn.RemoteAddr(), err)
+		_ = f.reply(451, "unable to initialize TLS")
+		return
+	}
+
 	// Suspend the reader so the channel-clean check sees a stable f.r /
 	// f.ctlMsg and so it cannot consume the client's post-234 ClientHello.
 	f.stopReader()
@@ -2950,6 +2978,8 @@ func (f *ftpSession) cmdAuth(arg string) {
 		return
 	}
 
+	f.controlTLSConfig = controlConfig
+	f.dataTLSConfig = dataConfig
 	if err := f.reply(234, "ready for TLS"); err != nil {
 		return
 	}
@@ -3035,9 +3065,15 @@ func (f *ftpSession) resetSessionStateForAuthTLS() {
 }
 
 func (f *ftpSession) performTLSHandshake() bool {
+	if f.controlTLSConfig == nil {
+		log.Printf("ftp AUTH TLS handshake from=%s: control-session TLS config is unavailable", f.conn.RemoteAddr())
+		_ = f.conn.Close()
+		return false
+	}
+
 	deadline := time.Now().Add(ftpTLSHandshakeTimeout)
 	_ = f.conn.SetDeadline(deadline)
-	tlsConn := tls.Server(f.conn, f.server.ftpTLSConfig)
+	tlsConn := tls.Server(f.conn, f.controlTLSConfig)
 	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
 		log.Printf("ftp AUTH TLS handshake from=%s: %v", f.conn.RemoteAddr(), err)
 		_ = f.conn.Close()
@@ -3383,17 +3419,17 @@ func (f *ftpSession) acceptDataConn() (net.Conn, error) {
 	if f.dataProt != 'P' {
 		return dc, nil
 	}
-	// PROT P: wrap the raw data connection in TLS using the server's
-	// data-conn config, which enforces session resumption from the control
-	// channel (see deriveFTPTLSConfigs). A handshake failure tears the
-	// data connection down before any plaintext bytes can be exchanged.
-	if f.server.ftpDataTLSConfig == nil {
+	// PROT P: wrap the raw data connection in TLS using this control session's
+	// private data config. Its ticket key accepts only tickets minted on this
+	// control connection, and it additionally requires DidResume. A failure
+	// tears the data connection down before any plaintext bytes can be exchanged.
+	if f.dataTLSConfig == nil {
 		_ = dc.Close()
 		return nil, errors.New("PROT P requested but FTPS is not configured")
 	}
 	deadline := time.Now().Add(ftpTLSHandshakeTimeout)
 	_ = dc.SetDeadline(deadline)
-	tc := tls.Server(dc, f.server.ftpDataTLSConfig)
+	tc := tls.Server(dc, f.dataTLSConfig)
 	if err := tc.HandshakeContext(context.Background()); err != nil {
 		_ = dc.Close()
 		return nil, fmt.Errorf("data tls handshake: %w", err)
@@ -3932,9 +3968,9 @@ func (f *ftpSession) cmdHost(arg string) {
 // authentication state and returns the session to the pre-login state without
 // closing the control connection. Any pending data transfer is aborted.
 //
-// RFC 4217 §10.1 keeps the TLS control session itself live across REIN, but
-// the data-channel protection level resets to the default (Clear) and PBSZ
-// must be re-issued before a subsequent PROT.
+// This implementation currently keeps the TLS control transport live across
+// REIN, while resetting the data-channel protection level to Clear. PBSZ must
+// be re-issued before a subsequent PROT.
 func (f *ftpSession) cmdRein() {
 	f.closeDataEndpoint()
 	f.logoutIfAuthenticated()

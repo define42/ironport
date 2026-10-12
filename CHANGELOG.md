@@ -43,9 +43,13 @@ and patch releases; breaking API changes require a major version bump.
   complete — while jailed filesystem operations are still in flight.
 - Added `Config.FtpPassiveAdvertisedIP` to override the IPv4 address sent in
   the `PASV` reply, for deployments behind NAT or a port-forward.
-- `deriveFTPTLSConfigs` now fails fast (surfaced at `ListenAndServe`) if the
-  system CSPRNG fails while generating the shared session-ticket key, instead
-  of silently breaking `PROT P` session resumption.
+- FTPS session tickets now use a distinct key for each `AUTH TLS` control
+  connection. A ticket obtained from another, even unauthenticated, control
+  connection can no longer resume a victim's `PROT P` data connection when
+  the clients share one source IP. Configs selected by `GetConfigForClient`
+  are hardened with the same key and resumption check; custom
+  `WrapSession`/`UnwrapSession` callbacks are rejected because they could
+  bypass the binding.
 - The FTP control idle timeout now sends a `421` reply before closing the
   connection instead of dropping it silently.
 - `STOR`/`APPE` now open the destination file before sending `150` and
@@ -61,11 +65,12 @@ and patch releases; breaking API changes require a major version bump.
   the `AUTH TLS`, `PBSZ`, and `PROT` commands on the FTP listener; set
   `Config.FtpRequireTLS` to refuse `USER`/`PASS` until the control connection
   is wrapped in TLS. `PROT P` data connections are TLS-wrapped using a
-  derived config that requires session resumption from the control channel
-  (defense against data-channel hijack), the buffered-bytes injection attack
-  against `AUTH TLS` is detected and the connection torn down, and every
-  TLS-wrapped data transfer is half-closed with `close_notify` so clients
-  can distinguish a complete transfer from a truncated one.
+  per-control-session config and ticket key that require resumption from that
+  exact control connection (defense against data-channel hijack), the
+  buffered-bytes injection attack against `AUTH TLS` is detected and the
+  connection torn down, and every TLS-wrapped data transfer is half-closed
+  with `close_notify` so clients can distinguish a complete transfer from a
+  truncated one.
 
 ## v1.0.10 - 2026-05-14
 

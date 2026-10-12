@@ -238,6 +238,10 @@ config.FtpRequireTLS = true
 srv := ironport.NewServer(config)
 ```
 
+`WrapSession` and `UnwrapSession` must remain unset: custom ticket handling
+could bypass the control-session binding, so the server rejects such FTPS
+configs at startup.
+
 The implementation covers the three FTPS implementation traps that are easy
 to get wrong:
 
@@ -245,11 +249,12 @@ to get wrong:
   server verifies the receive buffer is empty before starting the TLS
   handshake. A man-in-the-middle on the plaintext segment cannot pipeline
   attacker-controlled commands behind the legitimate `AUTH TLS` line.
-- **Data-channel binding** — `PROT P` data connections are required to
-  resume the TLS session from the control channel; the server's
-  data-connection `tls.Config` enforces `DidResume == true` via
-  `VerifyConnection`. A peer that hijacks the data port cannot mount a
-  fresh handshake with its own certificate.
+- **Data-channel binding** — every `AUTH TLS` control connection receives a
+  private session-ticket key shared only with its data-connection config.
+  `PROT P` also enforces `DidResume == true`, so a ticket obtained from a
+  different control connection is rejected even when both clients share one
+  public IP. A peer that hijacks the data port cannot mount a fresh handshake
+  or reuse a ticket from another session.
 - **Clean `close_notify` on transfers** — every TLS-wrapped data
   connection is half-closed with `CloseWrite` before the underlying
   socket is closed, so the client sees a proper TLS EOF and can
