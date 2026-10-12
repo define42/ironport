@@ -1,8 +1,8 @@
 module github.com/define42/ironport
 
-go 1.26.0
+go 1.26.9
 
-toolchain go1.26.4
+toolchain go1.27.2
 
 require (
 	github.com/pkg/sftp v1.13.11
