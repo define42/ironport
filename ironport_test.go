@@ -5297,6 +5297,21 @@ func TestServer_EffectiveFTPDataAcceptTimeout(t *testing.T) {
 	}
 }
 
+func TestFTPSession_AcceptDataConnRequiresPrivateProtection(t *testing.T) {
+	fs := &ftpSession{
+		server:   &Server{ftpRequireTLS: true},
+		dataProt: 'C',
+	}
+	dc, err := fs.acceptDataConn()
+	if dc != nil {
+		_ = dc.Close()
+		t.Fatal("acceptDataConn returned a connection without PROT P")
+	}
+	if !errors.Is(err, errFTPDataProtectionRequired) {
+		t.Fatalf("acceptDataConn error = %v; want %v", err, errFTPDataProtectionRequired)
+	}
+}
+
 func TestFTPSession_AcceptDataConnUsesConfiguredTimeout(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -7145,6 +7160,37 @@ func (c *ftpsTestClient) passiveDial() net.Conn {
 	return dc
 }
 
+// expectDataProtectionRequired verifies that a prepared data transfer is
+// rejected before the server emits 150 or touches the target file.
+func (c *ftpsTestClient) expectDataProtectionRequired(command string) {
+	c.t.Helper()
+	dc := c.passiveDial()
+	defer func() { _ = dc.Close() }()
+
+	if got := c.command(534, "%s", command); got != errFTPDataProtectionRequired.Error() {
+		c.t.Fatalf("%s response = %q; want %q", command, got, errFTPDataProtectionRequired)
+	}
+}
+
+// storeProtected uploads payload over a PROT P data connection.
+func (c *ftpsTestClient) storeProtected(filename string, payload []byte) {
+	c.t.Helper()
+	raw := c.passiveDial()
+	defer func() { _ = raw.Close() }()
+
+	c.send("STOR %s", filename)
+	c.read(150)
+	tc := c.upgradeDataConn(raw)
+	if _, err := tc.Write(payload); err != nil {
+		c.t.Fatalf("write protected upload: %v", err)
+	}
+	if err := tc.CloseWrite(); err != nil {
+		c.t.Fatalf("close protected upload: %v", err)
+	}
+	_ = tc.Close()
+	c.read(226)
+}
+
 // upgradeDataConn drives the client-side TLS handshake on an FTP data
 // connection. It must be called only after the server has replied 150 to
 // the transfer command.
@@ -7216,7 +7262,7 @@ func TestFTPS_MFMTSetsModificationTime(t *testing.T) {
 func TestFTPS_PROTDataConnRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	users := map[string]UserInfo{"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true}}
-	cfg, pool := newTestFTPSConfig(t, users, false)
+	cfg, pool := newTestFTPSConfig(t, users, true)
 	_, addr, stop := startTestFTPServerWithConfig(t, cfg)
 	defer stop()
 
@@ -7334,6 +7380,121 @@ func TestFTPS_RequireTLSRejectsCleartextLogin(t *testing.T) {
 	}
 	if code != 534 {
 		t.Fatalf("USER over plaintext: got %d; want 534", code)
+	}
+}
+
+func TestFTPS_RequireTLSRejectsUnprotectedDataCommands(t *testing.T) {
+	root := t.TempDir()
+	existingPath := filepath.Join(root, "existing.txt")
+	original := []byte("original content")
+	if err := os.WriteFile(existingPath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
+	}
+	cfg, pool := newTestFTPSConfig(t, users, true)
+	_, addr, stop := startTestFTPServerWithConfig(t, cfg)
+	defer stop()
+
+	c := dialFTPS(t, addr, pool)
+	c.authTLS()
+	c.login("alice", "alicepw")
+	// PBSZ alone does not protect the data channel; PROT P is mandatory.
+	c.command(200, "PBSZ 0")
+
+	c.expectDataProtectionRequired("LIST")
+	c.expectDataProtectionRequired("NLST")
+	c.expectDataProtectionRequired("MLSD")
+	c.expectDataProtectionRequired("RETR existing.txt")
+	c.expectDataProtectionRequired("STOR existing.txt")
+	c.expectDataProtectionRequired("STOR created-by-stor.txt")
+	c.expectDataProtectionRequired("APPE existing.txt")
+	c.expectDataProtectionRequired("APPE created-by-appe.txt")
+	// Rejected transfers must consume one-shot REST and ALLO hints.
+	c.command(350, "REST 4")
+	c.command(200, "ALLO 999")
+	c.expectDataProtectionRequired("STOR hinted.txt")
+	c.command(200, "NOOP")
+
+	got, err := os.ReadFile(existingPath) //nolint:gosec // path under t.TempDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("existing file changed after rejected transfer: got %q; want %q", got, original)
+	}
+	if _, err := os.Stat(filepath.Join(root, "created-by-stor.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected STOR created a file: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "created-by-appe.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected APPE created a file: %v", err)
+	}
+	hintedPath := filepath.Join(root, "hinted.txt")
+	if _, err := os.Stat(hintedPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("policy-rejected hinted STOR created a file: %v", err)
+	}
+
+	// A later protected upload must not inherit the rejected transfer's hints.
+	c.command(200, "PROT P")
+	protectedPayload := []byte("protected upload")
+	c.storeProtected("hinted.txt", protectedPayload)
+	got, err = os.ReadFile(hintedPath) //nolint:gosec // path under t.TempDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, protectedPayload) {
+		t.Fatalf("protected upload inherited stale transfer hints: got %q; want %q", got, protectedPayload)
+	}
+}
+
+func TestFTPS_RequireTLSRequiresPROTPAfterREIN(t *testing.T) {
+	root := t.TempDir()
+	existingPath := filepath.Join(root, "existing.txt")
+	original := []byte("original content")
+	if err := os.WriteFile(existingPath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
+	}
+	cfg, pool := newTestFTPSConfig(t, users, true)
+	_, addr, stop := startTestFTPServerWithConfig(t, cfg)
+	defer stop()
+
+	c := dialFTPS(t, addr, pool)
+	c.authTLS()
+	c.login("alice", "alicepw")
+	c.command(200, "PBSZ 0")
+	c.command(200, "PROT P")
+	c.command(220, "REIN")
+	c.login("alice", "alicepw")
+
+	// REIN keeps the control TLS session but resets PBSZ and PROT.
+	c.command(503, "PROT P")
+	c.command(200, "PBSZ 0")
+	c.expectDataProtectionRequired("STOR existing.txt")
+
+	got, err := os.ReadFile(existingPath) //nolint:gosec // path under t.TempDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("existing file changed after REIN policy rejection: got %q; want %q", got, original)
+	}
+
+	// The session can recover by negotiating private data protection again.
+	c.command(200, "PROT P")
+	protectedPayload := []byte("protected after REIN")
+	c.storeProtected("existing.txt", protectedPayload)
+	got, err = os.ReadFile(existingPath) //nolint:gosec // path under t.TempDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, protectedPayload) {
+		t.Fatalf("post-REIN protected upload = %q; want %q", got, protectedPayload)
 	}
 }
 

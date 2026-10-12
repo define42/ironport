@@ -220,9 +220,9 @@ YYYYMMDDHHMMSS path`.
 
 Set `FtpTLSConfig` to a `*tls.Config` that carries the server certificate to
 advertise `AUTH TLS`, `PBSZ`, and `PROT` over the FTP listener. Set
-`FtpRequireTLS = true` to refuse `USER`/`PASS` until the control connection
-has been upgraded — this is the recommended mode for any FTP listener that
-faces an untrusted network.
+`FtpRequireTLS = true` to require `AUTH TLS` before `USER`/`PASS` and
+`PBSZ` followed by `PROT P` before any data transfer. This is the
+recommended mode for any FTP listener that faces an untrusted network.
 
 ```go
 cert, err := tls.LoadX509KeyPair("ftps.crt", "ftps.key")

@@ -16,7 +16,7 @@
 //     FTP uses passive mode by default; active mode can be enabled explicitly.
 //   - Optional FTPS (RFC 4217 explicit TLS via AUTH TLS) over the FTP
 //     listener. Set Config.FtpTLSConfig to enable it and Config.FtpRequireTLS
-//     to refuse plaintext logins.
+//     to require protected login and data channels.
 //
 // Typical usage:
 //
@@ -143,9 +143,14 @@ const (
 	AuthEventLogout AuthEventType = "Logout"
 )
 
-// errFTPLineTooLong is returned when an FTP client sends a control-channel
-// command that exceeds ftpMaxControlLineLen bytes.
-var errFTPLineTooLong = errors.New("ftp control line too long")
+var (
+	// errFTPLineTooLong is returned when an FTP client sends a control-channel
+	// command that exceeds ftpMaxControlLineLen bytes.
+	errFTPLineTooLong = errors.New("ftp control line too long")
+	// errFTPDataProtectionRequired is returned when a require-TLS session tries
+	// to transfer data without first negotiating PBSZ followed by PROT P.
+	errFTPDataProtectionRequired = errors.New("PROT P required before data transfer")
+)
 
 // errSFTPRequestFailed is returned to SFTP clients for unknown backend errors
 // so internal paths and server details are not exposed.
@@ -482,9 +487,9 @@ type Server struct {
 	// surfaced at startup by prepareForListen so the server refuses to run
 	// rather than silently serving FTPS with broken session resumption.
 	ftpTLSConfigErr error
-	// ftpRequireTLS, when true, refuses USER/PASS until the control
-	// connection has been wrapped with AUTH TLS. Set this for deployments
-	// that expose the FTP listener but want to forbid plaintext logins.
+	// ftpRequireTLS, when true, refuses USER/PASS until the control connection
+	// has been wrapped with AUTH TLS and refuses data transfers until the client
+	// has negotiated PBSZ followed by PROT P.
 	ftpRequireTLS bool
 	// users maps usernames to their credentials and jail roots.
 	users map[string]UserInfo
@@ -592,9 +597,10 @@ type Config struct {
 	// at their defaults. Leave nil to disable FTPS.
 	FtpTLSConfig *tls.Config
 	// FtpRequireTLS, when true, refuses USER/PASS over the FTP control
-	// connection until AUTH TLS has succeeded. Requires FtpTLSConfig to be
-	// set; otherwise the FTP listener would have no path to authentication
-	// and every login attempt would be rejected.
+	// connection until AUTH TLS has succeeded and refuses data-transfer
+	// commands until the client has negotiated PBSZ followed by PROT P.
+	// Requires FtpTLSConfig to be set; otherwise the FTP listener would have
+	// no path to authentication and every login attempt would be rejected.
 	FtpRequireTLS bool
 	// FtpPassiveAdvertisedIP optionally overrides the IPv4 address sent to
 	// clients in the PASV (227) reply. By default the control connection's
@@ -2720,6 +2726,17 @@ func (f *ftpSession) cmdPbsz() {
 }
 
 func (f *ftpSession) handleAuthenticatedCommand(cmd, arg string) {
+	if ftpCommandUsesDataConn(cmd) && f.server.ftpRequireTLS && f.dataProt != 'P' {
+		// REST and ALLO are one-shot hints. A policy-rejected transfer still
+		// consumes them so they cannot alter a later protected transfer.
+		switch cmd {
+		case "RETR", "STOR", "APPE":
+			f.consumeTransferHints()
+		}
+		f.closeDataEndpoint()
+		_ = f.reply(534, errFTPDataProtectionRequired.Error())
+		return
+	}
 	if handler, ok := authedFTPHandlers[cmd]; ok {
 		handler(f, arg)
 		return
@@ -2733,6 +2750,16 @@ func (f *ftpSession) handleAuthenticatedCommand(cmd, arg string) {
 	default:
 		_ = f.reply(502, "command not implemented")
 	}
+}
+
+// ftpCommandUsesDataConn reports whether cmd transfers its payload over a
+// separate FTP data connection rather than the protected control connection.
+func ftpCommandUsesDataConn(cmd string) bool {
+	switch cmd {
+	case "LIST", "NLST", "RETR", "STOR", "APPE", "MLSD":
+		return true
+	}
+	return false
 }
 
 // authedFTPHandlers maps each authenticated-only FTP verb to a handler. Keeping
@@ -3345,6 +3372,10 @@ func parseFTPEPRTArg(arg string) (*net.TCPAddr, error) {
 }
 
 func (f *ftpSession) acceptDataConn() (net.Conn, error) {
+	if f.server.ftpRequireTLS && f.dataProt != 'P' {
+		f.closeDataEndpoint()
+		return nil, errFTPDataProtectionRequired
+	}
 	dc, err := f.dialOrAcceptDataConn()
 	if err != nil {
 		return nil, err
