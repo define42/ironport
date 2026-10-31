@@ -15,6 +15,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/define42/ironport/internal/jailfs"
 )
 
 var (
@@ -126,7 +128,7 @@ type ftpSession struct {
 	// fs is the fd-relative filesystem backing this session's jail. It is
 	// constructed by authenticate on successful login and released when the
 	// session ends (closeJail). Until login succeeds it is nil.
-	fs *jailFS
+	fs *jailfs.FS
 	// tlsConn is non-nil once the control connection has been wrapped via
 	// AUTH TLS. f.conn is set to the same *tls.Conn value in that case;
 	// keeping a typed pointer avoids repeated type assertions in PROT and
@@ -396,7 +398,7 @@ func (f *ftpSession) authenticate(pass string) bool {
 	// on the running kernel this fails and the login is rejected, preserving
 	// the package's hardened guarantee that all subsequent FTP commands
 	// operate via openat2.
-	jfs, err := openJailFS(jailRoot)
+	jfs, err := jailfs.Open(jailRoot)
 	if err != nil {
 		log.Printf("ftp open jail root %q for user %q: %v", jailRoot, f.username, err)
 		return false

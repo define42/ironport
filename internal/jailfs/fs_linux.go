@@ -1,4 +1,4 @@
-// Package ironport: jail filesystem backend built on Linux openat2.
+// Package jailfs provides a jailed filesystem backend built on Linux openat2.
 //
 // This file implements the "no symlinks anywhere" filesystem policy by
 // performing every per-request filesystem operation through file descriptors
@@ -17,8 +17,7 @@
 //
 // Setting access/modification times (SFTP Acmodtime) is performed through an
 // openat2-obtained fd, so timestamp updates follow the same containment policy.
-
-package ironport
+package jailfs
 
 import (
 	"errors"
@@ -55,7 +54,7 @@ var (
 // against /. The result is cached after the first successful probe. Callers
 // that need this guarantee at startup (e.g. before reporting a configured
 // jail root) can invoke it directly; it is also invoked transparently by
-// openJailFS on every jail creation.
+// Open on every jail creation.
 func probeOpenat2() error {
 	openat2ProbeOnce.Do(func() {
 		fd, err := unix.Openat2(unix.AT_FDCWD, "/", &unix.OpenHow{
@@ -75,15 +74,15 @@ func probeOpenat2() error {
 	return openat2ProbeErr
 }
 
-// ensureOpenat2 is exposed for callers that want to fail at startup rather
-// than at first request when openat2 is unavailable.
-func ensureOpenat2() error { return probeOpenat2() }
+// CheckSupport checks whether openat2 is available so callers can fail at
+// startup rather than at the first filesystem request.
+func CheckSupport() error { return probeOpenat2() }
 
-// cleanRelClientPath normalises a client-supplied path into a slash-separated,
+// CleanPath normalises a client-supplied path into a slash-separated,
 // jail-relative path suitable for openat2(rootFd, ...). The result never
 // starts with "/" and never contains "." or ".." segments after cleaning.
 // The jail root itself is represented as ".".
-func cleanRelClientPath(p string) string {
+func CleanPath(p string) string {
 	p = filepath.ToSlash(p)
 	p = path.Clean("/" + p)
 	if p == "/" {
@@ -107,25 +106,25 @@ func splitParent(rel string) (string, string) {
 	return dir, base
 }
 
-// jailFS encapsulates a fd-relative, no-symlink filesystem rooted at a single
+// FS encapsulates a fd-relative, no-symlink filesystem rooted at a single
 // directory. Every method validates the path through the kernel using
 // openat2; no string-level resolution or pre-check is performed.
 //
 // Methods are safe for concurrent use; the only mutable state is the root fd
 // which is set at construction and closed at teardown.
-type jailFS struct {
+type FS struct {
 	root   string // textual jail root, for constructing client-visible full paths
 	rootFd int    // O_PATH fd to the jail root; closed by Close
 }
 
-// openJailFS opens a jail root at the given on-disk path and returns a
-// jailFS whose root fd refers to that directory. The path is opened with
+// Open opens a jail root at the given on-disk path and returns a
+// FS whose root fd refers to that directory. The path is opened with
 // O_PATH|O_DIRECTORY|O_NOFOLLOW so the root itself cannot be substituted by
 // a symlink at construction time.
 //
 // openat2 availability is verified on first use; if the running kernel does
 // not support it the call returns errOpenat2Unsupported.
-func openJailFS(root string) (*jailFS, error) {
+func Open(root string) (*FS, error) {
 	if err := probeOpenat2(); err != nil {
 		return nil, err
 	}
@@ -133,11 +132,11 @@ func openJailFS(root string) (*jailFS, error) {
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: root, Err: err}
 	}
-	return &jailFS{root: root, rootFd: fd}, nil
+	return &FS{root: root, rootFd: fd}, nil
 }
 
 // Close releases the jail root fd. After Close, further calls return EBADF.
-func (j *jailFS) Close() error {
+func (j *FS) Close() error {
 	if j == nil || j.rootFd < 0 {
 		return nil
 	}
@@ -153,7 +152,7 @@ const resolveFlags = unix.RESOLVE_IN_ROOT | unix.RESOLVE_NO_SYMLINKS
 
 // openat opens a path relative to the jail root with the given flags and
 // permission. Symlinks in any component cause the call to fail.
-func (j *jailFS) openat(rel string, flags int, perm os.FileMode) (int, error) {
+func (j *FS) openat(rel string, flags int, perm os.FileMode) (int, error) {
 	// flags is a set of unix open(2) bit constants, never negative; the
 	// conversion to uint64 cannot overflow.
 	fd, err := unix.Openat2(j.rootFd, rel, &unix.OpenHow{
@@ -167,15 +166,15 @@ func (j *jailFS) openat(rel string, flags int, perm os.FileMode) (int, error) {
 	return fd, nil
 }
 
-// fullPath returns the on-disk path that corresponds to a client-supplied
+// FullPath returns the on-disk path that corresponds to a client-supplied
 // path. The argument is cleaned and confined to the jail relative form
 // before being joined to the textual root, so callers may pass raw client
 // input. Because openat2 with RESOLVE_NO_SYMLINKS guarantees that no
 // symlink is traversed when this path is actually used, simple string
 // concatenation here yields the actual on-disk path. This is used purely
 // for reporting (e.g. CompletedUpload.FullFilePath).
-func (j *jailFS) fullPath(clientPath string) string {
-	rel := cleanRelClientPath(clientPath)
+func (j *FS) FullPath(clientPath string) string {
+	rel := CleanPath(clientPath)
 	if rel == "." || rel == "" {
 		return filepath.Clean(j.root)
 	}
@@ -184,8 +183,8 @@ func (j *jailFS) fullPath(clientPath string) string {
 
 // OpenRead opens a regular file for reading. Symlinks anywhere in the path
 // (including the final component) cause the call to fail with EACCES/ELOOP.
-func (j *jailFS) OpenRead(clientPath string) (*os.File, error) {
-	rel := cleanRelClientPath(clientPath)
+func (j *FS) OpenRead(clientPath string) (*os.File, error) {
+	rel := CleanPath(clientPath)
 	fd, err := j.openat(rel, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: clientPath, Err: err}
@@ -197,8 +196,8 @@ func (j *jailFS) OpenRead(clientPath string) (*os.File, error) {
 // pass the standard os.O_* flags (typically O_CREATE|O_WRONLY|O_TRUNC for
 // uploads, or |O_APPEND for FTP APPE). The file is opened through openat2 so
 // the kernel rejects symlink traversal at all components.
-func (j *jailFS) OpenWrite(clientPath string, flags int, perm os.FileMode) (*os.File, error) {
-	rel := cleanRelClientPath(clientPath)
+func (j *FS) OpenWrite(clientPath string, flags int, perm os.FileMode) (*os.File, error) {
+	rel := CleanPath(clientPath)
 	if flags&os.O_CREATE == 0 {
 		perm = 0
 	}
@@ -213,8 +212,8 @@ func (j *jailFS) OpenWrite(clientPath string, flags int, perm os.FileMode) (*os.
 // RESOLVE_NO_SYMLINKS rejects symlink components, the result is always the
 // stat of a non-symlink. (Lstat is redundant under this policy and is mapped
 // to the same call.)
-func (j *jailFS) Stat(clientPath string) (os.FileInfo, error) {
-	rel := cleanRelClientPath(clientPath)
+func (j *FS) Stat(clientPath string) (os.FileInfo, error) {
+	rel := CleanPath(clientPath)
 	fd, err := j.openat(rel, unix.O_PATH, 0)
 	if err != nil {
 		return nil, &os.PathError{Op: "stat", Path: clientPath, Err: err}
@@ -236,7 +235,7 @@ func (j *jailFS) Stat(clientPath string) (os.FileInfo, error) {
 // Entries are stat'd via fstatat against the directory fd so the per-entry
 // metadata lookup also goes through the openat2-rooted directory and never
 // follows a symlink.
-func (j *jailFS) List(clientPath string) ([]os.FileInfo, error) {
+func (j *FS) List(clientPath string) ([]os.FileInfo, error) {
 	var out []os.FileInfo
 	if err := j.ListStream(clientPath, func(info os.FileInfo) error {
 		out = append(out, info)
@@ -259,13 +258,13 @@ const listStreamBatch = 512
 // unlink) are silently skipped — same tolerance as List. yield may
 // return a non-nil error to terminate the walk early; that error is
 // propagated to the caller unchanged.
-func (j *jailFS) ListStream(clientPath string, yield func(os.FileInfo) error) error {
-	rel := cleanRelClientPath(clientPath)
+func (j *FS) ListStream(clientPath string, yield func(os.FileInfo) error) error {
+	rel := CleanPath(clientPath)
 	fd, err := j.openat(rel, os.O_RDONLY|unix.O_DIRECTORY, 0)
 	if err != nil {
 		return &os.PathError{Op: "open", Path: clientPath, Err: err}
 	}
-	f := os.NewFile(uintptr(fd), j.fullPath(rel))
+	f := os.NewFile(uintptr(fd), j.FullPath(rel))
 	defer func() { _ = f.Close() }()
 	for {
 		names, readErr := f.Readdirnames(listStreamBatch)
@@ -291,8 +290,8 @@ func (j *jailFS) ListStream(clientPath string, yield func(os.FileInfo) error) er
 // The parent directory must already exist and must not be reached through a
 // symlink. The new directory is created with mkdirat against an openat2 fd of
 // the parent, so a TOCTOU race between path check and mkdir is impossible.
-func (j *jailFS) Mkdir(clientPath string, perm os.FileMode) error {
-	rel := cleanRelClientPath(clientPath)
+func (j *FS) Mkdir(clientPath string, perm os.FileMode) error {
+	rel := CleanPath(clientPath)
 	parent, base := splitParent(rel)
 	if base == "" {
 		return &os.PathError{Op: "mkdir", Path: clientPath, Err: syscall.EEXIST}
@@ -315,8 +314,8 @@ func (j *jailFS) Mkdir(clientPath string, perm os.FileMode) error {
 // jail. Directories that already exist are left untouched; it is an error if a
 // component along the path exists as a non-directory. Passing the jail root
 // (".", "" or "/") is a no-op.
-func (j *jailFS) MkdirAll(clientPath string, perm os.FileMode) error {
-	rel := cleanRelClientPath(clientPath)
+func (j *FS) MkdirAll(clientPath string, perm os.FileMode) error {
+	rel := CleanPath(clientPath)
 	if rel == "." || rel == "" {
 		return nil
 	}
@@ -339,8 +338,8 @@ func (j *jailFS) MkdirAll(clientPath string, perm os.FileMode) error {
 
 // removeAt is the shared implementation of Remove and Rmdir; flags is either
 // 0 (file unlink) or unix.AT_REMOVEDIR (directory unlink).
-func (j *jailFS) removeAt(clientPath string, flags int, op string) error {
-	rel := cleanRelClientPath(clientPath)
+func (j *FS) removeAt(clientPath string, flags int, op string) error {
+	rel := CleanPath(clientPath)
 	parent, base := splitParent(rel)
 	if base == "" {
 		return &os.PathError{Op: op, Path: clientPath, Err: syscall.EBUSY}
@@ -360,12 +359,12 @@ func (j *jailFS) removeAt(clientPath string, flags int, op string) error {
 // an openat2 with RESOLVE_NO_SYMLINKS, no symlink traversal is possible. The
 // final component is not followed by unlinkat, so a symlink at that position
 // is removed as a symlink (not its target) — consistent with os.Remove.
-func (j *jailFS) Remove(clientPath string) error {
+func (j *FS) Remove(clientPath string) error {
 	return j.removeAt(clientPath, 0, "remove")
 }
 
 // Rmdir removes an empty directory.
-func (j *jailFS) Rmdir(clientPath string) error {
+func (j *FS) Rmdir(clientPath string) error {
 	return j.removeAt(clientPath, unix.AT_REMOVEDIR, "rmdir")
 }
 
@@ -373,9 +372,9 @@ func (j *jailFS) Rmdir(clientPath string) error {
 // with RESOLVE_NO_SYMLINKS, so neither side may traverse a symlink. The
 // rename itself uses renameat2 with flags=0, preserving the os.Rename
 // semantics of overwriting an existing destination.
-func (j *jailFS) Rename(oldPath, newPath string) error {
-	oldRel := cleanRelClientPath(oldPath)
-	newRel := cleanRelClientPath(newPath)
+func (j *FS) Rename(oldPath, newPath string) error {
+	oldRel := CleanPath(oldPath)
+	newRel := CleanPath(newPath)
 	oldParent, oldBase := splitParent(oldRel)
 	newParent, newBase := splitParent(newRel)
 	if oldBase == "" || newBase == "" {
@@ -399,8 +398,8 @@ func (j *jailFS) Rename(oldPath, newPath string) error {
 
 // Chmod changes the permission bits of the entry at clientPath via fchmod on
 // an openat2-obtained fd. Symlinks anywhere in the path cause failure.
-func (j *jailFS) Chmod(clientPath string, perm os.FileMode) error {
-	rel := cleanRelClientPath(clientPath)
+func (j *FS) Chmod(clientPath string, perm os.FileMode) error {
+	rel := CleanPath(clientPath)
 	// Open read-only; fchmod requires a non-O_PATH fd on Linux.
 	fd, err := j.openat(rel, os.O_RDONLY, 0)
 	if err != nil {
@@ -428,8 +427,8 @@ func (j *jailFS) Chmod(clientPath string, perm os.FileMode) error {
 // Chown changes the owner/group of clientPath. The lookup goes through the
 // jail root with RESOLVE_NO_SYMLINKS, then fchownat with AT_EMPTY_PATH on a
 // fd opened with O_PATH operates atomically on the target.
-func (j *jailFS) Chown(clientPath string, uid, gid int) error {
-	rel := cleanRelClientPath(clientPath)
+func (j *FS) Chown(clientPath string, uid, gid int) error {
+	rel := CleanPath(clientPath)
 	fd, err := j.openat(rel, unix.O_PATH, 0)
 	if err != nil {
 		return &os.PathError{Op: "chown", Path: clientPath, Err: err}
@@ -443,8 +442,8 @@ func (j *jailFS) Chown(clientPath string, uid, gid int) error {
 
 // Truncate sets the file size at clientPath. The fd is obtained through
 // openat2 so symlink traversal is impossible.
-func (j *jailFS) Truncate(clientPath string, size int64) error {
-	rel := cleanRelClientPath(clientPath)
+func (j *FS) Truncate(clientPath string, size int64) error {
+	rel := CleanPath(clientPath)
 	fd, err := j.openat(rel, os.O_WRONLY, 0)
 	if err != nil {
 		return &os.PathError{Op: "truncate", Path: clientPath, Err: err}
@@ -459,8 +458,8 @@ func (j *jailFS) Truncate(clientPath string, size int64) error {
 // Chtimes changes the access and modification timestamps of clientPath. The
 // lookup goes through openat2 with RESOLVE_NO_SYMLINKS, then utimensat with
 // AT_EMPTY_PATH applies the timestamps to that fd without reopening by path.
-func (j *jailFS) Chtimes(clientPath string, atime, mtime time.Time) error {
-	rel := cleanRelClientPath(clientPath)
+func (j *FS) Chtimes(clientPath string, atime, mtime time.Time) error {
+	rel := CleanPath(clientPath)
 	fd, err := j.openat(rel, unix.O_PATH, 0)
 	if err != nil {
 		return &os.PathError{Op: "chtimes", Path: clientPath, Err: err}
@@ -478,8 +477,8 @@ func (j *jailFS) Chtimes(clientPath string, atime, mtime time.Time) error {
 
 // SetModTime changes only the modification timestamp of clientPath. The
 // access timestamp is left unchanged by passing UTIME_OMIT to utimensat.
-func (j *jailFS) SetModTime(clientPath string, mtime time.Time) error {
-	rel := cleanRelClientPath(clientPath)
+func (j *FS) SetModTime(clientPath string, mtime time.Time) error {
+	rel := CleanPath(clientPath)
 	fd, err := j.openat(rel, unix.O_PATH, 0)
 	if err != nil {
 		return &os.PathError{Op: "setmodtime", Path: clientPath, Err: err}

@@ -204,7 +204,7 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- C
 	// return until they have all finished. handleConn returning is what
 	// triggers untrackConn/connWG.Done in acceptLoop, which Shutdown waits
 	// on; without this wait, Shutdown could return while a jailed file
-	// operation is still in flight and jailFS.Close could race with it.
+	// operation is still in flight and jailfs.FS.Close could race with it.
 	var sessionWG sync.WaitGroup
 	defer sessionWG.Wait()
 

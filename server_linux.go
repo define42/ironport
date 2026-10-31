@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/define42/ironport/internal/jailfs"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -336,7 +337,7 @@ func (s *Server) prepareForListen() error {
 	// openat2(RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS), available since Linux
 	// 5.6. Fail fast at startup on older kernels rather than silently
 	// degrading the policy at first request.
-	if err := ensureOpenat2(); err != nil {
+	if err := jailfs.CheckSupport(); err != nil {
 		return fmt.Errorf("ironport: %w", err)
 	}
 	return nil

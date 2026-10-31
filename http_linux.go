@@ -28,6 +28,8 @@ import (
 	"os"
 	"path"
 	"strings"
+
+	"github.com/define42/ironport/internal/jailfs"
 )
 
 const (
@@ -159,7 +161,7 @@ func (s *Server) httpStoreUpload(w http.ResponseWriter, r *http.Request, usernam
 		writeHTTPStatus(w, http.StatusBadRequest)
 		return
 	}
-	jfs, err := openJailFS(jailRoot)
+	jfs, err := jailfs.Open(jailRoot)
 	if err != nil {
 		log.Printf("http open jail root %q for user %q: %v", jailRoot, username, err)
 		writeHTTPStatus(w, http.StatusInternalServerError)
@@ -187,7 +189,7 @@ type uploadResult struct {
 // returns one uploadResult per "file" part in request order. bodyOK is false
 // when the multipart stream itself was malformed (a client error); any parts
 // already stored before that point are still reported.
-func (s *Server) storeUploadParts(mr *multipart.Reader, jfs *jailFS, username, clientIP string) (results []uploadResult, bodyOK bool) {
+func (s *Server) storeUploadParts(mr *multipart.Reader, jfs *jailfs.FS, username, clientIP string) (results []uploadResult, bodyOK bool) {
 	for {
 		p, err := mr.NextPart()
 		if errors.Is(err, io.EOF) {
@@ -207,7 +209,7 @@ func (s *Server) storeUploadParts(mr *multipart.Reader, jfs *jailFS, username, c
 
 // storeUploadPart validates one "file" part's name, creates any missing parent
 // directories, streams it into the jail, and announces the completed upload.
-func (s *Server) storeUploadPart(jfs *jailFS, p *multipart.Part, username, clientIP string) uploadResult {
+func (s *Server) storeUploadPart(jfs *jailfs.FS, p *multipart.Part, username, clientIP string) uploadResult {
 	raw := uploadPartFilename(p)
 	clientPath, ok := sanitizeUploadPath(raw)
 	if !ok {
@@ -222,7 +224,7 @@ func (s *Server) storeUploadPart(jfs *jailFS, p *multipart.Part, username, clien
 		log.Printf("upload interrupted protocol=http user=%q path=%q: %v", username, clientPath, err)
 		return uploadResult{path: clientPath, serverErr: true}
 	}
-	s.announceHTTPUpload(username, clientIP, clientPath, jfs.fullPath(clientPath))
+	s.announceHTTPUpload(username, clientIP, clientPath, jfs.FullPath(clientPath))
 	return uploadResult{path: clientPath, stored: true}
 }
 
@@ -291,7 +293,7 @@ func uploadPartFilename(p *multipart.Part) string {
 // jail-relative destination path (always beginning with "/", e.g.
 // "/reports/q2.csv"). It rejects names that carry CR/LF or a NUL, name a
 // directory rather than a file (a trailing "/"), or resolve to the jail root
-// itself (".", "..", "/"). ".." segments are collapsed by cleanRelClientPath
+// itself (".", "..", "/"). ".." segments are collapsed by jailfs.CleanPath
 // and the jail's openat2 resolution is the actual containment guarantee; this
 // check only turns obviously bad names into a clean 400 rather than a
 // surprising filesystem error.
@@ -302,7 +304,7 @@ func sanitizeUploadPath(rawFilename string) (clientPath string, ok bool) {
 	if strings.HasSuffix(rawFilename, "/") {
 		return "", false // names a directory, not a file
 	}
-	rel := cleanRelClientPath(rawFilename)
+	rel := jailfs.CleanPath(rawFilename)
 	if rel == "." {
 		return "", false // resolves to the jail root; no file name
 	}
@@ -313,7 +315,7 @@ func sanitizeUploadPath(rawFilename string) (clientPath string, ok bool) {
 // overwriting any existing file (the same create/truncate semantics as an
 // SFTP/FTP STOR). The destination is opened through the jail's openat2 path so
 // symlink components and traversal are rejected by the kernel.
-func streamToJailFile(jfs *jailFS, clientPath string, src io.Reader) error {
+func streamToJailFile(jfs *jailfs.FS, clientPath string, src io.Reader) error {
 	f, err := jfs.OpenWrite(clientPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, httpUploadFilePerm)
 	if err != nil {
 		return err

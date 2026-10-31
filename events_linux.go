@@ -47,7 +47,7 @@ func publishUpload(uploads chan<- CompletedUpload, evt CompletedUpload) {
 // renamed from a deferred (temp-suffixed or dotfile) name to a final name that
 // is neither (matching is case-insensitive and the extension list comes from
 // Config.TempExtensions). The rename is only treated as a completed upload when
-// the destination is a regular file: jailFS.Rename also permits directory
+// the destination is a regular file: jailfs.FS.Rename also permits directory
 // renames (for example /.staging -> /staging), and announcing those as uploads
 // would deliver a false CompletedUpload event for a directory. destInfo is the
 // stat of the destination after the rename (nil if it could not be stat'd). It

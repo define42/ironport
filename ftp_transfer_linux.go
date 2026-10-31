@@ -269,7 +269,7 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 	if !f.finalizeUploadStatus(ftpPath, written, expectedSize, aborted, copyErr, closeErr) {
 		return
 	}
-	f.announceUpload(ftpPath, f.fs.fullPath(ftpPath))
+	f.announceUpload(ftpPath, f.fs.FullPath(ftpPath))
 	_ = f.reply(226, "transfer complete")
 }
 

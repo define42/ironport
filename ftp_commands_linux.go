@@ -672,7 +672,7 @@ func (f *ftpSession) cmdRnto(arg string) {
 	destInfo, _ := f.fs.Stat(newPath)
 	maybeAnnounceTempRename(f.uploads, f.tempExts, oldPath, destInfo, CompletedUpload{
 		Username:     f.username,
-		FullFilePath: f.fs.fullPath(newPath),
+		FullFilePath: f.fs.FullPath(newPath),
 		FilePath:     newPath,
 		ClientIP:     f.clientIP,
 		Protocol:     CompletedUploadProtocolFTP,

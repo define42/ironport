@@ -13,6 +13,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/define42/ironport/internal/jailfs"
 	"github.com/pkg/sftp"
 )
 
@@ -50,7 +51,7 @@ type jail struct {
 	// Its lifetime is bound to the session: jailedHandlers (SFTP) or
 	// ftpSession.openJail (FTP) creates it; the corresponding teardown path
 	// calls fs.Close() exactly once.
-	fs       *jailFS
+	fs       *jailfs.FS
 	username string
 	clientIP string
 	canRead  bool
@@ -204,7 +205,7 @@ func (j jail) Filewrite(r *sftp.Request) (writer io.WriterAt, err error) {
 	return &writeLogger{
 		File:         f,
 		filepath:     clientPath,
-		fullFilepath: j.fs.fullPath(r.Filepath),
+		fullFilepath: j.fs.FullPath(r.Filepath),
 		username:     j.username,
 		clientIP:     j.clientIP,
 		uploads:      j.uploads,
@@ -260,7 +261,7 @@ func (j jail) Filecmd(r *sftp.Request) (err error) {
 		destInfo, _ := j.fs.Stat(r.Target)
 		maybeAnnounceTempRename(j.uploads, j.tempExts, oldClientPath, destInfo, CompletedUpload{
 			Username:     j.username,
-			FullFilePath: j.fs.fullPath(r.Target),
+			FullFilePath: j.fs.FullPath(r.Target),
 			FilePath:     newClientPath,
 			ClientIP:     j.clientIP,
 			Protocol:     CompletedUploadProtocolSFTP,
@@ -381,8 +382,8 @@ func (j jail) applyTimes(r *sftp.Request, flags sftp.FileAttrFlags, attrs *sftp.
 	return nil
 }
 
-func jailedHandlers(root, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool) (sftp.Handlers, *jailFS, error) {
-	fs, err := openJailFS(filepath.Clean(root))
+func jailedHandlers(root, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool) (sftp.Handlers, *jailfs.FS, error) {
+	fs, err := jailfs.Open(filepath.Clean(root))
 	if err != nil {
 		return sftp.Handlers{}, nil, err
 	}
