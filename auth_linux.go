@@ -10,10 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
-	"strings"
-	"syscall"
 
+	"github.com/define42/ironport/internal/jailfs"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -77,35 +75,6 @@ func permissionsFor(u UserInfo, username, jailRoot string) *ssh.Permissions {
 	}
 }
 
-func canonicalJailRoot(root string) (string, error) {
-	if strings.TrimSpace(root) == "" {
-		return "", os.ErrInvalid
-	}
-
-	abs, err := filepath.Abs(filepath.Clean(root))
-	if err != nil {
-		return "", err
-	}
-
-	// Resolve the configured root before validating it. Broken symlinks in the
-	// jail root path intentionally reject the login/server start; a jail root
-	// must name a real directory at authentication time.
-	resolved, err := filepath.EvalSymlinks(abs)
-	if err != nil {
-		return "", err
-	}
-
-	st, err := os.Stat(resolved)
-	if err != nil {
-		return "", err
-	}
-	if !st.IsDir() {
-		return "", syscall.ENOTDIR
-	}
-
-	return resolved, nil
-}
-
 // checkPassword performs a SHA-256-normalized constant-time comparison between
 // stored and supplied passwords, and rejects empty stored/supplied credentials.
 func checkPassword(storedPw, suppliedPw string) bool {
@@ -132,7 +101,7 @@ func (s *Server) authenticateUser(username string, keyCheck func(stored UserInfo
 	if !keyCheck(u) || !ok {
 		return UserInfo{}, "", false
 	}
-	jailRoot, err := canonicalJailRoot(u.Root)
+	jailRoot, err := jailfs.CanonicalRoot(u.Root)
 	if err != nil {
 		return UserInfo{}, "", false
 	}
