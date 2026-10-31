@@ -320,7 +320,7 @@ func (j *FS) MkdirAll(clientPath string, perm os.FileMode) error {
 		return nil
 	}
 	prefix := ""
-	for _, segment := range strings.Split(rel, "/") {
+	for segment := range strings.SplitSeq(rel, "/") {
 		if prefix == "" {
 			prefix = segment
 		} else {
@@ -538,5 +538,5 @@ func (s *statFileInfo) ModTime() time.Time {
 	// 386) where those fields are int32.
 	return time.Unix(s.st.Mtim.Unix())
 }
-func (s *statFileInfo) IsDir() bool      { return s.Mode().IsDir() }
-func (s *statFileInfo) Sys() interface{} { return &s.st }
+func (s *statFileInfo) IsDir() bool { return s.Mode().IsDir() }
+func (s *statFileInfo) Sys() any    { return &s.st }

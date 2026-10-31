@@ -465,12 +465,10 @@ func (s *Server) spawnConnHandler(name string, nc net.Conn, handler func(net.Con
 // timeouts and transient syscall conditions such as running out of file
 // descriptors. Anything else is treated as potentially permanent.
 func isTransientAcceptError(err error) bool {
-	var ne net.Error
-	if errors.As(err, &ne) && ne.Timeout() {
+	if ne, ok := errors.AsType[net.Error](err); ok && ne.Timeout() {
 		return true
 	}
-	var se syscall.Errno
-	if errors.As(err, &se) {
+	if se, ok := errors.AsType[syscall.Errno](err); ok {
 		return se == syscall.EMFILE || se == syscall.ENFILE ||
 			se == syscall.ECONNABORTED || se == syscall.EINTR ||
 			se == syscall.ENOBUFS || se == syscall.ENOMEM
@@ -484,11 +482,7 @@ func nextAcceptBackoff(prev time.Duration) time.Duration {
 	if prev == 0 {
 		return 5 * time.Millisecond
 	}
-	next := prev * 2
-	if next > time.Second {
-		next = time.Second
-	}
-	return next
+	return min(prev*2, time.Second)
 }
 
 // Close stops both listeners, causing ListenAndServe to return nil. It is safe

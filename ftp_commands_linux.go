@@ -323,7 +323,7 @@ func ftpQuotePath(p string) string {
 // stray arguments — RFC 959 specifies a single optional pathname, so the
 // strict interpretation is the safer one.
 func listPathArg(arg string) string {
-	for _, field := range strings.Fields(arg) {
+	for field := range strings.FieldsSeq(arg) {
 		if strings.HasPrefix(field, "-") {
 			continue
 		}
