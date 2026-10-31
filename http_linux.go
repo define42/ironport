@@ -30,6 +30,7 @@ import (
 	"strings"
 
 	"github.com/define42/ironport/internal/jailfs"
+	"github.com/define42/ironport/internal/netconn"
 )
 
 const (
@@ -125,7 +126,7 @@ func (s *Server) handleHTTPIngest(w http.ResponseWriter, r *http.Request) {
 // probes (and the first leg of a browser's challenge/response) do not flood the
 // AuthEvents stream.
 func (s *Server) httpAuthenticate(w http.ResponseWriter, r *http.Request) (username string, user UserInfo, jailRoot string, ok bool) {
-	clientIP := hostFromAddr(r.RemoteAddr)
+	clientIP := netconn.HostFromAddr(r.RemoteAddr)
 	reqUser, reqPass, hasAuth := r.BasicAuth()
 	if !hasAuth {
 		writeHTTPAuthChallenge(w)
@@ -169,7 +170,7 @@ func (s *Server) httpStoreUpload(w http.ResponseWriter, r *http.Request, usernam
 	}
 	defer func() { _ = jfs.Close() }()
 
-	results, bodyOK := s.storeUploadParts(mr, jfs, username, hostFromAddr(r.RemoteAddr))
+	results, bodyOK := s.storeUploadParts(mr, jfs, username, netconn.HostFromAddr(r.RemoteAddr))
 	writeUploadResponse(w, results, bodyOK)
 }
 

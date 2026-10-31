@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/define42/ironport/internal/netconn"
 )
 
 func parseFTPPassivePortRange(portRange string) (start, end int, err error) {
@@ -296,9 +298,9 @@ func (f *ftpSession) acceptPassiveDataConn() (net.Conn, error) {
 
 	// Prevent passive data-port stealing by requiring the data connection to
 	// originate from the same IP as the control connection.
-	if f.clientIP != "" && remoteIP(dc.RemoteAddr()) != f.clientIP {
+	if f.clientIP != "" && netconn.RemoteIP(dc.RemoteAddr()) != f.clientIP {
 		_ = dc.Close()
-		return nil, fmt.Errorf("data connection from unexpected IP %s", remoteIP(dc.RemoteAddr()))
+		return nil, fmt.Errorf("data connection from unexpected IP %s", netconn.RemoteIP(dc.RemoteAddr()))
 	}
 	return dc, nil
 }

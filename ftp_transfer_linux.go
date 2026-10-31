@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/define42/ironport/internal/netconn"
 	"golang.org/x/sys/unix"
 )
 
@@ -86,8 +87,8 @@ func (f *ftpSession) cmdList(arg string, namesOnly bool) {
 	// Apply a per-Write idle deadline so a client that opens the data
 	// connection but refuses to read does not pin this goroutine and FD
 	// indefinitely once its TCP receive buffer fills.
-	idleDC := &idleConn{Conn: dc}
-	idleDC.setWriteTimeout(ftpDataIdleTimeout)
+	idleDC := &netconn.IdleConn{Conn: dc}
+	idleDC.SetWriteTimeout(ftpDataIdleTimeout)
 	aborted, copyErr := f.runTransfer(dc, func() error {
 		formatLine := func(info os.FileInfo, name string) string {
 			if namesOnly {
@@ -206,8 +207,8 @@ func (f *ftpSession) cmdRetr(arg string) {
 	// Apply a per-Write idle deadline so a client that opens the data
 	// connection but refuses to read (filling its TCP receive buffer) does
 	// not pin this goroutine and FD indefinitely.
-	idleDC := &idleConn{Conn: dc}
-	idleDC.setWriteTimeout(ftpDataIdleTimeout)
+	idleDC := &netconn.IdleConn{Conn: dc}
+	idleDC.SetWriteTimeout(ftpDataIdleTimeout)
 	aborted, copyErr := f.runTransfer(dc, func() error {
 		_, err := io.Copy(idleDC, file)
 		return err
@@ -311,8 +312,8 @@ func (f *ftpSession) openUploadFile(ftpPath string, appendMode bool, restartOffs
 // upload exactly N bytes. The only reliable defense is an explicit size
 // hint from the client (ALLO); finalizeUploadStatus enforces it.
 func (f *ftpSession) runUploadCopy(dc net.Conn, file *os.File) (written int64, aborted bool, copyErr, closeErr error) {
-	idleDC := &idleConn{Conn: dc}
-	idleDC.setReadTimeout(ftpDataIdleTimeout)
+	idleDC := &netconn.IdleConn{Conn: dc}
+	idleDC.SetReadTimeout(ftpDataIdleTimeout)
 	aborted, copyErr = f.runTransfer(dc, func() error {
 		n, err := io.Copy(file, idleDC)
 		written = n
@@ -446,8 +447,8 @@ func (f *ftpSession) cmdMLSD(arg string) {
 	}
 	defer closeDataConn(dc)
 
-	idleDC := &idleConn{Conn: dc}
-	idleDC.setWriteTimeout(ftpDataIdleTimeout)
+	idleDC := &netconn.IdleConn{Conn: dc}
+	idleDC.SetWriteTimeout(ftpDataIdleTimeout)
 	aborted, copyErr := f.runTransfer(dc, func() error {
 		// Stream entries straight to the data connection rather than
 		// materialising the whole listing in memory — see cmdList.

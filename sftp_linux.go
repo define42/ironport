@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/define42/ironport/internal/netconn"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
@@ -118,7 +119,7 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 			announceAuthEvent(authEvents, AuthEvent{
 				Type:     AuthEventLoginFailed,
 				Username: c.User(),
-				ClientIP: remoteIP(c.RemoteAddr()),
+				ClientIP: netconn.RemoteIP(c.RemoteAddr()),
 				Protocol: CompletedUploadProtocolSFTP,
 			})
 			return nil, errInvalidCredentials
@@ -163,8 +164,8 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- C
 	// the handshake (denial-of-service via resource exhaustion). After the
 	// handshake succeeds we switch to the per-session idle timeout so that
 	// authenticated but inactive sessions are eventually reaped.
-	ic := &idleConn{Conn: nc}
-	ic.setReadTimeout(sshHandshakeTimeout)
+	ic := &netconn.IdleConn{Conn: nc}
+	ic.SetReadTimeout(sshHandshakeTimeout)
 	sshConn, chans, reqs, err := ssh.NewServerConn(ic, cfg)
 	if err != nil {
 		log.Println("ssh handshake:", err)
@@ -172,14 +173,14 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- C
 	}
 	// Handshake complete – switch to the idle-session deadline. A zero value
 	// disables the deadline.
-	ic.setReadTimeout(idleTimeout)
+	ic.SetReadTimeout(idleTimeout)
 	defer func() { _ = sshConn.Close() }()
 
 	jailRoot := sshConn.Permissions.Extensions["jailRoot"]
 	user := sshConn.Permissions.Extensions["user"]
 	canRead := sshConn.Permissions.Extensions["canRead"] == "true"
 	canWrite := sshConn.Permissions.Extensions["canWrite"] == "true"
-	clientIP := remoteIP(sshConn.RemoteAddr())
+	clientIP := netconn.RemoteIP(sshConn.RemoteAddr())
 	// Record the authenticated user on this connection so RemoveUser can
 	// force-close it if the account is later revoked.
 	s.setConnUser(nc, user)

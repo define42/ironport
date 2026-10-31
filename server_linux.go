@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/define42/ironport/internal/jailfs"
+	"github.com/define42/ironport/internal/netconn"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -411,7 +412,7 @@ func (s *Server) acceptLoop(ln net.Listener, name string, handler func(net.Conn)
 		}
 		backoff = 0
 		permanentErrors = 0
-		applyTCPKeepAlive(nc, s.effectiveTCPKeepAlivePeriod())
+		netconn.ApplyTCPKeepAlive(nc, s.effectiveTCPKeepAlivePeriod())
 		if !s.trackConn(nc) {
 			// Shutdown began between Accept returning and tracking; refuse
 			// the connection rather than spawning an untrackable handler.

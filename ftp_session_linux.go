@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/define42/ironport/internal/jailfs"
+	"github.com/define42/ironport/internal/netconn"
 )
 
 var (
@@ -157,7 +158,7 @@ func (s *Server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- Co
 		w:          bufio.NewWriter(nc),
 		cwd:        "/",
 		dataProt:   'C',
-		clientIP:   remoteIP(nc.RemoteAddr()),
+		clientIP:   netconn.RemoteIP(nc.RemoteAddr()),
 		tempExts:   tempExts,
 		uploads:    uploads,
 		authEvents: authEvents,
