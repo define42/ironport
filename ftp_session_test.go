@@ -168,7 +168,7 @@ func FuzzReadFTPControlLine(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		r := bufio.NewReader(bytes.NewReader(data))
-		for i := 0; i < 16; i++ {
+		for range 16 {
 			line, err := readFTPControlLine(r, ftpMaxControlLineLen)
 			if err != nil {
 				return

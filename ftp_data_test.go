@@ -168,8 +168,6 @@ func TestFTPSession_AcceptDataConnUsesConfiguredTimeout(t *testing.T) {
 // a new PASV request fails fast with 425 rather than hanging or silently
 // drifting outside the range — and that the session pool recovers when a
 // holder releases its listener.
-//
-//nolint:gocognit // loops over the entire passive port range to verify exhaustion behavior
 func TestFTPServer_PASVExhaustsPortRange(t *testing.T) {
 	root := t.TempDir()
 	users := map[string]UserInfo{
@@ -180,7 +178,7 @@ func TestFTPServer_PASVExhaustsPortRange(t *testing.T) {
 
 	holders := make([]*ftpTestClient, 0, 3)
 	seen := make(map[int]struct{}, 3)
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		c := dialFTP(t, addr)
 		c.login("u", "p")
 		_, port, err := parseFTPPASVResponse(c.command(227, "PASV"))
@@ -207,22 +205,7 @@ func TestFTPServer_PASVExhaustsPortRange(t *testing.T) {
 	_ = holders[0].tp.Close()
 	holders = holders[1:]
 
-	deadline := time.Now().Add(2 * time.Second)
-	recoveredPort := 0
-	for time.Now().Before(deadline) {
-		_, p, err := parseFTPPASVResponse(extra.command(227, "PASV"))
-		if err != nil {
-			t.Fatalf("recovery parse PASV: %v", err)
-		}
-		if p >= 5500 && p <= 5502 {
-			recoveredPort = p
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if recoveredPort == 0 {
-		t.Fatalf("PASV did not recover a port in range after holder closed")
-	}
+	requireFTPPASVRecovery(t, extra, 5500, 5502)
 
 	for _, c := range holders {
 		_ = c.tp.Close()
@@ -368,7 +351,7 @@ func TestFTPServer_PASVConcurrentTransfers(t *testing.T) {
 	errCh := make(chan error, workers)
 	var wg sync.WaitGroup
 	wg.Add(workers)
-	for i := 0; i < workers; i++ {
+	for i := range workers {
 		go func(id int) {
 			defer wg.Done()
 			errCh <- doOne(t, id)
@@ -382,7 +365,7 @@ func TestFTPServer_PASVConcurrentTransfers(t *testing.T) {
 		}
 	}
 
-	for i := 0; i < workers; i++ {
+	for i := range workers {
 		name := fmt.Sprintf("file-%02d.bin", i)
 		got, err := os.ReadFile(filepath.Join(root, name)) //nolint:gosec // path under t.TempDir()
 		if err != nil {

@@ -60,11 +60,9 @@ func TestSFTPServer_SSHAlgorithmPinning(t *testing.T) {
 	t.Cleanup(stop)
 
 	sshCfg := &ssh.ClientConfig{
-		Config: ssh.Config{
-			KeyExchanges: []string{ssh.KeyExchangeCurve25519},
-			Ciphers:      []string{ssh.CipherAES256CTR},
-			MACs:         []string{ssh.HMACSHA256},
-		},
+		KeyExchanges:    []string{ssh.KeyExchangeCurve25519},
+		Ciphers:         []string{ssh.CipherAES256CTR},
+		MACs:            []string{ssh.HMACSHA256},
 		User:            "alice",
 		Auth:            []ssh.AuthMethod{ssh.Password("alicepw")},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat

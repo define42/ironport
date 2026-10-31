@@ -122,7 +122,7 @@ func TestServer_ListenAndServe_Close(t *testing.T) {
 
 	// Wait until the server is accepting connections.
 	var addr string
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		if a := srv.ListeningAddr(); a != nil {
 			addr = a.String()
 			break
@@ -257,7 +257,7 @@ func TestServer_Shutdown_DrainsInFlight(t *testing.T) {
 
 	shutdownDone := make(chan error, 1)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 		defer cancel()
 		shutdownDone <- srv.Shutdown(ctx)
 	}()
@@ -317,7 +317,7 @@ func TestServer_Shutdown_ForceClosesOnContextDeadline(t *testing.T) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 	defer cancel()
 	start := time.Now()
 	err = srv.Shutdown(ctx)
@@ -362,7 +362,7 @@ func TestServer_Shutdown_ForceClosesOnContextDeadline(t *testing.T) {
 // TestServer_Shutdown_BeforeListenAndServe is a no-op and must not block.
 func TestServer_Shutdown_BeforeListenAndServe(t *testing.T) {
 	srv := newTestServer(":0", "", "", map[string]UserInfo{}, testSigner(t), defaultCompletedUploadsSize)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
 		t.Errorf("Shutdown before ListenAndServe returned %v; want nil", err)
@@ -377,7 +377,7 @@ func TestServer_ListenAndServe_AfterShutdown(t *testing.T) {
 		"alice": {Password: "alicepw", Root: t.TempDir(), CanRead: true, CanWrite: true},
 	}
 	srv, _, errc1 := startListenAndServe(t, users)
-	if err := srv.Shutdown(context.Background()); err != nil {
+	if err := srv.Shutdown(t.Context()); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
 	select {

@@ -3,7 +3,6 @@ package ironport
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"crypto/tls"
 	"errors"
 	"io"
@@ -167,7 +166,7 @@ func TestFTPSGetConfigForClientCannotOverrideControlSessionTicketKey(t *testing.
 	_, _, hitsBefore := attackerSessions.stats()
 	_ = attackerData.SetDeadline(time.Now().Add(5 * time.Second))
 	attackerTLS := tls.Client(attackerData, attacker.tlsCfg)
-	if err := attackerTLS.HandshakeContext(context.Background()); err == nil {
+	if err := attackerTLS.HandshakeContext(t.Context()); err == nil {
 		// In TLS 1.3 the client can finish before it consumes the server's
 		// post-handshake rejection alert. A resumed connection would pass the
 		// server verifier, so DidResume is an immediate binding failure.
@@ -603,7 +602,7 @@ func TestFTPS_DataConnRequiresResumption(t *testing.T) {
 	}
 	tc := tls.Client(dc, freshCfg)
 	_ = dc.SetDeadline(time.Now().Add(5 * time.Second))
-	err = tc.HandshakeContext(context.Background())
+	err = tc.HandshakeContext(t.Context())
 	if err == nil {
 		t.Fatal("data-conn handshake without session resumption succeeded; want failure")
 	}
@@ -686,7 +685,7 @@ func TestFTPS_DataConnRejectsTicketFromDifferentControlSession(t *testing.T) {
 			_, _, hitsBefore := attackerSessions.stats()
 			_ = attackerData.SetDeadline(time.Now().Add(5 * time.Second))
 			attackerTLS := tls.Client(attackerData, attacker.tlsCfg)
-			handshakeErr := attackerTLS.HandshakeContext(context.Background())
+			handshakeErr := attackerTLS.HandshakeContext(t.Context())
 			_, _, hitsAfter := attackerSessions.stats()
 			if hitsAfter <= hitsBefore {
 				t.Fatal("attacker's cached control-session ticket was not offered on the victim's data connection")

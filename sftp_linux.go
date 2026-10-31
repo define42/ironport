@@ -128,11 +128,9 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 	}
 
 	cfg := &ssh.ServerConfig{
-		Config: ssh.Config{
-			KeyExchanges: slices.Clone(s.sshKeyExchanges),
-			Ciphers:      slices.Clone(s.sshCiphers),
-			MACs:         slices.Clone(s.sshMACs),
-		},
+		KeyExchanges:            slices.Clone(s.sshKeyExchanges),
+		Ciphers:                 slices.Clone(s.sshCiphers),
+		MACs:                    slices.Clone(s.sshMACs),
 		PublicKeyAuthAlgorithms: slices.Clone(s.sshPublicKeyAuthAlgorithms),
 		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
 			return completeLogin(c, func(u UserInfo) bool {
@@ -221,11 +219,9 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- C
 			continue
 		}
 
-		sessionWG.Add(1)
-		go func() {
-			defer sessionWG.Done()
+		sessionWG.Go(func() {
 			handleSession(ch, inReqs, jailRoot, user, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown)
-		}()
+		})
 	}
 }
 

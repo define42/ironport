@@ -192,7 +192,7 @@ func TestFTPServer_ListStreamsLargeDirectory(t *testing.T) {
 	root := t.TempDir()
 	const entryCount = 1543 // exercise listing across multiple batches
 	expected := make(map[string]struct{}, entryCount)
-	for i := 0; i < entryCount; i++ {
+	for i := range entryCount {
 		name := fmt.Sprintf("entry-%05d", i)
 		if err := os.WriteFile(filepath.Join(root, name), []byte{}, 0o600); err != nil {
 			t.Fatalf("os.WriteFile(%s): %v", name, err)
@@ -219,7 +219,7 @@ func TestFTPServer_ListStreamsLargeDirectory(t *testing.T) {
 	client.read(226)
 
 	got := map[string]struct{}{}
-	for _, name := range strings.Split(strings.TrimRight(string(data), "\r\n"), "\r\n") {
+	for name := range strings.SplitSeq(strings.TrimRight(string(data), "\r\n"), "\r\n") {
 		if name == "" {
 			continue
 		}
@@ -685,13 +685,13 @@ func TestFTPServer_AborMidTransferRace(t *testing.T) {
 		}
 	}
 
-	for i := 0; i < iterations; i++ {
+	for i := range iterations {
 		dc, _ := client.passiveConn()
 		client.send("STOR race.txt")
 		client.read(150)
 
 		writes := 1 + (i % 8)
-		for j := 0; j < writes; j++ {
+		for range writes {
 			if _, err := dc.Write(chunk); err != nil {
 				break
 			}

@@ -8,6 +8,7 @@ linters:
     - bodyclose
     - gocritic
     - errorlint
+    - modernize
     - nolintlint
     - misspell
     - gosec

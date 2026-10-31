@@ -3,7 +3,6 @@ package ironport
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -254,6 +253,35 @@ func (c *ftpTestClient) passiveConn() (net.Conn, int) {
 		c.t.Fatalf("net.DialTimeout(data): %v", err)
 	}
 	return dc, port
+}
+
+func requireFTPPASVRecovery(t *testing.T, client *ftpTestClient, start, end int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		client.send("PASV")
+		code, msg, err := client.tp.ReadResponse(0)
+		if err != nil {
+			t.Fatalf("recovery ReadResponse: %v", err)
+		}
+		if code == 425 {
+			// The server may still be processing the holder's disconnect.
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		if code != 227 {
+			t.Fatalf("recovery PASV response = %d %q; want 227", code, msg)
+		}
+		_, port, err := parseFTPPASVResponse(msg)
+		if err != nil {
+			t.Fatalf("recovery parse PASV: %v", err)
+		}
+		if port < start || port > end {
+			t.Fatalf("recovery PASV port = %d; want within %d-%d", port, start, end)
+		}
+		return
+	}
+	t.Fatalf("PASV did not recover a port in range %d-%d after holder closed", start, end)
 }
 
 func listenFTPActiveData(t *testing.T) net.Listener {
@@ -672,7 +700,7 @@ func (c *ftpsTestClient) authTLS() {
 	c.t.Helper()
 	c.command(234, "AUTH TLS")
 	tlsConn := tls.Client(c.rawConn, c.tlsCfg)
-	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+	if err := tlsConn.HandshakeContext(c.t.Context()); err != nil {
 		c.t.Fatalf("client TLS handshake: %v", err)
 	}
 	c.tlsConn = tlsConn
@@ -741,7 +769,7 @@ func (c *ftpsTestClient) storeProtected(filename string, payload []byte) {
 func (c *ftpsTestClient) upgradeDataConn(dc net.Conn) *tls.Conn {
 	c.t.Helper()
 	tc := tls.Client(dc, c.tlsCfg)
-	if err := tc.HandshakeContext(context.Background()); err != nil {
+	if err := tc.HandshakeContext(c.t.Context()); err != nil {
 		_ = dc.Close()
 		c.t.Fatalf("data TLS handshake: %v", err)
 	}
