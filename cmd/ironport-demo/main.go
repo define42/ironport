@@ -15,6 +15,14 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+const (
+	demoHTTPReadHeaderTimeout = 10 * time.Second
+	demoHTTPReadTimeout       = 5 * time.Minute
+	demoHTTPWriteTimeout      = 5 * time.Minute
+	demoHTTPIdleTimeout       = time.Minute
+	demoHTTPMaxHeaderBytes    = 16 << 10
+)
+
 type flags struct {
 	hostKeyPath                *string
 	sftpAddr                   *string
@@ -134,17 +142,25 @@ func startHTTPIngest(srv *ironport.Server, addr string) {
 	if addr == "" {
 		return
 	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/upload", srv.HttpIngest())
-	server := &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	server := newHTTPIngestServer(srv, addr)
 	go func() {
-		log.Printf("HTTP upload endpoint listening on %s (POST multipart key=file to /upload)", addr)
+		log.Printf("HTTP upload endpoint listening on %s (POST multipart key=file with X-Ironport-Upload: 1 to /upload)", addr)
 		log.Fatal(server.ListenAndServe())
 	}()
+}
+
+func newHTTPIngestServer(srv *ironport.Server, addr string) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/upload", srv.HttpIngest())
+	return &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: demoHTTPReadHeaderTimeout,
+		ReadTimeout:       demoHTTPReadTimeout,
+		WriteTimeout:      demoHTTPWriteTimeout,
+		IdleTimeout:       demoHTTPIdleTimeout,
+		MaxHeaderBytes:    demoHTTPMaxHeaderBytes,
+	}
 }
 
 // loadFTPSTLSConfig builds a *tls.Config from the operator-supplied cert/key

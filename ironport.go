@@ -90,6 +90,17 @@ const (
 	// defaultAuthEventsSize is the fallback buffer size used for the
 	// AuthEvents channel.
 	defaultAuthEventsSize = 64
+	// Resource limits also apply when callers construct Config directly.
+	defaultSSHMaxChannels     = 16
+	defaultHTTPMaxUploadBytes = defaultMaxTransferBytes
+	defaultHTTPMaxUploadParts = 1000
+	// HTTP authentication and admission defaults bound work that happens
+	// before an upload reaches the filesystem. These limits also apply to a
+	// zero-value Server.
+	defaultHTTPMaxConcurrentRequests = 32
+	defaultHTTPMaxAuthorizationBytes = 4096
+	defaultHTTPMaxUsernameBytes      = 256
+	defaultHTTPMaxPasswordBytes      = 1024
 	// ephemeralHostKeyBits is the size of the in-memory RSA host key generated
 	// when a server is started without an explicit signer.
 	ephemeralHostKeyBits = 3072
@@ -361,11 +372,11 @@ func NewSignerFromFile(path string) (ssh.Signer, error) {
 	return signer, nil
 }
 
-// UserInfo holds the credentials and jail root for a single SFTP/FTP user.
+// UserInfo holds the credentials and jail root for an SFTP, FTP, or HTTP user.
 type UserInfo struct {
 	Password       string
 	AuthorizedKeys []ssh.PublicKey // public keys allowed for SFTP authentication; nil or empty means public-key auth is disabled for this user
-	Root           string          // jail root on disk, e.g. /srv/sftp/alice
+	Root           string          // jail root on disk; path components must not be symlinks or ".."
 	CanRead        bool            // allow read/download/list operations
 	CanWrite       bool            // allow write/upload/delete/rename operations
 }
@@ -373,6 +384,66 @@ type UserInfo struct {
 func cloneUserInfo(u UserInfo) UserInfo {
 	u.AuthorizedKeys = slices.Clone(u.AuthorizedKeys)
 	return u
+}
+
+// sameUserAuthentication compares effective authentication rather than public
+// key object identity or slice layout. Keys are an unordered set of wire-format
+// values; duplicates and nil entries do not change which keys may authenticate.
+// Call without s.mu: application-provided PublicKey.Marshal methods may block
+// or call back into the server.
+func sameUserAuthentication(a, b UserInfo) bool {
+	if a.Password != b.Password || a.Root != b.Root || a.CanRead != b.CanRead || a.CanWrite != b.CanWrite {
+		return false
+	}
+	return slices.Equal(authorizedKeyValues(a.AuthorizedKeys), authorizedKeyValues(b.AuthorizedKeys))
+}
+
+func authorizedKeyValues(keys []ssh.PublicKey) []string {
+	values := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if key != nil {
+			values = append(values, string(key.Marshal()))
+		}
+	}
+	slices.Sort(values)
+	return slices.Compact(values)
+}
+
+// replaceUser publishes a cloned configuration and changes its revision only
+// when authentication actually changes. An effective change also marks every
+// authenticated connection for that user as canceled at the same
+// linearization point. The caller closes those connections after the lock is
+// released. The comparison runs outside the lock; retrying after a concurrent
+// revision change preserves atomic update/commit semantics, including
+// remove-and-readd of an otherwise identical user.
+func (s *Server) replaceUser(username string, info UserInfo) (uint64, []connToClose) {
+	info = cloneUserInfo(info)
+	for {
+		s.mu.RLock()
+		previous, existed := s.users[username]
+		previous = cloneUserInfo(previous)
+		revision := s.userRevisions[username]
+		s.mu.RUnlock()
+		unchanged := existed && revision != 0 && sameUserAuthentication(previous, info)
+
+		s.mu.Lock()
+		_, exists := s.users[username]
+		if exists != existed || s.userRevisions[username] != revision {
+			s.mu.Unlock()
+			continue
+		}
+		if s.users == nil {
+			s.users = make(map[string]UserInfo)
+		}
+		s.users[username] = info
+		var toClose []connToClose
+		if !unchanged {
+			revision = s.bumpUserRevisionLocked(username)
+			toClose = s.cancelUserConnsLocked(username)
+		}
+		s.mu.Unlock()
+		return revision, toClose
+	}
 }
 
 func cloneUsers(users map[string]UserInfo) map[string]UserInfo {
@@ -386,14 +457,39 @@ func cloneUsers(users map[string]UserInfo) map[string]UserInfo {
 	return cloned
 }
 
-func (s *Server) userSnapshot(username string) (UserInfo, bool) {
+func (s *Server) userSnapshot(username string) (UserInfo, uint64, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	u, ok := s.users[username]
 	if !ok {
-		return UserInfo{}, false
+		return UserInfo{}, 0, false
 	}
-	return cloneUserInfo(u), true
+	revision, ok := s.userRevisions[username]
+	if !ok {
+		return UserInfo{}, 0, false
+	}
+	return cloneUserInfo(u), revision, true
+}
+
+// bumpUserRevisionLocked assigns a server-lifetime-unique revision to the
+// current value of username. The caller must hold s.mu for writing.
+func (s *Server) bumpUserRevisionLocked(username string) uint64 {
+	s.nextUserRevision++
+	if s.nextUserRevision == 0 {
+		panic("ironport: user revision counter exhausted")
+	}
+	if s.userRevisions == nil {
+		s.userRevisions = make(map[string]uint64)
+	}
+	s.userRevisions[username] = s.nextUserRevision
+	return s.nextUserRevision
+}
+
+func (s *Server) userRevisionMatches(username string, revision uint64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, exists := s.users[username]
+	return exists && revision != 0 && s.userRevisions[username] == revision
 }
 
 func normalizeTempExtensions(src []string) []string {
@@ -417,7 +513,7 @@ func normalizeTempExtensions(src []string) []string {
 // CompletedUpload describes a file upload that has finished successfully.
 // It is the payload delivered on the server's CompletedUploads stream.
 type CompletedUpload struct {
-	// Username is the authenticated SFTP/FTP user that performed the upload.
+	// Username is the authenticated user that performed the upload.
 	Username string
 	// FullFilePath is the absolute path of the uploaded file on the server's
 	// local filesystem (i.e. resolved through the user's jail root).
@@ -430,7 +526,7 @@ type CompletedUpload struct {
 	// be parsed.
 	ClientIP string
 	// Protocol is the file-transfer protocol used for the upload.
-	// It is either CompletedUploadProtocolSFTP or CompletedUploadProtocolFTP.
+	// It is CompletedUploadProtocolSFTP, CompletedUploadProtocolFTP, or CompletedUploadProtocolHTTP.
 	Protocol string
 }
 
@@ -445,8 +541,51 @@ type AuthEvent struct {
 	// empty if the address could not be parsed.
 	ClientIP string
 	// Protocol is the file-transfer protocol used for the event.
-	// It is either CompletedUploadProtocolSFTP or CompletedUploadProtocolFTP.
+	// It is CompletedUploadProtocolSFTP, CompletedUploadProtocolFTP, or CompletedUploadProtocolHTTP.
 	Protocol string
+}
+
+type activeConnState struct {
+	clientIP      string
+	username      string
+	authenticated bool
+	cancel        func()
+	canceled      bool
+}
+
+type connToClose struct {
+	net.Conn
+
+	cancel func()
+}
+
+func (c connToClose) close() {
+	if c.cancel != nil {
+		c.cancel()
+	}
+	_ = c.Conn.Close()
+}
+
+// cancelUserConnsLocked marks each authenticated connection belonging to
+// username as permanently canceled and returns the I/O work for the caller to
+// perform after releasing s.mu.
+func (s *Server) cancelUserConnsLocked(username string) []connToClose {
+	var toClose []connToClose
+	for nc, state := range s.activeConns {
+		if !state.authenticated || state.username != username {
+			continue
+		}
+		state.canceled = true
+		s.activeConns[nc] = state
+		toClose = append(toClose, connToClose{Conn: nc, cancel: state.cancel})
+	}
+	return toClose
+}
+
+func closeConns(conns []connToClose) {
+	for _, conn := range conns {
+		conn.close()
+	}
 }
 
 // Server is a self-contained SFTP server with optional FTP support.
@@ -462,8 +601,9 @@ type Server struct {
 	ftpPassivePortRange string
 	// ftpDataAcceptTimeout bounds how long passive-mode FTP data listeners wait
 	// after PASV/EPSV and how long active-mode FTP dials may take after
-	// PORT/EPRT. Zero selects the package default; negative disables the deadline.
+	// PORT/EPRT. Passive reservations always have a finite lifetime.
 	ftpDataAcceptTimeout time.Duration
+	ftpPassiveLimits     ftpPassiveLimits
 	// ftpPassiveAdvertisedIP optionally overrides the IPv4 address sent to
 	// clients in the PASV (227) reply, for deployments behind NAT or a
 	// port-forward. Empty means advertise the control connection's local IP.
@@ -484,7 +624,14 @@ type Server struct {
 	ftpRequireTLS bool
 	// users maps usernames to their credentials and jail roots.
 	users map[string]UserInfo
-	// mu protects users, completedUploads, authEvents, and listeners for concurrent reads and writes.
+	// userRevisions assigns a fresh, server-lifetime-unique value whenever a
+	// user's authentication-relevant configuration changes. Authentication
+	// snapshots carry this value to reject an in-flight login if the user is
+	// removed, replaced, or has an authorized key changed before commit.
+	userRevisions    map[string]uint64
+	nextUserRevision uint64
+	// mu protects users, user revisions, completedUploads, authEvents, and
+	// listeners for concurrent reads and writes.
 	mu sync.RWMutex
 	// ln is the active SFTP listener; set by ListenAndServe and closed by Close.
 	ln net.Listener
@@ -505,6 +652,23 @@ type Server struct {
 	sshCiphers                 []string
 	sshMACs                    []string
 	sshPublicKeyAuthAlgorithms []string
+	sshMaxChannels             int
+	maxConnections             int
+	maxConnectionsPerIP        int
+	ftpAuthTimeout             time.Duration
+	sftpHandles                handleBudget
+	httpMaxUploadBytes         int64
+	httpMaxUploadParts         int
+	httpMaxConcurrentRequests  int
+	httpMaxAuthorizationBytes  int
+	httpMaxUsernameBytes       int
+	httpMaxPasswordBytes       int
+	httpAllowedOrigins         []string
+	httpRequestOnce            sync.Once
+	httpRequestSlots           chan struct{}
+	authLimiter                *authLimiter
+	authOnce                   sync.Once
+	ftpMaxAuthFailures         int
 	// completedUploads receives upload notifications. Use CompletedUploads to
 	// access it as a receive-only stream.
 	completedUploads chan CompletedUpload
@@ -549,12 +713,14 @@ type Server struct {
 	// per the sync.WaitGroup contract.
 	connWG sync.WaitGroup
 	// activeConns holds every accepted connection that has not yet returned
-	// from its handler, mapped to the username currently authenticated on
-	// that connection (empty string before authentication, or after FTP REIN).
+	// from its handler, including whether it has completed authentication and
+	// the authenticated username. Authentication is tracked separately because
+	// an empty username is valid and must not be confused with an anonymous
+	// connection before authentication or after FTP REIN.
 	// It is consulted by Shutdown to force-close stragglers when the caller's
 	// context deadline fires, and by RemoveUser to evict active sessions of
 	// a user being deleted.
-	activeConns map[net.Conn]string
+	activeConns map[net.Conn]activeConnState
 	// shutdownWaiters counts concurrent Shutdown callers so shuttingDown stays
 	// true until the final caller has finished waiting on connWG.
 	shutdownWaiters int
@@ -563,6 +729,8 @@ type Server struct {
 	// drain. It is guarded by mu so it serialises with connWG.Add inside
 	// trackConn.
 	shuttingDown bool
+	// storage coordinates quotas across users and protocols sharing a jail.
+	storage *storageManager
 }
 
 // Config holds the values used to construct a server.
@@ -573,8 +741,18 @@ type Config struct {
 	// FtpDataAcceptTimeout bounds how long passive-mode FTP data listeners wait
 	// for the client data connection after PASV/EPSV, and how long active-mode
 	// FTP dials may take after PORT/EPRT. Zero selects the package default
-	// (30 seconds); negative disables the deadline.
+	// (30 seconds). Negative disables the active-mode dial deadline but passive
+	// reservations still expire after the default 30 seconds.
 	FtpDataAcceptTimeout time.Duration
+	// FtpMaxPassiveListeners caps outstanding PASV/EPSV listeners server-wide.
+	// Zero or negative selects the default of 64.
+	FtpMaxPassiveListeners int
+	// FtpMaxPassiveListenersPerUser caps outstanding PASV/EPSV listeners for
+	// one authenticated username. Zero or negative selects the default of 2.
+	FtpMaxPassiveListenersPerUser int
+	// FtpMaxPassiveListenersPerIP caps outstanding PASV/EPSV listeners for one
+	// control-connection source IP. Zero or negative selects the default of 8.
+	FtpMaxPassiveListenersPerIP int
 	// FtpAllowActiveMode enables FTP active mode (PORT/EPRT). It defaults to
 	// false because active mode requires outbound connections from the server.
 	// When enabled, this server only dials the same IP as the control connection.
@@ -616,6 +794,57 @@ type Config struct {
 	SSHCiphers                 []string
 	SSHMACs                    []string
 	SSHPublicKeyAuthAlgorithms []string
+	// SSHMaxChannels limits simultaneous session channels per SSH connection.
+	// Non-positive values select the default of 16.
+	SSHMaxChannels int
+	// MaxConnections and MaxConnectionsPerIP bound accepted SFTP and FTP
+	// control connections together, including unauthenticated connections.
+	// Non-positive values select 128 and 32 respectively.
+	MaxConnections      int
+	MaxConnectionsPerIP int
+	// FTPAuthTimeout is the absolute time allowed to authenticate an FTP
+	// control session. Commands such as NOOP do not extend it. Non-positive
+	// values select 30 seconds. Logging out starts a new authentication window.
+	FTPAuthTimeout time.Duration
+	// SFTPMaxHandles, SFTPMaxHandlesPerUser, and SFTPMaxHandlesPerSession
+	// bound open files and directories globally, per username (across SSH
+	// connections), and per SSH connection (across channels). Non-positive
+	// values select 256, 64, and 32. CLOSE and channel teardown release slots.
+	SFTPMaxHandles           int
+	SFTPMaxHandlesPerUser    int
+	SFTPMaxHandlesPerSession int
+	// HTTPMaxUploadBytes limits the complete multipart request body, including
+	// headers and non-file fields. Non-positive values select 200 GiB (200 * 2^30 bytes).
+	HTTPMaxUploadBytes int64
+	// HTTPMaxUploadParts limits all multipart parts, including non-file fields.
+	// Non-positive values select 1000. Exceeding either HTTP limit returns 413.
+	HTTPMaxUploadParts int
+	// HTTPMaxConcurrentRequests caps requests executing in HttpIngest across
+	// every handler created from this Server. Non-positive values select 32.
+	// Requests over the limit are rejected immediately with 503 before their
+	// Authorization header or body is processed.
+	HTTPMaxConcurrentRequests int
+	// HTTPMaxAuthorizationBytes limits the raw Authorization header before
+	// Basic authentication decoding. Non-positive values select 4096 bytes.
+	HTTPMaxAuthorizationBytes int
+	// HTTPMaxUsernameBytes and HTTPMaxPasswordBytes limit decoded Basic-auth
+	// credentials. Non-positive values select 256 and 1024 bytes respectively.
+	HTTPMaxUsernameBytes int
+	HTTPMaxPasswordBytes int
+	// HTTPAllowedOrigins lists exact browser origins (scheme://host[:port])
+	// permitted to upload. With an empty list only the directly observed
+	// request origin is accepted. Configure external HTTPS origins explicitly
+	// behind a TLS-terminating proxy; forwarded headers are not trusted.
+	// Invalid entries match nothing. All uploads also require
+	// X-Ironport-Upload: 1; this is not a CORS allowlist.
+	HTTPAllowedOrigins []string
+	// AuthLimits bounds authentication attempts and retry backoff jointly
+	// across SSH, FTP, and HTTP. Zero fields select secure defaults.
+	AuthLimits AuthLimitConfig
+	// FTPMaxAuthFailures closes a control session after this many failed
+	// password attempts. Non-positive values select five; USER/REIN and
+	// successful login do not reset it.
+	FTPMaxAuthFailures int
 	// TempExtensions marks file extensions that should defer completion
 	// notifications until a later rename to a non-temp name. Matching is
 	// case-insensitive.
@@ -633,36 +862,130 @@ type Config struct {
 	// SftpAllowChown controls whether SFTP clients may change file ownership
 	// inside their jail. It defaults to false.
 	SftpAllowChown bool
+	// MaxFileBytes caps each file's logical size, including sparse writes and
+	// truncation. Non-positive values select 200 GiB.
+	MaxFileBytes int64
+	// MaxTransferBytes caps successful written bytes per open upload handle,
+	// including repeated writes to the same offset. Defaults to 200 GiB.
+	MaxTransferBytes int64
+	// MaxJailBytes caps cumulative regular-file logical bytes per jail root.
+	// Non-positive values select 1 TiB. Roots sharing an inode share a budget.
+	MaxJailBytes int64
+	// MaxJailEntries caps files, directories and other directory entries in a
+	// jail (root excluded). Non-positive values select 1,000,000. Unlinked files
+	// keep their byte/entry charge until their final managed handle closes.
+	// Filesystem quotas remain required for physical storage, external writers,
+	// overlapping jails and multiple server instances.
+	MaxJailEntries int64
 }
 
 // AddUser adds or replaces a user entry in the server's user map.
+// The update takes effect before root checks or logging, which may block.
+// Reapplying equivalent credentials, root, and permissions preserves in-flight
+// authentication and existing sessions. An effective change atomically
+// invalidates in-flight authentication and marks existing SFTP/FTP sessions for
+// closure. Authorized-key ordering, duplicates, and nil entries do not change
+// the effective credentials.
 // It is safe to call concurrently with active connections.
 func (s *Server) AddUser(username string, info UserInfo) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.users == nil {
-		s.users = make(map[string]UserInfo)
+	revision, toClose := s.replaceUser(username, info)
+	closeConns(toClose)
+	// Publish credentials before diagnostic I/O: a slow filesystem or logger
+	// must not keep the previous credentials valid. The revision identifies
+	// this check even if another update races with the eventual log write.
+	s.warnUnusableJailRoot(username, info.Root, revision)
+}
+
+func checkJailRoot(root string) error {
+	fs, err := openJailFS(root)
+	if err != nil {
+		return err
 	}
-	s.users[username] = cloneUserInfo(info)
+	_ = fs.Close()
+	return nil
+}
+
+func logUnusableJailRoot(username, root string, revision uint64, err error) {
+	log.Printf(
+		"warning: jail-root check failed for user %q revision %d at %q: %q",
+		username,
+		revision,
+		root,
+		err.Error(),
+	)
+}
+
+// warnUnusableJailRoot logs when a configured jail root cannot currently be
+// opened, so a root that authentication will reject (for example one
+// containing a symlink or ".." component) surfaces during AddUser and server
+// startup rather than only as an indistinguishable login failure. A missing
+// directory is only warned about, since deployments may create jail
+// directories later.
+func (s *Server) warnUnusableJailRoot(username, root string, revision uint64) {
+	err := checkJailRoot(root)
+	if err != nil {
+		if errors.Is(err, errOpenat2Unsupported) {
+			return // ListenAndServe reports this once at startup
+		}
+		s.logUnusableJailRootIfCurrent(username, root, revision, err)
+		return
+	}
+}
+
+// logUnusableJailRootIfCurrent suppresses a diagnostic when a concurrent user
+// update has already replaced the root that was checked. The message describes
+// the check rather than predicting future logins, so it remains accurate if
+// the configuration changes immediately after this final comparison.
+func (s *Server) logUnusableJailRootIfCurrent(username, root string, revision uint64, err error) {
+	if !s.userRevisionMatches(username, revision) {
+		return
+	}
+	logUnusableJailRoot(username, root, revision, err)
+}
+
+func (s *Server) warnUnusableJailRoots() {
+	type configuredRoot struct {
+		username string
+		root     string
+		revision uint64
+	}
+
+	s.mu.RLock()
+	roots := make([]configuredRoot, 0, len(s.users))
+	for username, info := range s.users {
+		roots = append(roots, configuredRoot{username: username, root: info.Root, revision: s.userRevisions[username]})
+	}
+	s.mu.RUnlock()
+
+	for _, configured := range roots {
+		s.warnUnusableJailRoot(configured.username, configured.root, configured.revision)
+	}
+}
+
+// ValidateJailRoots verifies kernel support and warns about unusable configured
+// roots. Missing or invalid roots are diagnostic only because deployments may
+// provision them later. ListenAndServe and HttpIngest call this automatically;
+// callers may also invoke it explicitly during deployment validation.
+func (s *Server) ValidateJailRoots() error {
+	if err := ensureOpenat2(); err != nil {
+		return fmt.Errorf("ironport: %w", err)
+	}
+	s.warnUnusableJailRoots()
+	return nil
 }
 
 // RemoveUser removes a user entry from the server's user map and force-closes
-// any connections currently authenticated as that user, so an in-flight
-// session cannot keep operating after its credentials have been revoked.
+// any SFTP/FTP connections currently authenticated as that user, including FTP
+// data operations. HTTP requests already authorized are owned by the caller
+// and are not canceled; subsequent authentication fails.
 // It is safe to call concurrently with active connections.
 func (s *Server) RemoveUser(username string) {
 	s.mu.Lock()
 	delete(s.users, username)
-	var toClose []net.Conn
-	for nc, u := range s.activeConns {
-		if u == username {
-			toClose = append(toClose, nc)
-		}
-	}
+	delete(s.userRevisions, username)
+	toClose := s.cancelUserConnsLocked(username)
 	s.mu.Unlock()
-	for _, c := range toClose {
-		_ = c.Close()
-	}
+	closeConns(toClose)
 }
 
 // RemoveAllUsers removes every user entry from the server's user map and
@@ -674,72 +997,119 @@ func (s *Server) RemoveUser(username string) {
 func (s *Server) RemoveAllUsers() {
 	s.mu.Lock()
 	s.users = make(map[string]UserInfo)
-	var toClose []net.Conn
-	for nc, u := range s.activeConns {
-		if u != "" {
-			toClose = append(toClose, nc)
+	s.userRevisions = make(map[string]uint64)
+	var toClose []connToClose
+	for nc, state := range s.activeConns {
+		if state.authenticated {
+			state.canceled = true
+			s.activeConns[nc] = state
+			toClose = append(toClose, connToClose{Conn: nc, cancel: state.cancel})
 		}
 	}
 	s.mu.Unlock()
-	for _, c := range toClose {
-		_ = c.Close()
-	}
+	closeConns(toClose)
 }
 
 // AddUserKey appends key to the AuthorizedKeys of an existing user.
 // If the key is already present (by wire-format equality) it is not added again.
 // It is a no-op when username does not exist or key is nil.
+// Adding a key does not revoke authority held by an existing session, so active
+// sessions are left connected. The revision still changes to linearize the new
+// authentication configuration with logins already in flight.
 // It is safe to call concurrently with active connections.
 func (s *Server) AddUserKey(username string, key ssh.PublicKey) {
 	if key == nil {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	u, ok := s.users[username]
-	if !ok {
-		return
-	}
-	keys := slices.Clone(u.AuthorizedKeys)
 	keyBytes := key.Marshal()
-	for _, existing := range keys {
-		if existing == nil {
+	for {
+		s.mu.RLock()
+		u, ok := s.users[username]
+		u = cloneUserInfo(u)
+		revision := s.userRevisions[username]
+		s.mu.RUnlock()
+		if !ok {
+			return
+		}
+		alreadyPresent := false
+		for _, existing := range u.AuthorizedKeys {
+			if existing != nil && subtle.ConstantTimeCompare(keyBytes, existing.Marshal()) == 1 {
+				alreadyPresent = true
+				break
+			}
+		}
+		if alreadyPresent {
+			if s.userRevisionMatches(username, revision) {
+				return
+			}
 			continue
 		}
-		if subtle.ConstantTimeCompare(keyBytes, existing.Marshal()) == 1 {
-			return // already present
+		u.AuthorizedKeys = append(u.AuthorizedKeys, key)
+
+		s.mu.Lock()
+		_, exists := s.users[username]
+		if !exists || s.userRevisions[username] != revision {
+			s.mu.Unlock()
+			continue
 		}
+		s.users[username] = u
+		s.bumpUserRevisionLocked(username)
+		s.mu.Unlock()
+		return
 	}
-	keys = append(keys, key)
-	u.AuthorizedKeys = keys
-	s.users[username] = u
 }
 
 // RemoveUserKey removes key from the AuthorizedKeys of an existing user.
 // It is a no-op when username does not exist, the key is not found, or key is nil.
+// Removing an effective key disconnects that user's established SFTP/FTP
+// sessions so a compromised credential cannot retain access through an old
+// session. No-op removals leave existing sessions untouched.
 // It is safe to call concurrently with active connections.
 func (s *Server) RemoveUserKey(username string, key ssh.PublicKey) {
 	if key == nil {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	u, ok := s.users[username]
-	if !ok {
-		return
-	}
 	keyBytes := key.Marshal()
-	var filtered []ssh.PublicKey
-	for _, existing := range u.AuthorizedKeys {
-		if existing == nil {
-			continue
+	for {
+		s.mu.RLock()
+		u, ok := s.users[username]
+		u = cloneUserInfo(u)
+		revision := s.userRevisions[username]
+		s.mu.RUnlock()
+		if !ok {
+			return
 		}
-		if subtle.ConstantTimeCompare(keyBytes, existing.Marshal()) != 1 {
+
+		filtered := make([]ssh.PublicKey, 0, len(u.AuthorizedKeys))
+		removed := false
+		for _, existing := range u.AuthorizedKeys {
+			if existing != nil && subtle.ConstantTimeCompare(keyBytes, existing.Marshal()) == 1 {
+				removed = true
+				continue
+			}
 			filtered = append(filtered, existing)
 		}
+		if !removed {
+			if s.userRevisionMatches(username, revision) {
+				return
+			}
+			continue
+		}
+		u.AuthorizedKeys = filtered
+
+		s.mu.Lock()
+		_, exists := s.users[username]
+		if !exists || s.userRevisions[username] != revision {
+			s.mu.Unlock()
+			continue
+		}
+		s.users[username] = u
+		s.bumpUserRevisionLocked(username)
+		toClose := s.cancelUserConnsLocked(username)
+		s.mu.Unlock()
+		closeConns(toClose)
+		return
 	}
-	u.AuthorizedKeys = filtered
-	s.users[username] = u
 }
 
 // DefaultConfig returns a fresh server configuration with package
@@ -748,11 +1118,18 @@ func (s *Server) RemoveUserKey(username string, key ssh.PublicKey) {
 // generates an ephemeral in-memory host key.
 func DefaultConfig() *Config {
 	return &Config{
-		SftpAddr:            ":2022",
-		FtpAddr:             "",
-		FtpPassivePortRange: "5000-5010",
-		CompletedUploadSize: defaultCompletedUploadsSize,
-		AuthEventSize:       defaultAuthEventsSize,
+		SftpAddr:                  ":2022",
+		FtpAddr:                   "",
+		FtpPassivePortRange:       "5000-5010",
+		CompletedUploadSize:       defaultCompletedUploadsSize,
+		AuthEventSize:             defaultAuthEventsSize,
+		SSHMaxChannels:            defaultSSHMaxChannels,
+		HTTPMaxUploadBytes:        defaultHTTPMaxUploadBytes,
+		HTTPMaxUploadParts:        defaultHTTPMaxUploadParts,
+		HTTPMaxConcurrentRequests: defaultHTTPMaxConcurrentRequests,
+		HTTPMaxAuthorizationBytes: defaultHTTPMaxAuthorizationBytes,
+		HTTPMaxUsernameBytes:      defaultHTTPMaxUsernameBytes,
+		HTTPMaxPasswordBytes:      defaultHTTPMaxPasswordBytes,
 	}
 }
 
@@ -773,15 +1150,18 @@ func NewServer(config *Config) *Server {
 	if config == nil {
 		config = DefaultConfig()
 	}
+	users := cloneUsers(config.Users)
 	s := &Server{
 		addr:                       config.SftpAddr,
 		ftpAddr:                    config.FtpAddr,
 		ftpPassivePortRange:        config.FtpPassivePortRange,
 		ftpDataAcceptTimeout:       config.FtpDataAcceptTimeout,
+		ftpPassiveLimits:           newFTPPassiveLimits(config),
 		ftpAllowActiveMode:         config.FtpAllowActiveMode,
 		ftpPassiveAdvertisedIP:     strings.TrimSpace(config.FtpPassiveAdvertisedIP),
 		ftpRequireTLS:              config.FtpRequireTLS,
-		users:                      cloneUsers(config.Users),
+		users:                      users,
+		userRevisions:              make(map[string]uint64, len(users)),
 		sftpSigner:                 config.SftpSigner,
 		completedUploads:           newCompletedUploadsChannel(config.CompletedUploadSize),
 		authEvents:                 newAuthEventsChannel(config.AuthEventSize),
@@ -789,11 +1169,45 @@ func NewServer(config *Config) *Server {
 		sshCiphers:                 slices.Clone(config.SSHCiphers),
 		sshMACs:                    slices.Clone(config.SSHMACs),
 		sshPublicKeyAuthAlgorithms: slices.Clone(config.SSHPublicKeyAuthAlgorithms),
-		tempExtensions:             normalizeTempExtensions(config.TempExtensions),
-		idleTimeout:                config.IdleTimeout,
-		tcpKeepAlivePeriod:         config.TCPKeepAlivePeriod,
-		sftpAllowChown:             config.SftpAllowChown,
-		activeConns:                make(map[net.Conn]string),
+		sshMaxChannels:             config.SSHMaxChannels,
+		maxConnections:             positiveLimit(config.MaxConnections, defaultMaxConnections),
+		maxConnectionsPerIP:        positiveLimit(config.MaxConnectionsPerIP, defaultMaxConnectionsPerIP),
+		ftpAuthTimeout:             positiveDuration(config.FTPAuthTimeout, defaultFTPAuthTimeout),
+		sftpHandles: handleBudget{
+			max:        positiveLimit(config.SFTPMaxHandles, defaultSFTPMaxHandles),
+			maxUser:    positiveLimit(config.SFTPMaxHandlesPerUser, defaultSFTPMaxHandlesPerUser),
+			maxSession: positiveLimit(config.SFTPMaxHandlesPerSession, defaultSFTPMaxHandlesPerSession),
+		},
+		httpMaxUploadBytes:        config.HTTPMaxUploadBytes,
+		httpMaxUploadParts:        config.HTTPMaxUploadParts,
+		httpMaxConcurrentRequests: positiveLimit(config.HTTPMaxConcurrentRequests, defaultHTTPMaxConcurrentRequests),
+		httpMaxAuthorizationBytes: positiveLimit(config.HTTPMaxAuthorizationBytes, defaultHTTPMaxAuthorizationBytes),
+		httpMaxUsernameBytes:      positiveLimit(config.HTTPMaxUsernameBytes, defaultHTTPMaxUsernameBytes),
+		httpMaxPasswordBytes:      positiveLimit(config.HTTPMaxPasswordBytes, defaultHTTPMaxPasswordBytes),
+		httpAllowedOrigins:        slices.Clone(config.HTTPAllowedOrigins),
+		authLimiter:               newAuthLimiter(config.AuthLimits),
+		ftpMaxAuthFailures:        config.FTPMaxAuthFailures,
+		tempExtensions:            normalizeTempExtensions(config.TempExtensions),
+		idleTimeout:               config.IdleTimeout,
+		tcpKeepAlivePeriod:        config.TCPKeepAlivePeriod,
+		sftpAllowChown:            config.SftpAllowChown,
+		activeConns:               make(map[net.Conn]activeConnState),
+		storage:                   newStorageManager(config),
+	}
+	for username := range users {
+		s.bumpUserRevisionLocked(username)
+	}
+	if s.sshMaxChannels <= 0 {
+		s.sshMaxChannels = defaultSSHMaxChannels
+	}
+	if s.httpMaxUploadBytes <= 0 {
+		s.httpMaxUploadBytes = defaultHTTPMaxUploadBytes
+	}
+	if s.httpMaxUploadParts <= 0 {
+		s.httpMaxUploadParts = defaultHTTPMaxUploadParts
+	}
+	if s.ftpMaxAuthFailures <= 0 {
+		s.ftpMaxAuthFailures = 5
 	}
 	if config.FtpTLSConfig != nil {
 		s.ftpTLSConfig = config.FtpTLSConfig.Clone()
@@ -947,35 +1361,90 @@ func (s *Server) endShutdown() {
 	s.mu.Unlock()
 }
 
-// trackConn records nc as an in-flight handler-owned connection. It returns
-// false when the server has already begun shutting down, in which case the
-// caller must not spawn a handler for nc and is responsible for closing it.
+// trackConn admits nc within the global/per-IP limits and records it as an
+// in-flight handler-owned connection. It returns false on overload or shutdown;
+// the caller must then close nc without spawning a handler.
 // On success the caller must call untrackConn(nc) and connWG.Done() exactly
 // once before its handler goroutine returns.
 func (s *Server) trackConn(nc net.Conn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.shuttingDown {
+	if s.shuttingDown || len(s.activeConns) >= positiveLimit(s.maxConnections, defaultMaxConnections) {
+		return false
+	}
+	if _, tracked := s.activeConns[nc]; tracked {
+		return false
+	}
+	ip := canonicalClientIP(remoteIP(nc.RemoteAddr()))
+	count := 0
+	for _, state := range s.activeConns {
+		if state.clientIP == ip {
+			count++
+		}
+	}
+	if count >= positiveLimit(s.maxConnectionsPerIP, defaultMaxConnectionsPerIP) {
 		return false
 	}
 	if s.activeConns == nil {
-		s.activeConns = make(map[net.Conn]string)
+		s.activeConns = make(map[net.Conn]activeConnState)
 	}
-	s.activeConns[nc] = ""
+	s.activeConns[nc] = activeConnState{clientIP: ip}
 	s.connWG.Add(1)
 	return true
 }
 
-// setConnUser records username as the authenticated identity on nc. It is a
-// no-op when nc is not currently tracked (e.g., in tests that bypass the
-// accept loop). Pass an empty username to clear the association (used after
-// FTP REIN so the now-anonymous session is no longer tied to the prior user).
-func (s *Server) setConnUser(nc net.Conn, username string) {
+// setConnCancel attaches protocol-specific I/O cleanup to a tracked connection.
+// cancel must be idempotent and safe to call concurrently with the handler.
+// Late registration cannot miss a concurrent revocation or forced shutdown.
+func (s *Server) setConnCancel(nc net.Conn, cancel func()) bool {
+	s.mu.Lock()
+	state, tracked := s.activeConns[nc]
+	if !tracked || state.canceled || s.shuttingDown {
+		s.mu.Unlock()
+		cancel()
+		return false
+	}
+	state.cancel = cancel
+	s.activeConns[nc] = state
+	s.mu.Unlock()
+	return true
+}
+
+// clearConnUser marks nc as unauthenticated. It is a no-op when nc is not
+// currently tracked. FTP uses it after REIN and failed authentication so the
+// anonymous session is no longer tied to the prior user.
+func (s *Server) clearConnUser(nc net.Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.activeConns[nc]; ok {
-		s.activeConns[nc] = username
+	if state, ok := s.activeConns[nc]; ok {
+		state.username = ""
+		state.authenticated = false
+		s.activeConns[nc] = state
 	}
+}
+
+// commitConnUser atomically verifies that an authentication snapshot is still
+// current and binds the already-tracked raw connection to that user. This is
+// the linearization point between authentication and revocation: a concurrent
+// RemoveUser/RemoveAllUsers either invalidates the revision first, or observes
+// the committed connection and closes it.
+func (s *Server) commitConnUser(nc net.Conn, username string, revision uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if revision == 0 || s.userRevisions[username] != revision {
+		return false
+	}
+	if _, exists := s.users[username]; !exists {
+		return false
+	}
+	state, tracked := s.activeConns[nc]
+	if !tracked || state.canceled {
+		return false
+	}
+	state.username = username
+	state.authenticated = true
+	s.activeConns[nc] = state
+	return true
 }
 
 // untrackConn removes nc from the in-flight set. The corresponding
@@ -993,13 +1462,15 @@ func (s *Server) untrackConn(nc net.Conn) {
 // finished on their own.
 func (s *Server) forceCloseActiveConns() int {
 	s.mu.Lock()
-	conns := make([]net.Conn, 0, len(s.activeConns))
-	for c := range s.activeConns {
-		conns = append(conns, c)
+	conns := make([]connToClose, 0, len(s.activeConns))
+	for c, state := range s.activeConns {
+		state.canceled = true
+		s.activeConns[c] = state
+		conns = append(conns, connToClose{Conn: c, cancel: state.cancel})
 	}
 	s.mu.Unlock()
 	for _, c := range conns {
-		_ = c.Close()
+		c.close()
 	}
 	return len(conns)
 }
@@ -1060,7 +1531,9 @@ func announceAuthEvent(events chan<- AuthEvent, evt AuthEvent) {
 	select {
 	case events <- evt:
 	default:
-		log.Printf("auth event: AuthEvents queue full, notification type=%q protocol=%q user=%q dropped", evt.Type, evt.Protocol, evt.Username)
+		if sample, suppressed := authEventDropLogs.allow(time.Now()); sample {
+			log.Printf("auth event: AuthEvents queue full, notification type=%q protocol=%q user=%q dropped suppressed=%d", evt.Type, evt.Protocol, evt.Username, suppressed)
+		}
 	}
 }
 
@@ -1139,8 +1612,6 @@ func (s *Server) ListenAndServe() error {
 	}
 	uploads := s.completedUploadsChan()
 	authEvents := s.authEventsChan()
-	cfg := s.sshServerConfig()
-
 	sftpLn, ftpLn, err := s.openListeners()
 	if err != nil {
 		return err
@@ -1148,15 +1619,25 @@ func (s *Server) ListenAndServe() error {
 	if !s.publishListeners(runID, sftpLn, ftpLn) {
 		return closeListenerPair(sftpLn, ftpLn)
 	}
-	return s.runListenWorkers(runID, sftpLn, ftpLn, cfg, uploads, authEvents)
+	return s.runListenWorkers(runID, sftpLn, ftpLn, uploads, authEvents)
 }
 
 // prepareForListen runs the startup checks that must succeed before any
-// listener is opened: the FTPS config is valid, a signer is available, and the
-// running kernel supports the openat2 containment primitive.
+// listener is opened: the FTPS config is valid when FTP is enabled, a signer is
+// available, and the running kernel supports the openat2 containment primitive.
+// Once those checks pass, configured jail roots are checked and diagnosed
+// without making missing roots fatal, since deployments may provision them
+// after server startup.
 func (s *Server) prepareForListen() error {
-	if s.ftpTLSConfigErr != nil {
-		return fmt.Errorf("ironport: %w", s.ftpTLSConfigErr)
+	// Match openListeners: unused FTP settings must not prevent an SFTP-only
+	// deployment from starting, including when FtpAddr contains whitespace.
+	if strings.TrimSpace(s.ftpAddr) != "" {
+		if s.ftpTLSConfigErr != nil {
+			return fmt.Errorf("ironport: %w", s.ftpTLSConfigErr)
+		}
+		if s.ftpRequireTLS && s.ftpTLSConfig == nil {
+			return errors.New("ironport: FtpRequireTLS requires FtpTLSConfig")
+		}
 	}
 	if err := s.ensureSigner(); err != nil {
 		return fmt.Errorf("ironport: %w", err)
@@ -1165,10 +1646,7 @@ func (s *Server) prepareForListen() error {
 	// openat2(RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS), available since Linux
 	// 5.6. Fail fast at startup on older kernels rather than silently
 	// degrading the policy at first request.
-	if err := ensureOpenat2(); err != nil {
-		return fmt.Errorf("ironport: %w", err)
-	}
-	return nil
+	return s.ValidateJailRoots()
 }
 
 func (s *Server) openListeners() (net.Listener, net.Listener, error) {
@@ -1187,11 +1665,11 @@ func (s *Server) openListeners() (net.Listener, net.Listener, error) {
 	return sftpLn, ftpLn, nil
 }
 
-func (s *Server) runListenWorkers(runID uint64, sftpLn, ftpLn net.Listener, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) error {
+func (s *Server) runListenWorkers(runID uint64, sftpLn, ftpLn net.Listener, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) error {
 	log.Printf("SFTP listening on %s", sftpLn.Addr())
 	workers := 1
 	errCh := make(chan error, 2)
-	go func() { errCh <- s.serveSFTP(sftpLn, cfg, uploads, authEvents) }()
+	go func() { errCh <- s.serveSFTP(sftpLn, uploads, authEvents) }()
 
 	if ftpLn != nil {
 		workers++
@@ -1209,12 +1687,12 @@ func (s *Server) runListenWorkers(runID uint64, sftpLn, ftpLn net.Listener, cfg 
 	return ret
 }
 
-func (s *Server) serveSFTP(ln net.Listener, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) error {
+func (s *Server) serveSFTP(ln net.Listener, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) error {
 	tempExts := s.configuredTempExtensions()
 	idleTimeout := s.effectiveIdleTimeout()
 	allowChown := s.sftpChownAllowed()
 	return s.acceptLoop(ln, "sftp", func(nc net.Conn) {
-		s.handleConn(nc, cfg, uploads, authEvents, tempExts, idleTimeout, allowChown)
+		s.handleConn(nc, uploads, authEvents, tempExts, idleTimeout, allowChown)
 	})
 }
 
@@ -1257,8 +1735,9 @@ func (s *Server) acceptLoop(ln net.Listener, name string, handler func(net.Conn)
 		permanentErrors = 0
 		applyTCPKeepAlive(nc, s.effectiveTCPKeepAlivePeriod())
 		if !s.trackConn(nc) {
-			// Shutdown began between Accept returning and tracking; refuse
-			// the connection rather than spawning an untrackable handler.
+			// Reject overload before allocating a handler or protocol state.
+			// Closing immediately also keeps rejection writes/logs off the
+			// accept loop, so an attacker cannot stall admission this way.
 			_ = nc.Close()
 			continue
 		}
@@ -1613,47 +2092,62 @@ func (s *Server) FTPListeningAddr() net.Addr {
 	return s.ftpLn.Addr()
 }
 
+type sshPermissionDataKey uint8
+
+const sshJailFSKey sshPermissionDataKey = iota
+
+// sshAuthState owns a jail opened by an authentication callback until a
+// successful handshake transfers that ownership to handleConn. A separate
+// state is captured by each connection's ServerConfig.
+type sshAuthState struct {
+	fs       *jailFS
+	username string
+	revision uint64
+}
+
+func (a *sshAuthState) replace(fs *jailFS, username string, revision uint64) {
+	if a.fs != nil && a.fs != fs {
+		_ = a.fs.Close()
+	}
+	a.fs = fs
+	a.username = username
+	a.revision = revision
+}
+
+func (a *sshAuthState) take() (*jailFS, string, uint64) {
+	fs := a.fs
+	username := a.username
+	revision := a.revision
+	a.fs = nil
+	a.username = ""
+	a.revision = 0
+	return fs, username, revision
+}
+
+func (a *sshAuthState) close() {
+	if a.fs != nil {
+		_ = a.fs.Close()
+		a.fs = nil
+	}
+	a.username = ""
+	a.revision = 0
+}
+
 // permissionsFor builds the ssh.Permissions for an authenticated user,
-// embedding the jail root and access flags as extensions so that the
-// connection handler can retrieve them after the handshake.
-func permissionsFor(u UserInfo, username, jailRoot string) *ssh.Permissions {
+// embedding the retained jail descriptor in ExtraData so the connection
+// handler receives the exact directory opened during authentication.
+func permissionsFor(u UserInfo, username string, fs *jailFS) *ssh.Permissions {
 	return &ssh.Permissions{
 		Extensions: map[string]string{
-			"jailRoot": jailRoot,
+			"jailRoot": fs.root,
 			"user":     username,
 			"canRead":  fmt.Sprintf("%v", u.CanRead),
 			"canWrite": fmt.Sprintf("%v", u.CanWrite),
 		},
+		ExtraData: map[any]any{
+			sshJailFSKey: fs,
+		},
 	}
-}
-
-func canonicalJailRoot(root string) (string, error) {
-	if strings.TrimSpace(root) == "" {
-		return "", os.ErrInvalid
-	}
-
-	abs, err := filepath.Abs(filepath.Clean(root))
-	if err != nil {
-		return "", err
-	}
-
-	// Resolve the configured root before validating it. Broken symlinks in the
-	// jail root path intentionally reject the login/server start; a jail root
-	// must name a real directory at authentication time.
-	resolved, err := filepath.EvalSymlinks(abs)
-	if err != nil {
-		return "", err
-	}
-
-	st, err := os.Stat(resolved)
-	if err != nil {
-		return "", err
-	}
-	if !st.IsDir() {
-		return "", syscall.ENOTDIR
-	}
-
-	return resolved, nil
 }
 
 // checkPassword performs a SHA-256-normalized constant-time comparison between
@@ -1666,27 +2160,55 @@ func checkPassword(storedPw, suppliedPw string) bool {
 }
 
 // authenticateUser performs the credential check shared by SFTP and FTP
-// logins. It returns a cloned UserInfo snapshot and the canonical jail-root
-// path on success. ok is false when either the credentials do not match or
-// the jail-root cannot be canonicalised; callers should not distinguish those
-// cases when replying to clients, to avoid leaking which step failed.
+// logins. On success it returns both a cloned UserInfo snapshot and the open
+// jail descriptor that the caller must retain until the authenticated
+// connection or request ends. ok is false when either the credentials do not
+// match or the jail root cannot be securely opened; callers should not
+// distinguish those cases when replying to clients.
 //
 // keyCheck supplies the matching logic so the SSH PasswordCallback can pass a
-// password comparator and the PublicKeyCallback can pass a constant-time-padded
+// password comparator and VerifiedPublicKeyCallback can pass a constant-time-padded
 // key comparator. keyCheck receives the zero-value UserInfo when the user is
 // unknown, so it MUST be constant-time (independent of stored password length
 // and AuthorizedKeys count) to avoid leaking username existence; checkPassword
 // and the public-key timing pad already satisfy this.
-func (s *Server) authenticateUser(username string, keyCheck func(stored UserInfo) bool) (UserInfo, string, bool) {
-	u, ok := s.userSnapshot(username)
-	if !keyCheck(u) || !ok {
-		return UserInfo{}, "", false
+func (s *Server) authenticateUser(username string, keyCheck func(stored UserInfo) bool) (UserInfo, *jailFS, uint64, bool) {
+	u, revision, ok := s.matchingUser(username, keyCheck)
+	if !ok {
+		return UserInfo{}, nil, 0, false
 	}
-	jailRoot, err := canonicalJailRoot(u.Root)
+	fs, err := openJailFS(u.Root)
 	if err != nil {
-		return UserInfo{}, "", false
+		// Logged server-side only; the client sees a generic credential
+		// failure so it cannot distinguish a bad root from a bad password.
+		if s.userRevisionMatches(username, revision) {
+			if sample, suppressed := s.authControl().logs.allow(time.Now()); sample {
+				log.Printf("jail root %q for user %q could not be opened during authentication: %q suppressed=%d", u.Root, username, err.Error(), suppressed)
+			}
+		}
+		return UserInfo{}, nil, 0, false
 	}
-	return u, jailRoot, true
+	if err := s.attachStorageBudget(fs); err != nil {
+		_ = fs.Close()
+		return UserInfo{}, nil, 0, false
+	}
+	// The filesystem open and quota scan intentionally occur without s.mu. Recheck the
+	// revision afterward so HTTP receives a linearizable authentication
+	// decision and connection protocols never carry a stale jail to commit.
+	if !s.userRevisionMatches(username, revision) {
+		_ = fs.Close()
+		return UserInfo{}, nil, 0, false
+	}
+	u.Root = fs.root
+	return u, fs, revision, true
+}
+
+func (s *Server) matchingUser(username string, keyCheck func(stored UserInfo) bool) (UserInfo, uint64, bool) {
+	u, revision, ok := s.userSnapshot(username)
+	if !keyCheck(u) || !ok {
+		return UserInfo{}, 0, false
+	}
+	return u, revision, true
 }
 
 // matchAuthorizedKey reports whether the presented SSH public key matches any
@@ -1734,23 +2256,23 @@ func matchAuthorizedKey(authorizedKeys []ssh.PublicKey, presented ssh.PublicKey)
 // Public-key authentication succeeds when the presented key matches any entry
 // in the user's AuthorizedKeys slice (constant-time comparison of wire-format
 // bytes).
-func (s *Server) sshServerConfig() *ssh.ServerConfig {
+func (s *Server) sshServerConfig(authState *sshAuthState) *ssh.ServerConfig {
 	authEvents := s.authEventsChan()
-	// completeLogin centralises the failure announcement and the success
-	// permissions construction so PasswordCallback and PublicKeyCallback only
-	// have to express their own credential-matching logic.
+	failLogin := func(c ssh.ConnMetadata, throttled bool) (*ssh.Permissions, error) {
+		s.authFailed(c.User(), remoteIP(c.RemoteAddr()), CompletedUploadProtocolSFTP, authEvents, throttled)
+		return nil, errInvalidCredentials
+	}
 	completeLogin := func(c ssh.ConnMetadata, keyCheck func(UserInfo) bool) (*ssh.Permissions, error) {
-		u, jailRoot, ok := s.authenticateUser(c.User(), keyCheck)
-		if !ok {
-			announceAuthEvent(authEvents, AuthEvent{
-				Type:     AuthEventLoginFailed,
-				Username: c.User(),
-				ClientIP: remoteIP(c.RemoteAddr()),
-				Protocol: CompletedUploadProtocolSFTP,
-			})
-			return nil, errInvalidCredentials
+		if s.allowAuth(c.User(), remoteIP(c.RemoteAddr())) > 0 {
+			return failLogin(c, true)
 		}
-		return permissionsFor(u, c.User(), jailRoot), nil
+		u, fs, revision, ok := s.authenticateUser(c.User(), keyCheck)
+		if !ok {
+			return failLogin(c, false)
+		}
+		s.authSucceeded(c.User(), remoteIP(c.RemoteAddr()))
+		authState.replace(fs, c.User(), revision)
+		return permissionsFor(u, c.User(), fs), nil
 	}
 
 	cfg := &ssh.ServerConfig{
@@ -1772,6 +2294,24 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 			})
 		},
 		PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			if s.allowAuth(c.User(), remoteIP(c.RemoteAddr())) > 0 {
+				return failLogin(c, true)
+			}
+			_, _, ok := s.matchingUser(c.User(), func(u UserInfo) bool {
+				return matchAuthorizedKey(u.AuthorizedKeys, key)
+			})
+			if !ok {
+				return failLogin(c, false)
+			}
+			// The SSH package may call PublicKeyCallback for an unsigned
+			// key query. Do not open a jail or retain a user snapshot until
+			// VerifiedPublicKeyCallback proves key possession.
+			return &ssh.Permissions{}, nil
+		},
+		VerifiedPublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey, _ *ssh.Permissions, _ string) (*ssh.Permissions, error) {
+			// Re-read the user and re-check the key after signature proof so
+			// RemoveUser, key revocation, root changes, and permission changes
+			// made after an unsigned key query take effect immediately.
 			return completeLogin(c, func(u UserInfo) bool {
 				return matchAuthorizedKey(u.AuthorizedKeys, key)
 			})
@@ -1781,8 +2321,52 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 	return cfg
 }
 
-func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent, tempExts []string, idleTimeout time.Duration, sftpAllowChown bool) {
+// takeCommittedSSHJail transfers the jail retained by the successful SSH
+// authentication callback and atomically binds nc to that authentication's
+// still-current user revision. On failure it closes every transferred jail.
+func (s *Server) takeCommittedSSHJail(nc net.Conn, sshConn *ssh.ServerConn, authState *sshAuthState, authEvents chan<- AuthEvent) (fs *jailFS, username, jailRoot string, ok bool) {
+	defer func() {
+		if !ok {
+			announceAuthEvent(authEvents, AuthEvent{
+				Type:     AuthEventLoginFailed,
+				Username: sshConn.User(),
+				ClientIP: remoteIP(sshConn.RemoteAddr()),
+				Protocol: CompletedUploadProtocolSFTP,
+			})
+		}
+	}()
+	var permissionFS *jailFS
+	if sshConn.Permissions != nil {
+		permissionFS, _ = sshConn.Permissions.ExtraData[sshJailFSKey].(*jailFS)
+	}
+	ownedFS, authUsername, revision := authState.take()
+	if permissionFS == nil || ownedFS != permissionFS {
+		if ownedFS != nil {
+			_ = ownedFS.Close()
+		}
+		if permissionFS != nil && permissionFS != ownedFS {
+			_ = permissionFS.Close()
+		}
+		log.Printf("ssh handshake for %q did not retain its authenticated jail", sshConn.User())
+		return nil, "", "", false
+	}
+
+	user := sshConn.Permissions.Extensions["user"]
+	if authUsername != user || !s.commitConnUser(nc, user, revision) {
+		_ = permissionFS.Close()
+		log.Printf("ssh authentication for %q was revoked before handshake completion", user)
+		return nil, "", "", false
+	}
+	return permissionFS, user, sshConn.Permissions.Extensions["jailRoot"], true
+}
+
+//nolint:funlen // SSH handshake, retained-FD transfer, and channel lifetime form one security-critical flow
+func (s *Server) handleConn(nc net.Conn, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent, tempExts []string, idleTimeout time.Duration, sftpAllowChown bool) {
 	defer func() { _ = nc.Close() }()
+
+	authState := &sshAuthState{}
+	defer authState.close()
+	cfg := s.sshServerConfig(authState)
 
 	// Wrap the raw connection so that every Read resets the read deadline.
 	// During the handshake we use sshHandshakeTimeout to prevent malicious
@@ -1792,25 +2376,48 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- C
 	// authenticated but inactive sessions are eventually reaped.
 	ic := &idleConn{Conn: nc}
 	ic.setReadTimeout(sshHandshakeTimeout)
+	handshakeTimer := time.AfterFunc(sshHandshakeTimeout, func() { _ = nc.Close() })
+	defer handshakeTimer.Stop()
 	sshConn, chans, reqs, err := ssh.NewServerConn(ic, cfg)
+	handshakeTimer.Stop()
 	if err != nil {
-		log.Println("ssh handshake:", err)
+		if allowed, suppressed := s.authControl().logs.allow(time.Now()); allowed {
+			log.Printf("ssh handshake: %v (suppressed=%d)", err, suppressed)
+		}
 		return
 	}
 	// Handshake complete – switch to the idle-session deadline. A zero value
 	// disables the deadline.
 	ic.setReadTimeout(idleTimeout)
 	defer func() { _ = sshConn.Close() }()
+	globalRequestsDone := make(chan struct{})
+	go func() {
+		defer close(globalRequestsDone)
+		ssh.DiscardRequests(reqs)
+	}()
 
-	jailRoot := sshConn.Permissions.Extensions["jailRoot"]
-	user := sshConn.Permissions.Extensions["user"]
+	fs, user, jailRoot, ok := s.takeCommittedSSHJail(nc, sshConn, authState, authEvents)
+	if !ok {
+		// NewServerConn's request and channel streams must be serviced even
+		// after the SSH handshake has succeeded but the final user-revision
+		// commit fails. Close the transport first so no new channel opens can
+		// arrive, then reject the buffered opens to let x/crypto/ssh's mux
+		// finish and close both streams.
+		_ = sshConn.Close()
+		for newCh := range chans {
+			_ = newCh.Reject(ssh.Prohibited, "authentication no longer valid")
+		}
+		<-globalRequestsDone
+		return
+	}
+	// Registered before sessionWG.Wait below so LIFO defer order waits for
+	// every channel handler before releasing the shared root descriptor.
+	defer func() { _ = fs.Close() }()
+
 	canRead := sshConn.Permissions.Extensions["canRead"] == "true"
 	canWrite := sshConn.Permissions.Extensions["canWrite"] == "true"
 	clientIP := remoteIP(sshConn.RemoteAddr())
-	// Record the authenticated user on this connection so RemoveUser can
-	// force-close it if the account is later revoked.
-	s.setConnUser(nc, user)
-	log.Printf("login protocol=sftp user=%s root=%s from=%s", user, jailRoot, sshConn.RemoteAddr())
+	log.Printf("login protocol=sftp user=%q root=%q from=%s", user, jailRoot, sshConn.RemoteAddr())
 	announceAuthEvent(authEvents, AuthEvent{
 		Type:     AuthEventLoginSuccess,
 		Username: user,
@@ -1824,9 +2431,6 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- C
 		Protocol: CompletedUploadProtocolSFTP,
 	})
 
-	// Discard global requests
-	go ssh.DiscardRequests(reqs)
-
 	// Track the per-channel session goroutines so this function does not
 	// return until they have all finished. handleConn returning is what
 	// triggers untrackConn/connWG.Done in acceptLoop, which Shutdown waits
@@ -1834,15 +2438,28 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- C
 	// operation is still in flight and jailFS.Close could race with it.
 	var sessionWG sync.WaitGroup
 	defer sessionWG.Wait()
+	limit := s.sshMaxChannels
+	if limit <= 0 {
+		limit = defaultSSHMaxChannels
+	}
+	sessionSlots := make(chan struct{}, limit)
+	handles := &sessionHandleBudget{owner: &s.sftpHandles, username: user}
 
 	for newCh := range chans {
 		if newCh.ChannelType() != "session" {
 			_ = newCh.Reject(ssh.UnknownChannelType, "unknown channel type")
 			continue
 		}
+		select {
+		case sessionSlots <- struct{}{}:
+		default:
+			_ = newCh.Reject(ssh.ResourceShortage, "session channel limit reached")
+			continue
+		}
 
 		ch, inReqs, err := newCh.Accept()
 		if err != nil {
+			<-sessionSlots
 			log.Println("accept channel:", err)
 			continue
 		}
@@ -1850,9 +2467,11 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- C
 		sessionWG.Add(1)
 		go func() {
 			defer sessionWG.Done()
-			handleSession(ch, inReqs, jailRoot, user, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown)
+			defer func() { <-sessionSlots }()
+			handleSession(ch, inReqs, fs, user, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown, handles)
 		}()
 	}
+	<-globalRequestsDone
 }
 
 // remoteIP extracts the IP portion of a net.Addr. If the address contains a
@@ -1879,7 +2498,7 @@ func hostFromAddr(addr string) string {
 	return addr
 }
 
-func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool) {
+func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, fs *jailFS, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool, handles ...*sessionHandleBudget) {
 	defer func() {
 		recoverSFTPSessionPanic(username, clientIP, recover())
 		_ = ch.Close()
@@ -1903,12 +2522,7 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, usernam
 			}
 			_ = req.Reply(true, nil)
 
-			// Serving the SFTP subsystem is delegated to a helper so that
-			// its cleanup defers (fs.Close, server.Close) run on its own
-			// return rather than accumulating inside this for/switch — a
-			// defer placed directly in this case would survive across loop
-			// iterations if the trailing `return` were ever removed.
-			serveSFTPSubsystem(ch, jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown)
+			serveSFTPSubsystem(ch, fs, username, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown, handles...)
 			return
 
 		default:
@@ -1917,19 +2531,11 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, usernam
 	}
 }
 
-// serveSFTPSubsystem opens the per-session jail, runs the SFTP request server
-// to completion, and tears both down via defer so the cleanup is local to this
-// function and not to handleSession's loop body. Callers must already have
+// serveSFTPSubsystem runs the SFTP request server against the jail descriptor
+// retained by the authenticated SSH connection. Callers must already have
 // replied to the "subsystem" request before invoking it.
-func serveSFTPSubsystem(ch ssh.Channel, jailRoot, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool) {
-	handlers, fs, err := jailedHandlers(jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown)
-	if err != nil {
-		log.Printf("open jail root %q: %v", jailRoot, err)
-		return
-	}
-	defer func() { _ = fs.Close() }()
-
-	server := sftp.NewRequestServer(ch, handlers)
+func serveSFTPSubsystem(ch ssh.Channel, fs *jailFS, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool, handles ...*sessionHandleBudget) {
+	server := sftp.NewRequestServer(ch, jailedHandlers(fs, username, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown, handles...))
 	defer func() { _ = server.Close() }()
 	if err := server.Serve(); err != nil && !errors.Is(err, io.EOF) {
 		log.Println("sftp serve:", err)
@@ -1937,11 +2543,12 @@ func serveSFTPSubsystem(ch ssh.Channel, jailRoot, username, clientIP string, can
 }
 
 type jail struct {
+	handles *sessionHandleBudget
 	// fs is the fd-relative filesystem implementation backing this jail. It
-	// is constructed once per session and shared by all handler invocations.
-	// Its lifetime is bound to the session: jailedHandlers (SFTP) or
-	// ftpSession.openJail (FTP) creates it; the corresponding teardown path
-	// calls fs.Close() exactly once.
+	// is constructed once during authentication and shared by all handler
+	// invocations. Its lifetime is bound to the authenticated SSH connection,
+	// FTP session, or HTTP request; the corresponding owner calls fs.Close()
+	// exactly once after all operations finish.
 	fs       *jailFS
 	username string
 	clientIP string
@@ -1968,11 +2575,20 @@ func (j jail) Fileread(r *sftp.Request) (reader io.ReaderAt, err error) {
 	if !j.canRead {
 		return nil, os.ErrPermission
 	}
+	release, err := j.handles.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if reader == nil {
+			release()
+		}
+	}()
 	f, err := j.fs.OpenRead(r.Filepath)
 	if err != nil {
 		return nil, sanitizeSFTPErr(err)
 	}
-	return f, nil
+	return &budgetReader{managedFile: f, release: release}, nil
 }
 
 // writeLogger wraps an *os.File and logs the filename when the file is closed,
@@ -1991,7 +2607,7 @@ func (j jail) Fileread(r *sftp.Request) (reader io.ReaderAt, err error) {
 // upload is truncated and must NOT be announced on the CompletedUploads
 // channel; otherwise consumers would treat a partial file as complete.
 type writeLogger struct {
-	*os.File
+	*managedFile
 
 	filepath     string
 	fullFilepath string
@@ -2021,9 +2637,17 @@ func (w *writeLogger) WriteAt(p []byte, off int64) (n int, err error) {
 		// the off parameter from the SFTP request is intentionally
 		// dropped — honouring it would not change the destination of
 		// the bytes and would only confuse the next reader.
-		return w.Write(p)
+		n, err = w.Write(p)
+		if err != nil {
+			w.TransferError(err)
+		}
+		return n, err
 	}
-	return w.File.WriteAt(p, off)
+	n, err = w.managedFile.WriteAt(p, off)
+	if err != nil {
+		w.TransferError(err)
+	}
+	return n, err
 }
 
 // TransferError implements pkg/sftp's optional TransferError interface. It is
@@ -2045,7 +2669,7 @@ func (w *writeLogger) TransferError(err error) {
 
 func (w *writeLogger) Close() (err error) {
 	defer deferRecoverSFTPPanicf(&err, nil, "sftp write close panic user=%q ip=%q path=%q: %v\n%s", w.username, w.clientIP, w.filepath)()
-	err = w.File.Close()
+	err = w.managedFile.Close()
 	w.mu.Lock()
 	transferErr := w.transferErr
 	w.mu.Unlock()
@@ -2089,12 +2713,21 @@ func (j jail) Filewrite(r *sftp.Request) (writer io.WriterAt, err error) {
 	if err != nil {
 		return nil, err
 	}
+	release, err := j.handles.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if writer == nil {
+			release()
+		}
+	}()
 	f, err := j.fs.OpenWrite(r.Filepath, openFlags, 0o600)
 	if err != nil {
 		return nil, sanitizeSFTPErr(err)
 	}
-	return &writeLogger{
-		File:         f,
+	return &budgetWriter{writeLogger: &writeLogger{
+		managedFile:  f,
 		filepath:     clientPath,
 		fullFilepath: j.fs.fullPath(r.Filepath),
 		username:     j.username,
@@ -2102,7 +2735,7 @@ func (j jail) Filewrite(r *sftp.Request) (writer io.WriterAt, err error) {
 		uploads:      j.uploads,
 		tempExts:     j.tempExts,
 		appendMode:   appendMode,
-	}, nil
+	}, release: release}, nil
 }
 
 func sftpWriteOpenFlags(r *sftp.Request) (int, bool, error) {
@@ -2190,11 +2823,20 @@ func (j jail) Filelist(r *sftp.Request) (lister sftp.ListerAt, err error) {
 	}
 	switch r.Method {
 	case "List":
-		infos, err := j.fs.List(r.Filepath)
+		release, err := j.handles.acquire()
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			if lister == nil {
+				release()
+			}
+		}()
+		lister, err := j.fs.OpenList(r.Filepath)
 		if err != nil {
 			return nil, sanitizeSFTPErr(err)
 		}
-		return listerFromFileInfo(infos), nil
+		return &budgetLister{ListerAt: lister, closer: lister, release: release}, nil
 	case "Stat", "Lstat":
 		// Under the no-symlink policy Stat and Lstat are equivalent: the
 		// kernel rejects any symlink in the path lookup, so the entry being
@@ -2273,11 +2915,7 @@ func (j jail) applyTimes(r *sftp.Request, flags sftp.FileAttrFlags, attrs *sftp.
 	return nil
 }
 
-func jailedHandlers(root, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool) (sftp.Handlers, *jailFS, error) {
-	fs, err := openJailFS(filepath.Clean(root))
-	if err != nil {
-		return sftp.Handlers{}, nil, err
-	}
+func jailedHandlers(fs *jailFS, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool, handles ...*sessionHandleBudget) sftp.Handlers {
 	j := jail{
 		fs:             fs,
 		username:       username,
@@ -2288,12 +2926,15 @@ func jailedHandlers(root, username, clientIP string, canRead, canWrite bool, upl
 		tempExts:       tempExts,
 		sftpAllowChown: sftpAllowChown,
 	}
+	if len(handles) > 0 {
+		j.handles = handles[0]
+	}
 	return sftp.Handlers{
 		FileGet:  j,
 		FilePut:  j,
 		FileCmd:  j,
 		FileList: j,
-	}, fs, nil
+	}
 }
 
 type fileInfoLister struct{ infos []os.FileInfo }
@@ -2338,21 +2979,33 @@ type ftpSession struct {
 	// rawConn is the connection exactly as it was accepted and recorded
 	// in Server.activeConns. AUTH TLS replaces conn with the *tls.Conn
 	// wrapper, but activeConns stays keyed by the accepted conn, so user
-	// association updates (setConnUser) must always go through rawConn;
-	// keying on conn after the upgrade misses the map and the session
+	// association updates (commitConnUser/clearConnUser) must always go through
+	// rawConn; keying on conn after the upgrade misses the map and the session
 	// escapes RemoveUser / RemoveAllUsers eviction.
-	rawConn       net.Conn
-	r             *bufio.Reader
-	w             *bufio.Writer
-	username      string
-	user          UserInfo
-	authenticated bool
-	cwd           string
-	dataLn        net.Listener
-	dataAddr      *net.TCPAddr
-	epsvAll       bool
-	rnfrPath      string
-	restartOffset int64
+	rawConn        net.Conn
+	r              *bufio.Reader
+	w              *bufio.Writer
+	username       string
+	user           UserInfo
+	authenticated  bool
+	authFailures   int
+	authTerminated bool
+	cwd            string
+	// dataMu protects data endpoints against revocation/shutdown callbacks.
+	// cancelled is permanent for this control session; AUTH TLS and REIN
+	// reset protocol state without reviving a revoked connection.
+	dataMu     sync.Mutex
+	dataLn     net.Listener
+	dataAddr   *net.TCPAddr
+	dataConn   net.Conn
+	dataCancel context.CancelFunc
+	cancelled  bool
+	// controlReadClosed interrupts data setup after EOF without revoking
+	// commands already queued on the control connection. Guarded by dataMu.
+	controlReadClosed bool
+	epsvAll           bool
+	rnfrPath          string
+	restartOffset     int64
 	// expectedUploadSize is the byte count declared by the client via the
 	// most recent ALLO command; it is consumed by the next STOR/APPE so
 	// an aborted transfer cannot let the hint leak into a later command.
@@ -2403,6 +3056,12 @@ type ftpSession struct {
 }
 
 func (s *Server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) {
+	// An absolute authentication window also interrupts stalled AUTH TLS
+	// handshakes and reply writes. Unauthenticated NOOP/USER/REIN traffic
+	// never resets it. Closing the socket wakes the existing reader.
+	authTimeout := positiveDuration(s.ftpAuthTimeout, defaultFTPAuthTimeout)
+	authTimer := time.AfterFunc(authTimeout, func() { _ = nc.Close() })
+	defer func() { authTimer.Stop() }()
 	sess := &ftpSession{
 		server:     s,
 		conn:       nc,
@@ -2416,6 +3075,11 @@ func (s *Server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- Co
 		uploads:    uploads,
 		authEvents: authEvents,
 	}
+	if !s.setConnCancel(nc, sess.cancelDataOperations) {
+		_ = nc.Close()
+		return
+	}
+	defer sess.cancelDataOperations()
 	// Close nc first, then drain the current reader's ctlMsg so its goroutine
 	// can exit. The reader may have been restarted by AUTH TLS; sess.ctlMsg
 	// is re-read at defer-execution time so the drain targets whichever
@@ -2462,8 +3126,14 @@ func (s *Server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- Co
 			continue
 		}
 		cmd, arg := parseFTPCommand(line)
+		wasAuthenticated := sess.authenticated
 		if sess.handleFTPCommand(cmd, arg) {
 			return
+		}
+		if sess.authenticated {
+			authTimer.Stop()
+		} else if wasAuthenticated {
+			authTimer.Reset(authTimeout)
 		}
 	}
 }
@@ -2578,6 +3248,10 @@ func (f *ftpSession) readControlLines() {
 				return
 			default:
 			}
+			// EOF can mean only the peer's write half has closed. Preserve
+			// all preceding commands and their replies by delivering this
+			// error in FIFO order; only explicit revocation cancels dispatch.
+			f.controlReaderClosed()
 			select {
 			case f.ctlMsg <- ftpCtlMsg{err: err}:
 			case <-f.readerStop:
@@ -2642,6 +3316,12 @@ func parseFTPCommand(line string) (string, string) {
 }
 
 func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
+	f.dataMu.Lock()
+	cancelled := f.cancelled
+	f.dataMu.Unlock()
+	if cancelled {
+		return true
+	}
 	handled, quit := f.handlePreAuthCommand(cmd, arg)
 	if handled {
 		return quit
@@ -2657,7 +3337,7 @@ func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
 // handlePreAuthCommand handles the commands that are accepted before
 // authentication (or that have AUTH-TLS-specific gating). Returns
 // handled=true when the command matched a pre-auth case, and quit=true when
-// the session should terminate (only QUIT does this).
+// the session should terminate (QUIT or a login limit does this).
 func (f *ftpSession) handlePreAuthCommand(cmd, arg string) (handled, quit bool) {
 	if cmd == "QUIT" {
 		_ = f.reply(221, "goodbye")
@@ -2665,7 +3345,7 @@ func (f *ftpSession) handlePreAuthCommand(cmd, arg string) (handled, quit bool) 
 	}
 	if handler, ok := preAuthFTPHandlers[cmd]; ok {
 		handler(f, arg)
-		return true, false
+		return true, f.authTerminated
 	}
 	return false, false
 }
@@ -2705,7 +3385,7 @@ func (f *ftpSession) cmdUser(arg string) {
 	// user association so a RemoveUser for that name no longer evicts a
 	// session that is mid-login as someone else. A successful PASS will
 	// re-establish the association for the new user.
-	f.server.setConnUser(f.rawConn, "")
+	f.server.clearConnUser(f.rawConn)
 	f.username = arg
 	f.authenticated = false
 	f.user = UserInfo{}
@@ -2713,6 +3393,10 @@ func (f *ftpSession) cmdUser(arg string) {
 }
 
 func (f *ftpSession) cmdPass(arg string) {
+	if f.authenticated {
+		_ = f.reply(503, "already logged in; send USER or REIN first")
+		return
+	}
 	if f.server.ftpRequireTLS && f.tlsConn == nil {
 		_ = f.reply(534, "AUTH TLS required before login")
 		return
@@ -2721,12 +3405,29 @@ func (f *ftpSession) cmdPass(arg string) {
 		_ = f.reply(503, "send USER first")
 		return
 	}
+	if f.server.allowAuth(f.username, f.clientIP) > 0 {
+		f.server.authFailed(f.username, f.clientIP, CompletedUploadProtocolFTP, f.authEvents, true)
+		f.authTerminated = true
+		_ = f.reply(421, "authentication temporarily unavailable, closing control connection")
+		return
+	}
 	if !f.authenticate(arg) {
-		f.announceAuthEvent(AuthEventLoginFailed)
+		f.authFailures++
+		f.server.authFailed(f.username, f.clientIP, CompletedUploadProtocolFTP, f.authEvents, false)
+		limit := f.server.ftpMaxAuthFailures
+		if limit <= 0 {
+			limit = 5
+		}
+		if f.authFailures >= limit {
+			f.authTerminated = true
+			_ = f.reply(421, "too many authentication failures, closing control connection")
+			return
+		}
 		_ = f.reply(530, errInvalidCredentials.Error())
 		return
 	}
-	log.Printf("login protocol=ftp user=%s root=%s from=%s", f.username, f.user.Root, f.conn.RemoteAddr())
+	f.server.authSucceeded(f.username, f.clientIP)
+	log.Printf("login protocol=ftp user=%q root=%q from=%s", f.username, f.user.Root, f.conn.RemoteAddr())
 	f.announceAuthEvent(AuthEventLoginSuccess)
 	_ = f.reply(230, "login successful")
 }
@@ -2821,7 +3522,7 @@ var authedFTPHandlers = map[string]func(*ftpSession, string){
 	"RNFR": func(f *ftpSession, arg string) { f.cmdRnfr(arg) },
 	"RNTO": func(f *ftpSession, arg string) { f.cmdRnto(arg) },
 	"ABOR": func(f *ftpSession, _ string) {
-		f.closeDataListener()
+		f.closeDataEndpoint()
 		f.restartOffset = 0
 		f.expectedUploadSize = 0
 		_ = f.reply(226, "abort successful")
@@ -3030,7 +3731,13 @@ func (f *ftpSession) preTLSChannelClean() bool {
 				return f.r.Buffered() == 0 || f.logPreTLSBuffered()
 			}
 			if msg.err == nil && strings.TrimSpace(msg.line) != "" {
-				log.Printf("ftp AUTH TLS rejected from=%s: pre-TLS line buffered: %q", f.conn.RemoteAddr(), msg.line)
+				verb, _ := parseFTPCommand(strings.TrimRight(msg.line, "\r\n"))
+				log.Printf(
+					"ftp AUTH TLS rejected from=%s: pre-TLS command buffered: verb=%q bytes=%d",
+					f.conn.RemoteAddr(),
+					sanitizeFTPText(verb),
+					len(msg.line),
+				)
 				return false
 			}
 		default:
@@ -3054,6 +3761,7 @@ func (f *ftpSession) resetSessionStateForAuthTLS() {
 	// is released (both were previously skipped), and clear the
 	// connection's user association so a RemoveUser for the pre-TLS user
 	// cannot evict the now-anonymous session.
+	f.closeDataEndpoint()
 	f.logoutIfAuthenticated()
 	f.username = ""
 	f.authenticated = false
@@ -3061,7 +3769,10 @@ func (f *ftpSession) resetSessionStateForAuthTLS() {
 	f.rnfrPath = ""
 	f.restartOffset = 0
 	f.expectedUploadSize = 0
-	f.server.setConnUser(f.rawConn, "")
+	f.epsvAll = false
+	f.pbszSet = false
+	f.dataProt = 'C'
+	f.server.clearConnUser(f.rawConn)
 }
 
 func (f *ftpSession) performTLSHandshake() bool {
@@ -3092,40 +3803,24 @@ func (f *ftpSession) performTLSHandshake() bool {
 }
 
 func (f *ftpSession) authenticate(pass string) bool {
-	u, jailRoot, ok := f.server.authenticateUser(f.username, func(stored UserInfo) bool {
+	u, jfs, revision, ok := f.server.authenticateUser(f.username, func(stored UserInfo) bool {
 		return checkPassword(stored.Password, pass)
 	})
 	if !ok {
 		return false
 	}
-	// Open the fd-relative jail filesystem now. If openat2 is not available
-	// on the running kernel this fails and the login is rejected, preserving
-	// the package's hardened guarantee that all subsequent FTP commands
-	// operate via openat2.
-	jfs, err := openJailFS(jailRoot)
-	if err != nil {
-		log.Printf("ftp open jail root %q for user %q: %v", jailRoot, f.username, err)
+	if !f.server.commitConnUser(f.rawConn, f.username, revision) {
+		_ = jfs.Close()
 		return false
 	}
 	// Release any previous jail from a stale session that re-used USER/PASS.
 	f.closeJail()
 	f.fs = jfs
-	f.user = UserInfo{
-		Password:       u.Password,
-		Root:           jailRoot,
-		CanRead:        u.CanRead,
-		CanWrite:       u.CanWrite,
-		AuthorizedKeys: slices.Clone(u.AuthorizedKeys),
-	}
+	f.user = u
 	f.authenticated = true
 	f.cwd = "/"
 	f.rnfrPath = ""
 	f.restartOffset = 0
-	// Tie the connection to the authenticated user so RemoveUser can
-	// force-close active FTP sessions if the account is revoked. Key on
-	// rawConn: after AUTH TLS, f.conn is the *tls.Conn wrapper, which is
-	// not the conn the accept loop registered in activeConns.
-	f.server.setConnUser(f.rawConn, f.username)
 	return true
 }
 
@@ -3160,6 +3855,7 @@ func (f *ftpSession) closeJail() {
 }
 
 func (f *ftpSession) reply(code int, message string) error {
+	f.setControlWriteDeadline()
 	_, err := fmt.Fprintf(f.w, "%d %s\r\n", code, message)
 	if err != nil {
 		return err
@@ -3168,6 +3864,7 @@ func (f *ftpSession) reply(code int, message string) error {
 }
 
 func (f *ftpSession) multilineReply(code int, first string, lines []string, last string) error {
+	f.setControlWriteDeadline()
 	if _, err := fmt.Fprintf(f.w, "%d-%s\r\n", code, first); err != nil {
 		return err
 	}
@@ -3180,6 +3877,14 @@ func (f *ftpSession) multilineReply(code int, first string, lines []string, last
 		return err
 	}
 	return f.w.Flush()
+}
+
+// Bound control-channel writes too: STAT and pipelined commands can fill
+// the client's receive buffer even while the control reader remains active.
+func (f *ftpSession) setControlWriteDeadline() {
+	if f.conn != nil {
+		_ = f.conn.SetWriteDeadline(time.Now().Add(ftpDataIdleTimeout))
+	}
 }
 
 func (f *ftpSession) cleanPath(p string) string {
@@ -3263,12 +3968,19 @@ func (f *ftpSession) enterPassive(epsv bool) {
 		return
 	}
 
-	ln, err := f.server.listenFTPData(host)
+	ln, err := f.server.listenReservedFTPData(host, f.username, f.clientIP)
 	if err != nil {
 		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
+	f.dataMu.Lock()
+	if f.cancelled {
+		f.dataMu.Unlock()
+		_ = ln.Close()
+		return
+	}
 	f.dataLn = ln
+	f.dataMu.Unlock()
 
 	port := ln.Addr().(*net.TCPAddr).Port
 	if epsv {
@@ -3338,7 +4050,13 @@ func (f *ftpSession) enterActive(addr *net.TCPAddr) {
 		return
 	}
 	f.closeDataEndpoint()
+	f.dataMu.Lock()
+	if f.cancelled {
+		f.dataMu.Unlock()
+		return
+	}
 	f.dataAddr = addr
+	f.dataMu.Unlock()
 	_ = f.reply(200, "active mode ready")
 }
 
@@ -3412,10 +4130,44 @@ func (f *ftpSession) acceptDataConn() (net.Conn, error) {
 		f.closeDataEndpoint()
 		return nil, errFTPDataProtectionRequired
 	}
-	dc, err := f.dialOrAcceptDataConn()
-	if err != nil {
-		return nil, err
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.dataMu.Lock()
+	if f.cancelled || f.controlReadClosed {
+		f.dataMu.Unlock()
+		return nil, net.ErrClosed
 	}
+	f.dataCancel = cancel
+	ln, addr := f.dataLn, f.dataAddr
+	f.dataMu.Unlock()
+	defer f.finishDataSetup()
+	var deadline time.Time
+	if timeout := f.server.effectiveFTPDataAcceptTimeout(); timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	if ln != nil {
+		if reserved, ok := ln.(*ftpPassiveListener); ok {
+			// PASV/EPSV starts this deadline. A later transfer command must
+			// not extend a reservation held open with control-channel NOOPs.
+			deadline = reserved.deadline
+		}
+		return f.acceptPassiveDataConn(ctx, ln, deadline)
+	}
+	if addr != nil {
+		return f.dialActiveDataConn(ctx, addr, deadline)
+	}
+	return nil, errors.New("data connection not prepared")
+}
+
+func (f *ftpSession) protectDataConn(ctx context.Context, dc net.Conn, setupDeadline time.Time) (net.Conn, error) {
+	f.dataMu.Lock()
+	if f.cancelled || f.controlReadClosed {
+		f.dataMu.Unlock()
+		_ = dc.Close()
+		return nil, net.ErrClosed
+	}
+	f.dataConn = dc
+	f.dataMu.Unlock()
 	if f.dataProt != 'P' {
 		return dc, nil
 	}
@@ -3428,9 +4180,12 @@ func (f *ftpSession) acceptDataConn() (net.Conn, error) {
 		return nil, errors.New("PROT P requested but FTPS is not configured")
 	}
 	deadline := time.Now().Add(ftpTLSHandshakeTimeout)
+	if !setupDeadline.IsZero() && setupDeadline.Before(deadline) {
+		deadline = setupDeadline
+	}
 	_ = dc.SetDeadline(deadline)
 	tc := tls.Server(dc, f.dataTLSConfig)
-	if err := tc.HandshakeContext(context.Background()); err != nil {
+	if err := tc.HandshakeContext(ctx); err != nil {
 		_ = dc.Close()
 		return nil, fmt.Errorf("data tls handshake: %w", err)
 	}
@@ -3438,50 +4193,42 @@ func (f *ftpSession) acceptDataConn() (net.Conn, error) {
 	return tc, nil
 }
 
-func (f *ftpSession) dialOrAcceptDataConn() (net.Conn, error) {
-	if f.dataLn != nil {
-		return f.acceptPassiveDataConn()
+func (f *ftpSession) acceptPassiveDataConn(ctx context.Context, ln net.Listener, deadline time.Time) (net.Conn, error) {
+	if tcpLn, ok := ln.(interface{ SetDeadline(time.Time) error }); ok {
+		_ = tcpLn.SetDeadline(deadline)
 	}
-	if f.dataAddr != nil {
-		return f.dialActiveDataConn()
-	}
-	return nil, errors.New("data connection not prepared")
-}
-
-func (f *ftpSession) acceptPassiveDataConn() (net.Conn, error) {
-	ln := f.dataLn
-	f.dataLn = nil
-	defer func() { _ = ln.Close() }()
-
-	if tcpLn, ok := ln.(*net.TCPListener); ok {
-		if timeout := f.server.effectiveFTPDataAcceptTimeout(); timeout > 0 {
-			_ = tcpLn.SetDeadline(time.Now().Add(timeout))
+	// A foreign peer must not consume the legitimate client's passive port.
+	// Bound failed attempts as well as elapsed time, including when the
+	// administrator has explicitly disabled the overall setup deadline.
+	const maxRejectedPeers = 32
+	for range maxRejectedPeers {
+		dc, err := ln.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if f.clientIP != "" && remoteIP(dc.RemoteAddr()) != f.clientIP {
+			_ = dc.Close()
+			continue
+		}
+		protected, err := f.protectDataConn(ctx, dc, deadline)
+		if err == nil {
+			return protected, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
 	}
+	return nil, errors.New("too many rejected data connections")
+}
 
-	dc, err := ln.Accept()
+func (f *ftpSession) dialActiveDataConn(ctx context.Context, addr *net.TCPAddr, deadline time.Time) (net.Conn, error) {
+	dialer := net.Dialer{Deadline: deadline}
+	log.Printf("ftp active data dial user=%q from=%s to=%s", f.username, f.conn.RemoteAddr(), addr)
+	dc, err := dialer.DialContext(ctx, "tcp", addr.String())
 	if err != nil {
 		return nil, err
 	}
-
-	// Prevent passive data-port stealing by requiring the data connection to
-	// originate from the same IP as the control connection.
-	if f.clientIP != "" && remoteIP(dc.RemoteAddr()) != f.clientIP {
-		_ = dc.Close()
-		return nil, fmt.Errorf("data connection from unexpected IP %s", remoteIP(dc.RemoteAddr()))
-	}
-	return dc, nil
-}
-
-func (f *ftpSession) dialActiveDataConn() (net.Conn, error) {
-	addr := f.dataAddr
-	f.dataAddr = nil
-	dialer := net.Dialer{}
-	if timeout := f.server.effectiveFTPDataAcceptTimeout(); timeout > 0 {
-		dialer.Timeout = timeout
-	}
-	log.Printf("ftp active data dial user=%s from=%s to=%s", f.username, f.conn.RemoteAddr(), addr)
-	return dialer.Dial("tcp", addr.String())
+	return f.protectDataConn(ctx, dc, deadline)
 }
 
 // closeDataConn closes an FTP data connection. For TLS-wrapped data
@@ -3504,16 +4251,70 @@ func closeDataConn(dc net.Conn) {
 	_ = dc.Close()
 }
 
-func (f *ftpSession) closeDataListener() {
-	if f.dataLn != nil {
-		_ = f.dataLn.Close()
-		f.dataLn = nil
-	}
+func (f *ftpSession) finishDataSetup() {
+	f.closeDataEndpoint()
+	f.dataMu.Lock()
+	f.dataCancel = nil
+	f.dataMu.Unlock()
 }
 
 func (f *ftpSession) closeDataEndpoint() {
-	f.closeDataListener()
+	f.dataMu.Lock()
+	ln := f.dataLn
+	f.dataLn = nil
 	f.dataAddr = nil
+	f.dataMu.Unlock()
+	if ln != nil {
+		_ = ln.Close()
+	}
+}
+
+// controlReaderClosed interrupts a pending accept/dial/TLS handshake, which
+// cannot consume the queued terminal error while it is blocked. Established
+// transfers consume it through runTransfer instead. Queued ordinary commands
+// must still execute; the reader ending is not an authorization revocation.
+func (f *ftpSession) controlReaderClosed() {
+	f.dataMu.Lock()
+	f.controlReadClosed = true
+	ln, dc, cancel := f.dataLn, f.dataConn, f.dataCancel
+	f.dataMu.Unlock()
+	if cancel == nil {
+		return
+	}
+	cancel()
+	if ln != nil {
+		_ = ln.Close()
+	}
+	if dc != nil {
+		_ = dc.Close()
+	}
+}
+
+// cancelDataOperations permanently cancels the session for revocation,
+// shutdown, or final teardown. It never waits for the handler to finish.
+func (f *ftpSession) cancelDataOperations() {
+	f.dataMu.Lock()
+	f.cancelled = true
+	ln, dc, cancel := f.dataLn, f.dataConn, f.dataCancel
+	f.dataLn, f.dataConn, f.dataCancel = nil, nil, nil
+	f.dataAddr = nil
+	f.dataMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if ln != nil {
+		_ = ln.Close()
+	}
+	if dc != nil {
+		_ = dc.Close()
+	}
+}
+
+func (f *ftpSession) finishDataConn(dc net.Conn) {
+	closeDataConn(dc)
+	f.dataMu.Lock()
+	f.dataConn = nil
+	f.dataMu.Unlock()
 }
 
 // runTransfer executes work on dc while watching the control connection
@@ -3581,7 +4382,7 @@ func (f *ftpSession) cmdList(arg string, namesOnly bool) {
 		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
-	defer closeDataConn(dc)
+	defer f.finishDataConn(dc)
 
 	// Apply a per-Write idle deadline so a client that opens the data
 	// connection but refuses to read does not pin this goroutine and FD
@@ -3701,7 +4502,7 @@ func (f *ftpSession) cmdRetr(arg string) {
 		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
-	defer closeDataConn(dc)
+	defer f.finishDataConn(dc)
 
 	// Apply a per-Write idle deadline so a client that opens the data
 	// connection but refuses to read (filling its TCP receive buffer) does
@@ -3735,26 +4536,23 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 	}
 	ftpPath := f.cleanPath(arg)
 
-	// Open the destination file before sending 150 / accepting the data
-	// connection. Opening first means an open failure (permission, path,
-	// restart offset past EOF) is reported with the client still idle,
-	// rather than after it has already begun streaming data.
-	file, ok := f.openUploadFile(ftpPath, appendMode, restartOffset)
-	if !ok {
-		return
-	}
-
 	if err := f.reply(150, "opening data connection"); err != nil {
-		_ = file.Close()
 		return
 	}
 	dc, err := f.acceptDataConn()
 	if err != nil {
-		_ = file.Close()
 		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
-	defer closeDataConn(dc)
+	defer f.finishDataConn(dc)
+
+	// Opening with O_CREATE/O_TRUNC is destructive. Do it only after the
+	// source-address check and, for FTPS, session-bound TLS authentication
+	// have succeeded. Failed or raced data setup must not modify the jail.
+	file, ok := f.openUploadFile(ftpPath, appendMode, restartOffset)
+	if !ok {
+		return
+	}
 
 	// When resuming a STOR via REST, ALLO carried the total file size but
 	// only the bytes from restartOffset onward travel on this transfer;
@@ -3777,7 +4575,7 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 // appropriate O_TRUNC/O_APPEND semantics and applies the restart offset (for
 // REST + STOR). It sends the appropriate FTP reply on any error and returns
 // ok=false when the caller should bail out.
-func (f *ftpSession) openUploadFile(ftpPath string, appendMode bool, restartOffset int64) (*os.File, bool) {
+func (f *ftpSession) openUploadFile(ftpPath string, appendMode bool, restartOffset int64) (*managedFile, bool) {
 	flags := os.O_CREATE | os.O_WRONLY
 	switch {
 	case appendMode:
@@ -3810,7 +4608,7 @@ func (f *ftpSession) openUploadFile(ftpPath string, appendMode bool, restartOffs
 // indistinguishable at the protocol level from a client that intended to
 // upload exactly N bytes. The only reliable defense is an explicit size
 // hint from the client (ALLO); finalizeUploadStatus enforces it.
-func (f *ftpSession) runUploadCopy(dc net.Conn, file *os.File) (written int64, aborted bool, copyErr, closeErr error) {
+func (f *ftpSession) runUploadCopy(dc net.Conn, file *managedFile) (written int64, aborted bool, copyErr, closeErr error) {
 	idleDC := &idleConn{Conn: dc}
 	idleDC.setReadTimeout(ftpDataIdleTimeout)
 	aborted, copyErr = f.runTransfer(dc, func() error {
@@ -3851,7 +4649,7 @@ func (f *ftpSession) finalizeUploadStatus(ftpPath string, written, expectedSize 
 // silently corrupts the upload), closes the file and sends the appropriate
 // FTP reply on any error, and returns true only when the file is ready for
 // the data copy.
-func (f *ftpSession) applyRestartOffset(file *os.File, restartOffset int64) bool {
+func (f *ftpSession) applyRestartOffset(file *managedFile, restartOffset int64) bool {
 	st, statErr := file.Stat()
 	if statErr != nil {
 		_ = file.Close()
@@ -3985,7 +4783,7 @@ func (f *ftpSession) cmdRein() {
 	// The session is no longer tied to the previous user; clear the
 	// connection's user association so a RemoveUser for that name does not
 	// kick this now-anonymous session.
-	f.server.setConnUser(f.rawConn, "")
+	f.server.clearConnUser(f.rawConn)
 	_ = f.reply(220, "ready for new user")
 }
 
@@ -4023,20 +4821,45 @@ func (f *ftpSession) cmdStat(arg string) {
 		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
-	var lines []string
-	if st.IsDir() {
-		entries, err := f.fs.List(ftpPath)
-		if err != nil {
-			_ = f.reply(550, ftpErrMsg(err))
-			return
-		}
-		for _, info := range entries {
-			lines = append(lines, ftpListLine(info, info.Name()))
-		}
-	} else {
-		lines = append(lines, ftpListLine(st, ftpPathBase(ftpPath)))
+	if err := f.writeStatListing(ftpPath, st); err != nil && f.conn != nil {
+		// A failure after the multiline header cannot be represented as a
+		// separate reply without desynchronizing the control protocol.
+		_ = f.conn.Close()
 	}
-	_ = f.multilineReply(213, "Status of "+ftpQuotePath(ftpPath)+":", lines, "End of status")
+}
+
+func (f *ftpSession) writeStatListing(ftpPath string, st os.FileInfo) error {
+	var dir *managedFile
+	if st.IsDir() {
+		var err error
+		dir, err = f.fs.openManagedDirectory(ftpPath)
+		if err != nil {
+			// No multiline reply has started, so an ordinary error keeps the
+			// control connection synchronized and usable for later commands.
+			return f.reply(550, ftpErrMsg(err))
+		}
+		defer func() { _ = dir.Close() }()
+	}
+	f.setControlWriteDeadline()
+	if _, err := fmt.Fprintf(f.w, "213-Status of %s:\r\n", ftpQuotePath(ftpPath)); err != nil {
+		return err
+	}
+	writeEntry := func(info os.FileInfo, name string) error {
+		_, err := fmt.Fprintf(f.w, " %s\r\n", ftpListLine(info, name))
+		return err
+	}
+	var err error
+	if dir != nil {
+		err = streamDirectory(dir, func(info os.FileInfo) error {
+			return writeEntry(info, info.Name())
+		})
+	} else {
+		err = writeEntry(st, ftpPathBase(ftpPath))
+	}
+	if err != nil {
+		return err
+	}
+	return f.reply(213, "End of status")
 }
 
 // cmdMLST answers MLST (RFC 3659). MLST returns machine-readable facts for a
@@ -4088,7 +4911,7 @@ func (f *ftpSession) cmdMLSD(arg string) {
 		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
-	defer closeDataConn(dc)
+	defer f.finishDataConn(dc)
 
 	idleDC := &idleConn{Conn: dc}
 	idleDC.setWriteTimeout(ftpDataIdleTimeout)

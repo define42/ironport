@@ -276,6 +276,13 @@ func newTestServer(addr, ftpAddr, ftpPassivePortRange string, users map[string]U
 	return NewServer(newTestConfig(addr, ftpAddr, ftpPassivePortRange, users, signer, completedUploadsSize))
 }
 
+func testSSHServerConfig(t *testing.T, srv *Server) *ssh.ServerConfig {
+	t.Helper()
+	authState := &sshAuthState{}
+	t.Cleanup(authState.close)
+	return srv.sshServerConfig(authState)
+}
+
 func newTestFTPConfig(t *testing.T, users map[string]UserInfo, ftpPassivePortRange string, allowActive bool) *Config {
 	t.Helper()
 	config := newTestConfig("127.0.0.1:0", "127.0.0.1:0", ftpPassivePortRange, users, testSigner(t), defaultCompletedUploadsSize)
@@ -305,7 +312,6 @@ func startTestServerWithConfig(t *testing.T, config *Config) (srv *Server, addr 
 	serverConfig := *config
 	serverConfig.SftpAddr = addr
 	srv = NewServer(&serverConfig)
-	cfg := srv.sshServerConfig()
 
 	go func() {
 		for {
@@ -317,11 +323,11 @@ func startTestServerWithConfig(t *testing.T, config *Config) (srv *Server, addr 
 				_ = nc.Close()
 				continue
 			}
-			go func() {
+			go func(nc net.Conn) {
 				defer srv.connWG.Done()
 				defer srv.untrackConn(nc)
-				srv.handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.sftpChownAllowed())
-			}()
+				srv.handleConn(nc, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.sftpChownAllowed())
+			}(nc)
 		}
 	}()
 
@@ -863,7 +869,7 @@ func TestFTPTLSSessionBindingRejectsCustomSessionCallbacks(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srv := NewServer(&Config{FtpTLSConfig: tt.config()})
+			srv := NewServer(&Config{FtpAddr: "127.0.0.1:0", FtpTLSConfig: tt.config()})
 			if err := srv.prepareForListen(); err == nil {
 				t.Fatal("prepareForListen accepted a custom TLS session callback")
 			} else if !strings.Contains(err.Error(), "custom TLS session wrapping") {
@@ -1064,7 +1070,7 @@ func TestSSHServerConfig_AppliesAlgorithmPins(t *testing.T) {
 	config.SSHCiphers[0] = ssh.CipherAES128CTR
 	config.TempExtensions[0] = ".writing"
 
-	cfg := srv.sshServerConfig()
+	cfg := testSSHServerConfig(t, srv)
 	if !slices.Equal(cfg.KeyExchanges, []string{ssh.KeyExchangeCurve25519}) {
 		t.Fatalf("KeyExchanges = %v; want %v", cfg.KeyExchanges, []string{ssh.KeyExchangeCurve25519})
 	}
@@ -1483,6 +1489,54 @@ func TestServerListenFTPData(t *testing.T) {
 	})
 }
 
+func TestFTPServer_RetainsJailRootAfterPathReplacement(t *testing.T) {
+	base := t.TempDir()
+	configuredRoot := filepath.Join(base, "root")
+	if err := os.Mkdir(configuredRoot, 0o750); err != nil {
+		t.Fatalf("os.Mkdir(configured root): %v", err)
+	}
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: configuredRoot, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestFTPServer(t, users, "")
+	t.Cleanup(stop)
+
+	client := dialFTP(t, addr)
+	client.login("alice", "alicepw")
+
+	openedRoot := filepath.Join(base, "opened-root")
+	if err := os.Rename(configuredRoot, openedRoot); err != nil {
+		t.Fatalf("os.Rename(configured root): %v", err)
+	}
+	if err := os.Mkdir(configuredRoot, 0o750); err != nil {
+		t.Fatalf("os.Mkdir(replacement root): %v", err)
+	}
+
+	dataConn, _ := client.passiveConn()
+	client.send("STOR retained.txt")
+	client.read(150)
+	payload := []byte("retained FTP jail")
+	if _, err := dataConn.Write(payload); err != nil {
+		_ = dataConn.Close()
+		t.Fatalf("dataConn.Write: %v", err)
+	}
+	if err := dataConn.Close(); err != nil {
+		t.Fatalf("dataConn.Close: %v", err)
+	}
+	client.read(226)
+
+	got, err := os.ReadFile(filepath.Join(openedRoot, "retained.txt")) //nolint:gosec // path is confined to t.TempDir
+	if err != nil {
+		t.Fatalf("os.ReadFile(opened root): %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("retained file contents = %q; want %q", got, payload)
+	}
+	if _, err := os.Stat(filepath.Join(configuredRoot, "retained.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement root received retained.txt; stat error = %v", err)
+	}
+}
+
 //nolint:gocognit,cyclop,funlen // single end-to-end FTP scenario: upload, download, list, verify
 func TestFTPServer_UploadDownloadList(t *testing.T) {
 	root := t.TempDir()
@@ -1802,12 +1856,12 @@ func TestFTPServer_RestBeyondFileSizeRejected(t *testing.T) {
 	client.command(200, "TYPE I")
 
 	// REST past EOF of an existing file: STOR must fail with 554 and the
-	// existing bytes must remain untouched. The destination is opened before
-	// the 150 reply, so the rejection arrives immediately with no 150 and no
-	// data transfer.
+	// existing bytes must remain untouched. Validation follows 150 and the
+	// authenticated data connection, before any data is written.
 	client.command(350, "REST 99")
 	rejectConn, _ := client.passiveConn()
-	client.command(554, "STOR existing.txt")
+	client.command(150, "STOR existing.txt")
+	client.read(554)
 	_ = rejectConn.Close()
 
 	if got, err := os.ReadFile(existingPath); err != nil { //nolint:gosec // path under t.TempDir()
@@ -1820,7 +1874,8 @@ func TestFTPServer_RestBeyondFileSizeRejected(t *testing.T) {
 	// be created at size 0 and writing at offset N would leave a hole.
 	client.command(350, "REST 10")
 	newConn, _ := client.passiveConn()
-	client.command(554, "STOR new.txt")
+	client.command(150, "STOR new.txt")
+	client.read(554)
 	_ = newConn.Close()
 
 	// REST at exactly EOF is still allowed (equivalent to APPE-style
@@ -1843,12 +1898,10 @@ func TestFTPServer_RestBeyondFileSizeRejected(t *testing.T) {
 	}
 }
 
-// TestFTPServer_StorOpenFailureBefore150 verifies that when the upload
-// destination cannot be opened (here: the path is an existing directory),
-// the server rejects the STOR with 550 *before* sending any 150 reply and
-// without ever accepting a data connection. Opening the file first means a
-// client never starts streaming into a transfer that is doomed to fail.
-func TestFTPServer_StorOpenFailureBefore150(t *testing.T) {
+// TestFTPServer_StorOpenFailureAfterDataSetup verifies that destructive opens
+// occur only after data setup. Invalid destinations consequently receive 150
+// followed by 550 after the server has accepted the authenticated data peer.
+func TestFTPServer_StorOpenFailureAfterDataSetup(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Mkdir(filepath.Join(root, "adir"), 0o700); err != nil {
 		t.Fatalf("os.Mkdir: %v", err)
@@ -1863,10 +1916,10 @@ func TestFTPServer_StorOpenFailureBefore150(t *testing.T) {
 	client.login("ftpuser", "ftppw")
 	client.command(200, "TYPE I")
 
-	// Set up a passive listener, then STOR onto a directory: openUploadFile
-	// fails and the server must reply 550 directly, never 150.
+	// Set up a passive listener, then STOR onto a directory.
 	dataConn, _ := client.passiveConn()
-	client.command(550, "STOR adir")
+	client.command(150, "STOR adir")
+	client.read(550)
 	_ = dataConn.Close()
 }
 
@@ -2422,6 +2475,271 @@ func TestServer_AddRemoveUser(t *testing.T) {
 	}
 }
 
+//nolint:funlen // table covers every user mutation that must invalidate an in-flight authentication snapshot
+func TestServer_AuthenticationRevisionRejectsConcurrentChanges(t *testing.T) {
+	root := t.TempDir()
+	key := testSigner(t).PublicKey()
+	otherKey := testSigner(t).PublicKey()
+	info := UserInfo{
+		Password:       "pw",
+		AuthorizedKeys: []ssh.PublicKey{key},
+		Root:           root,
+		CanRead:        true,
+	}
+	tests := []struct {
+		name   string
+		mutate func(*Server)
+	}{
+		{
+			name:   "remove user",
+			mutate: func(s *Server) { s.RemoveUser("alice") },
+		},
+		{
+			name:   "remove all users",
+			mutate: func(s *Server) { s.RemoveAllUsers() },
+		},
+		{
+			name: "replace user",
+			mutate: func(s *Server) {
+				replacement := info
+				replacement.Password = "new-password"
+				s.AddUser("alice", replacement)
+			},
+		},
+		{
+			name:   "remove authorized key",
+			mutate: func(s *Server) { s.RemoveUserKey("alice", key) },
+		},
+		{
+			name:   "add authorized key",
+			mutate: func(s *Server) { s.AddUserKey("alice", otherKey) },
+		},
+		{
+			name: "remove and re-add identical user",
+			mutate: func(s *Server) {
+				s.RemoveUser("alice")
+				s.AddUser("alice", info)
+			},
+		},
+		{
+			name: "remove all and re-add identical user",
+			mutate: func(s *Server) {
+				s.RemoveAllUsers()
+				s.AddUser("alice", info)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewServer(&Config{Users: map[string]UserInfo{"alice": info}})
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			type authResult struct {
+				fs       *jailFS
+				revision uint64
+				ok       bool
+			}
+			result := make(chan authResult, 1)
+			go func() {
+				_, fs, revision, ok := s.authenticateUser("alice", func(UserInfo) bool {
+					close(entered)
+					<-release
+					return true
+				})
+				result <- authResult{fs: fs, revision: revision, ok: ok}
+			}()
+
+			<-entered
+			tc.mutate(s)
+			close(release)
+			got := <-result
+			if got.fs != nil {
+				_ = got.fs.Close()
+				t.Fatal("stale authentication retained a jail descriptor")
+			}
+			if got.ok || got.revision != 0 {
+				t.Fatalf("stale authentication = (revision %d, ok %v); want (0, false)", got.revision, got.ok)
+			}
+		})
+	}
+}
+
+func TestServer_CommitConnUserRejectsStaleRevision(t *testing.T) {
+	root := t.TempDir()
+	key := testSigner(t).PublicKey()
+	otherKey := testSigner(t).PublicKey()
+	info := UserInfo{
+		Password:       "pw",
+		AuthorizedKeys: []ssh.PublicKey{key},
+		Root:           root,
+	}
+	tests := []struct {
+		name   string
+		mutate func(*Server)
+		want   bool
+	}{
+		{name: "current revision", want: true},
+		{name: "removed user", mutate: func(s *Server) { s.RemoveUser("alice") }},
+		{name: "all users removed", mutate: func(s *Server) { s.RemoveAllUsers() }},
+		{
+			name: "replaced user",
+			mutate: func(s *Server) {
+				replacement := info
+				replacement.CanWrite = true
+				s.AddUser("alice", replacement)
+			},
+		},
+		{name: "key revoked", mutate: func(s *Server) { s.RemoveUserKey("alice", key) }},
+		{name: "key added", mutate: func(s *Server) { s.AddUserKey("alice", otherKey) }},
+		{
+			name: "remove add ABA",
+			mutate: func(s *Server) {
+				s.RemoveUser("alice")
+				s.AddUser("alice", info)
+			},
+		},
+		{
+			name: "remove all add ABA",
+			mutate: func(s *Server) {
+				s.RemoveAllUsers()
+				s.AddUser("alice", info)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assertCommitConnUser(t, info, tc.mutate, tc.want)
+		})
+	}
+}
+
+func assertCommitConnUser(t *testing.T, info UserInfo, mutate func(*Server), want bool) {
+	t.Helper()
+	s := NewServer(&Config{Users: map[string]UserInfo{"alice": info}})
+	_, revision, ok := s.userSnapshot("alice")
+	if !ok {
+		t.Fatal("initial user snapshot not found")
+	}
+	serverConn, clientConn := net.Pipe()
+	if !s.trackConn(serverConn) {
+		t.Fatal("trackConn rejected test connection")
+	}
+	t.Cleanup(func() {
+		s.untrackConn(serverConn)
+		s.connWG.Done()
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+	})
+
+	if mutate != nil {
+		mutate(s)
+	}
+	if got := s.commitConnUser(serverConn, "alice", revision); got != want {
+		t.Fatalf("commitConnUser() = %v; want %v", got, want)
+	}
+	s.mu.RLock()
+	state := s.activeConns[serverConn]
+	s.mu.RUnlock()
+	if want && (!state.authenticated || state.username != "alice") {
+		t.Fatalf("committed connection state = %+v; want authenticated alice", state)
+	}
+	if !want && state.authenticated {
+		t.Fatalf("stale commit associated user %q", state.username)
+	}
+}
+
+func TestServer_CommitConnUserRejectsUntrackedConnection(t *testing.T) {
+	s := NewServer(&Config{Users: map[string]UserInfo{
+		"alice": {Password: "pw", Root: t.TempDir()},
+	}})
+	_, revision, ok := s.userSnapshot("alice")
+	if !ok {
+		t.Fatal("initial user snapshot not found")
+	}
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+	})
+	if s.commitConnUser(serverConn, "alice", revision) {
+		t.Fatal("commitConnUser accepted an untracked connection")
+	}
+}
+
+type closeTrackingConn struct {
+	stubConn
+
+	closed bool
+}
+
+func (c *closeTrackingConn) Close() error {
+	c.closed = true
+	return nil
+}
+
+func TestServer_EmptyUsernameConnectionRemainsRevocable(t *testing.T) {
+	info := UserInfo{Password: "pw", Root: t.TempDir()}
+	revocations := []struct {
+		name   string
+		revoke func(*Server)
+	}{
+		{name: "remove user", revoke: func(s *Server) { s.RemoveUser("") }},
+		{name: "remove all users", revoke: func(s *Server) { s.RemoveAllUsers() }},
+	}
+
+	for _, tc := range revocations {
+		t.Run(tc.name, func(t *testing.T) {
+			assertEmptyUsernameRevocation(t, info, tc.revoke)
+		})
+	}
+}
+
+func assertEmptyUsernameRevocation(t *testing.T, info UserInfo, revoke func(*Server)) {
+	t.Helper()
+	preAuthServer := NewServer(&Config{Users: map[string]UserInfo{"": info}})
+	preAuthConn := &closeTrackingConn{}
+	if !preAuthServer.trackConn(preAuthConn) {
+		t.Fatal("trackConn rejected pre-authentication connection")
+	}
+	t.Cleanup(func() {
+		preAuthServer.untrackConn(preAuthConn)
+		preAuthServer.connWG.Done()
+	})
+	revoke(preAuthServer)
+	if preAuthConn.closed {
+		t.Fatal("revocation closed an unauthenticated connection")
+	}
+
+	authServer := NewServer(&Config{Users: map[string]UserInfo{"": info}})
+	_, revision, ok := authServer.userSnapshot("")
+	if !ok {
+		t.Fatal("empty-username snapshot not found")
+	}
+	authConn := &closeTrackingConn{}
+	if !authServer.trackConn(authConn) {
+		t.Fatal("trackConn rejected authenticated connection")
+	}
+	t.Cleanup(func() {
+		authServer.untrackConn(authConn)
+		authServer.connWG.Done()
+	})
+	if !authServer.commitConnUser(authConn, "", revision) {
+		t.Fatal("commitConnUser rejected empty authenticated username")
+	}
+	authServer.mu.RLock()
+	state := authServer.activeConns[authConn]
+	authServer.mu.RUnlock()
+	if !state.authenticated || state.username != "" {
+		t.Fatalf("empty-username connection state = %+v; want authenticated", state)
+	}
+	revoke(authServer)
+	if !authConn.closed {
+		t.Fatal("revocation did not close authenticated empty-username connection")
+	}
+}
+
 // TestServer_RemoveUser_DisconnectsActiveSFTP verifies that RemoveUser
 // force-closes an SFTP session that is currently authenticated as the
 // removed user.
@@ -2774,8 +3092,6 @@ func TestNewSignerFromFile(t *testing.T) {
 
 // TestSFTPServer_WithFileHostKey verifies that the server works end-to-end when
 // started with a host key loaded from a file via NewSignerFromFile.
-//
-//nolint:funlen // end-to-end host-key file load + handshake assertion is one logical scenario
 func TestSFTPServer_WithFileHostKey(t *testing.T) {
 	dir := t.TempDir()
 	root := t.TempDir()
@@ -2800,26 +3116,9 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 	users := map[string]UserInfo{
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-
-	srv := newTestServer(addr, "", "", users, signer, defaultCompletedUploadsSize)
-	cfg := srv.sshServerConfig()
-
-	go func() {
-		for {
-			nc, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go srv.handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.sftpChownAllowed())
-		}
-	}()
-	t.Cleanup(func() { _ = ln.Close() })
+	config := newTestConfig("", "", "", users, signer, defaultCompletedUploadsSize)
+	_, addr, stop := startTestServerWithConfig(t, config)
+	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
 	content := []byte("key from file")
@@ -3236,56 +3535,14 @@ func TestSFTPServer_PublicKeyAuth_InvalidKey(t *testing.T) {
 	}
 }
 
-//nolint:gocognit // exhaustively walks symlink/non-dir/relative-path error paths
-func TestCanonicalJailRoot(t *testing.T) {
+//nolint:gocognit // covers each jail-root rejection path against a live SSH handshake
+func TestSFTPServer_PasswordAuth_ValidatesJailRoot(t *testing.T) {
 	target := t.TempDir()
 	link := filepath.Join(t.TempDir(), "root-link")
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatalf("os.Symlink: %v", err)
 	}
 
-	filePath := filepath.Join(t.TempDir(), "root-file")
-	if err := os.WriteFile(filePath, []byte("x"), 0o600); err != nil {
-		t.Fatalf("os.WriteFile: %v", err)
-	}
-
-	missingPath := filepath.Join(t.TempDir(), "missing")
-
-	tests := []struct {
-		name    string
-		root    string
-		want    string
-		wantErr error
-	}{
-		{name: "empty", root: "", wantErr: os.ErrInvalid},
-		{name: "whitespace", root: " \t ", wantErr: os.ErrInvalid},
-		{name: "missing", root: missingPath, wantErr: os.ErrNotExist},
-		{name: "file", root: filePath, wantErr: syscall.ENOTDIR},
-		{name: "symlink", root: link, want: target},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := canonicalJailRoot(tc.root)
-			if tc.wantErr != nil {
-				if !errors.Is(err, tc.wantErr) {
-					t.Fatalf("canonicalJailRoot(%q) error = %v; want %v", tc.root, err, tc.wantErr)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("canonicalJailRoot(%q): %v", tc.root, err)
-			}
-			if got != tc.want {
-				t.Fatalf("canonicalJailRoot(%q) = %q; want %q", tc.root, got, tc.want)
-			}
-		})
-	}
-}
-
-//nolint:gocognit // covers each jail-root rejection path against a live SSH handshake
-func TestSFTPServer_PasswordAuth_ValidatesJailRoot(t *testing.T) {
-	target := t.TempDir()
 	filePath := filepath.Join(t.TempDir(), "root-file")
 	if err := os.WriteFile(filePath, []byte("x"), 0o600); err != nil {
 		t.Fatalf("os.WriteFile: %v", err)
@@ -3301,6 +3558,7 @@ func TestSFTPServer_PasswordAuth_ValidatesJailRoot(t *testing.T) {
 		{name: "file", root: filePath},
 		{name: "missing", root: filepath.Join(t.TempDir(), "missing")},
 		{name: "directory", root: target, want: target},
+		{name: "symlink", root: link},
 	}
 
 	for _, tc := range tests {
@@ -3308,7 +3566,7 @@ func TestSFTPServer_PasswordAuth_ValidatesJailRoot(t *testing.T) {
 			srv := newTestServer(":0", "", "", map[string]UserInfo{
 				"alice": {Password: "alicepw", Root: tc.root, CanRead: true, CanWrite: true},
 			}, testSigner(t), defaultCompletedUploadsSize)
-			cfg := srv.sshServerConfig()
+			cfg := testSSHServerConfig(t, srv)
 
 			perms, err := cfg.PasswordCallback(testConnMetadata{user: "alice"}, []byte("alicepw"))
 			if tc.want == "" {
@@ -3325,21 +3583,66 @@ func TestSFTPServer_PasswordAuth_ValidatesJailRoot(t *testing.T) {
 			}
 		})
 	}
+}
 
-	link := filepath.Join(t.TempDir(), "root-link")
-	if err := os.Symlink(target, link); err != nil {
-		t.Fatalf("os.Symlink: %v", err)
+func TestSFTPServer_RetainsJailRootAfterPathReplacement(t *testing.T) {
+	base := t.TempDir()
+	configuredRoot := filepath.Join(base, "root")
+	if err := os.Mkdir(configuredRoot, 0o750); err != nil {
+		t.Fatalf("os.Mkdir(configured root): %v", err)
 	}
-	srv := newTestServer(":0", "", "", map[string]UserInfo{
-		"alice": {Password: "alicepw", Root: link, CanRead: true, CanWrite: true},
-	}, testSigner(t), defaultCompletedUploadsSize)
-	cfg := srv.sshServerConfig()
-	perms, err := cfg.PasswordCallback(testConnMetadata{user: "alice"}, []byte("alicepw"))
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: configuredRoot, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	sshClient, err := ssh.Dial("tcp", addr, &ssh.ClientConfig{
+		User:            "alice",
+		Auth:            []ssh.AuthMethod{ssh.Password("alicepw")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // test client against in-process test server; no MITM threat
+	})
 	if err != nil {
-		t.Fatalf("PasswordCallback: %v", err)
+		t.Fatalf("ssh.Dial: %v", err)
 	}
-	if actualJailRoot := perms.Extensions["jailRoot"]; actualJailRoot != target {
-		t.Fatalf("permissions jailRoot = %q; want %q", actualJailRoot, target)
+	t.Cleanup(func() { _ = sshClient.Close() })
+
+	openedRoot := filepath.Join(base, "opened-root")
+	if err := os.Rename(configuredRoot, openedRoot); err != nil {
+		t.Fatalf("os.Rename(configured root): %v", err)
+	}
+	if err := os.Mkdir(configuredRoot, 0o750); err != nil {
+		t.Fatalf("os.Mkdir(replacement root): %v", err)
+	}
+
+	client, err := sftp.NewClient(sshClient)
+	if err != nil {
+		t.Fatalf("sftp.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	payload := []byte("retained jail")
+	f, err := client.Create("/retained.txt")
+	if err != nil {
+		t.Fatalf("client.Create: %v", err)
+	}
+	if _, err := f.Write(payload); err != nil {
+		_ = f.Close()
+		t.Fatalf("file.Write: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("file.Close: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(openedRoot, "retained.txt")) //nolint:gosec // path is confined to t.TempDir
+	if err != nil {
+		t.Fatalf("os.ReadFile(opened root): %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("retained file contents = %q; want %q", got, payload)
+	}
+	if _, err := os.Stat(filepath.Join(configuredRoot, "retained.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement root received retained.txt; stat error = %v", err)
 	}
 }
 
@@ -3348,6 +3651,10 @@ func TestSFTPServer_PublicKeyAuth_RejectsInvalidJailRoot(t *testing.T) {
 	filePath := filepath.Join(t.TempDir(), "root-file")
 	if err := os.WriteFile(filePath, []byte("x"), 0o600); err != nil {
 		t.Fatalf("os.WriteFile: %v", err)
+	}
+	link := filepath.Join(t.TempDir(), "root-link")
+	if err := os.Symlink(t.TempDir(), link); err != nil {
+		t.Fatalf("os.Symlink: %v", err)
 	}
 
 	tests := []struct {
@@ -3358,6 +3665,7 @@ func TestSFTPServer_PublicKeyAuth_RejectsInvalidJailRoot(t *testing.T) {
 		{name: "whitespace", root: "  "},
 		{name: "file", root: filePath},
 		{name: "missing", root: filepath.Join(t.TempDir(), "missing")},
+		{name: "symlink", root: link},
 	}
 
 	for _, tc := range tests {
@@ -3365,14 +3673,84 @@ func TestSFTPServer_PublicKeyAuth_RejectsInvalidJailRoot(t *testing.T) {
 			srv := newTestServer(":0", "", "", map[string]UserInfo{
 				"alice": {AuthorizedKeys: []ssh.PublicKey{clientPubKey}, Root: tc.root, CanRead: true, CanWrite: true},
 			}, testSigner(t), defaultCompletedUploadsSize)
-			cfg := srv.sshServerConfig()
+			cfg := testSSHServerConfig(t, srv)
 
-			perms, err := cfg.PublicKeyCallback(testConnMetadata{user: "alice"}, clientPubKey)
+			metadata := testConnMetadata{user: "alice"}
+			pending, err := cfg.PublicKeyCallback(metadata, clientPubKey)
+			if err != nil {
+				t.Fatalf("PublicKeyCallback: %v", err)
+			}
+			perms, err := cfg.VerifiedPublicKeyCallback(metadata, clientPubKey, pending, clientPubKey.Type())
 			if err == nil {
-				t.Fatalf("PublicKeyCallback returned nil error with permissions %+v", perms)
+				t.Fatalf("VerifiedPublicKeyCallback returned nil error with permissions %+v", perms)
 			}
 		})
 	}
+}
+
+//nolint:gocognit,funlen // covers both revocation and configuration replacement across the two SSH auth phases
+func TestSFTPServer_PublicKeyAuth_RevalidatesAfterKeyQuery(t *testing.T) {
+	_, clientPubKey := testClientKey(t)
+	metadata := testConnMetadata{user: "alice"}
+
+	t.Run("revoked key", func(t *testing.T) {
+		srv := newTestServer(":0", "", "", map[string]UserInfo{
+			"alice": {AuthorizedKeys: []ssh.PublicKey{clientPubKey}, Root: t.TempDir(), CanRead: true},
+		}, testSigner(t), defaultCompletedUploadsSize)
+		authState := &sshAuthState{}
+		t.Cleanup(authState.close)
+		cfg := srv.sshServerConfig(authState)
+
+		pending, err := cfg.PublicKeyCallback(metadata, clientPubKey)
+		if err != nil {
+			t.Fatalf("PublicKeyCallback: %v", err)
+		}
+		srv.RemoveUserKey("alice", clientPubKey)
+		perms, err := cfg.VerifiedPublicKeyCallback(metadata, clientPubKey, pending, clientPubKey.Type())
+		if err == nil {
+			t.Fatalf("VerifiedPublicKeyCallback accepted a revoked key with permissions %+v", perms)
+		}
+		if authState.fs != nil {
+			t.Fatal("revoked key retained a jail descriptor")
+		}
+	})
+
+	t.Run("updated root and permissions", func(t *testing.T) {
+		oldRoot := t.TempDir()
+		newRoot := t.TempDir()
+		srv := newTestServer(":0", "", "", map[string]UserInfo{
+			"alice": {AuthorizedKeys: []ssh.PublicKey{clientPubKey}, Root: oldRoot, CanRead: true},
+		}, testSigner(t), defaultCompletedUploadsSize)
+		authState := &sshAuthState{}
+		t.Cleanup(authState.close)
+		cfg := srv.sshServerConfig(authState)
+
+		pending, err := cfg.PublicKeyCallback(metadata, clientPubKey)
+		if err != nil {
+			t.Fatalf("PublicKeyCallback: %v", err)
+		}
+		srv.AddUser("alice", UserInfo{
+			AuthorizedKeys: []ssh.PublicKey{clientPubKey},
+			Root:           newRoot,
+			CanWrite:       true,
+		})
+		perms, err := cfg.VerifiedPublicKeyCallback(metadata, clientPubKey, pending, clientPubKey.Type())
+		if err != nil {
+			t.Fatalf("VerifiedPublicKeyCallback: %v", err)
+		}
+		if got := perms.Extensions["jailRoot"]; got != newRoot {
+			t.Fatalf("permissions jailRoot = %q; want updated root %q", got, newRoot)
+		}
+		if got := perms.Extensions["canRead"]; got != "false" {
+			t.Fatalf("permissions canRead = %q; want false", got)
+		}
+		if got := perms.Extensions["canWrite"]; got != "true" {
+			t.Fatalf("permissions canWrite = %q; want true", got)
+		}
+		if authState.fs == nil || authState.fs.root != newRoot {
+			t.Fatalf("retained jail = %+v; want updated root %q", authState.fs, newRoot)
+		}
+	})
 }
 
 func TestNewServer_ClonesUsersMapAndAuthorizedKeys(t *testing.T) {
@@ -4641,7 +5019,6 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 	}
 	signer := testSigner(t)
 	srv := newTestServer("127.0.0.1:0", "", "", users, signer, defaultCompletedUploadsSize)
-	cfg := srv.sshServerConfig()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -4655,7 +5032,7 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go srv.handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.sftpChownAllowed())
+			go srv.handleConn(nc, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.sftpChownAllowed())
 		}
 	}()
 
@@ -4723,6 +5100,12 @@ func (c *panicReadChannel) Stderr() io.ReadWriter {
 }
 
 func TestHandleSession_RecoversFromPanic(t *testing.T) {
+	fs, err := openJailFS(t.TempDir())
+	if err != nil {
+		t.Fatalf("openJailFS: %v", err)
+	}
+	t.Cleanup(func() { _ = fs.Close() })
+
 	ch := &panicReadChannel{closed: make(chan struct{})}
 	inReqs := make(chan *ssh.Request, 1)
 	inReqs <- &ssh.Request{
@@ -4734,7 +5117,7 @@ func TestHandleSession_RecoversFromPanic(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleSession(ch, inReqs, t.TempDir(), "testuser", "127.0.0.1", true, true, make(chan CompletedUpload, 1), nil, false)
+		handleSession(ch, inReqs, fs, "testuser", "127.0.0.1", true, true, make(chan CompletedUpload, 1), nil, false)
 	}()
 
 	select {
@@ -5297,28 +5680,49 @@ func TestFTPSessionAuthenticate_ValidatesJailRoot(t *testing.T) {
 		{name: "whitespace", root: "  ", want: false},
 		{name: "file", root: filePath, want: false},
 		{name: "missing", root: filepath.Join(t.TempDir(), "missing"), want: false},
-		{name: "symlink", root: link, want: true},
+		{name: "symlink", root: link, want: false},
+		{name: "directory", root: target, want: true},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			fs := &ftpSession{
-				server: &Server{
-					users: map[string]UserInfo{
-						"alice": {Password: "alicepw", Root: tc.root, CanRead: true, CanWrite: true},
-					},
-				},
-				username: "alice",
-			}
-
-			got := fs.authenticate("alicepw")
-			if got != tc.want {
-				t.Fatalf("authenticate() = %v; want %v", got, tc.want)
-			}
-			if tc.want && fs.user.Root != target {
-				t.Fatalf("authenticated root = %q; want %q", fs.user.Root, target)
-			}
+			assertFTPSessionAuthentication(t, tc.root, target, tc.want)
 		})
+	}
+}
+
+func assertFTPSessionAuthentication(t *testing.T, root, wantRoot string, want bool) {
+	t.Helper()
+	server := NewServer(&Config{
+		Users: map[string]UserInfo{
+			"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
+		},
+	})
+	serverConn, clientConn := net.Pipe()
+	if !server.trackConn(serverConn) {
+		t.Fatal("trackConn rejected test connection")
+	}
+	t.Cleanup(func() {
+		server.untrackConn(serverConn)
+		server.connWG.Done()
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+	})
+	fs := &ftpSession{
+		server:   server,
+		rawConn:  serverConn,
+		username: "alice",
+	}
+
+	got := fs.authenticate("alicepw")
+	if got {
+		t.Cleanup(fs.closeJail)
+	}
+	if got != want {
+		t.Fatalf("authenticate() = %v; want %v", got, want)
+	}
+	if want && fs.user.Root != wantRoot {
+		t.Fatalf("authenticated root = %q; want %q", fs.user.Root, wantRoot)
 	}
 }
 
@@ -5929,7 +6333,7 @@ func TestWriteLogger_TransferErrorSuppressesNotification(t *testing.T) {
 	}
 	uploads := make(chan CompletedUpload, 1)
 	wl := &writeLogger{
-		File:         f,
+		managedFile:  &managedFile{File: f},
 		filepath:     "/partial.bin",
 		fullFilepath: filepath.Join(root, "partial.bin"),
 		username:     "alice",
@@ -5960,7 +6364,7 @@ func TestWriteLogger_CleanCloseAnnouncesUpload(t *testing.T) {
 	}
 	uploads := make(chan CompletedUpload, 1)
 	wl := &writeLogger{
-		File:         f,
+		managedFile:  &managedFile{File: f},
 		filepath:     "/ok.bin",
 		fullFilepath: filepath.Join(root, "ok.bin"),
 		username:     "alice",
@@ -5993,7 +6397,7 @@ func TestWriteLogger_TransferErrorNilIsNoop(t *testing.T) {
 	}
 	uploads := make(chan CompletedUpload, 1)
 	wl := &writeLogger{
-		File:         f,
+		managedFile:  &managedFile{File: f},
 		filepath:     "/ok2.bin",
 		fullFilepath: filepath.Join(root, "ok2.bin"),
 		username:     "alice",
@@ -6274,7 +6678,9 @@ func TestFTPServer_PASVExhaustsPortRange(t *testing.T) {
 	users := map[string]UserInfo{
 		"u": {Password: "p", Root: root, CanRead: true, CanWrite: true},
 	}
-	_, addr, stop := startTestFTPServer(t, users, "5500-5502")
+	config := newTestFTPConfig(t, users, "5500-5502", false)
+	config.FtpMaxPassiveListenersPerUser = 3
+	_, addr, stop := startTestFTPServerWithConfig(t, config)
 	t.Cleanup(stop)
 
 	holders := make([]*ftpTestClient, 0, 3)
@@ -6309,7 +6715,19 @@ func TestFTPServer_PASVExhaustsPortRange(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	recoveredPort := 0
 	for time.Now().Before(deadline) {
-		_, p, err := parseFTPPASVResponse(extra.command(227, "PASV"))
+		extra.send("PASV")
+		code, response, err := extra.tp.ReadResponse(0)
+		if err != nil {
+			t.Fatalf("recovery PASV: %v", err)
+		}
+		if code == 425 {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		if code != 227 {
+			t.Fatalf("recovery PASV code = %d; want 227", code)
+		}
+		_, p, err := parseFTPPASVResponse(response)
 		if err != nil {
 			t.Fatalf("recovery parse PASV: %v", err)
 		}
@@ -7841,7 +8259,7 @@ func TestFTPS_DataConnRequiresResumption(t *testing.T) {
 // valid server ticket with AUTH TLS alone, so DidResume is not sufficient to
 // bind a protected data connection to the authenticated control session.
 //
-//nolint:gocognit,funlen // one end-to-end cross-session attack and legitimate fallback
+//nolint:gocognit,funlen,cyclop // one end-to-end cross-session attack and legitimate fallback
 func TestFTPS_DataConnRejectsTicketFromDifferentControlSession(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -7935,15 +8353,15 @@ func TestFTPS_DataConnRejectsTicketFromDifferentControlSession(t *testing.T) {
 				}
 			}
 			_ = attackerData.Close()
-			victim.read(425)
 
-			// Rejection must be scoped to the foreign ticket. The ticket from
-			// this victim control session still resumes and transfers data.
-			victimData := victim.passiveDial()
+			// Rejection must leave this passive port and pending RETR usable.
+			// The victim's own ticket still resumes and transfers its data.
+			victimData, err := net.DialTimeout("tcp", attackerData.RemoteAddr().String(), 5*time.Second)
+			if err != nil {
+				t.Fatalf("victim data connection after rejected peer: %v", err)
+			}
 			defer func() { _ = victimData.Close() }()
 			_ = victimData.SetDeadline(time.Now().Add(5 * time.Second))
-			victim.send("RETR secret.bin")
-			victim.read(150)
 			victimTLS := victim.upgradeDataConn(victimData)
 			if !victimTLS.ConnectionState().DidResume {
 				t.Fatal("victim data handshake did not resume its control session")
@@ -7984,8 +8402,8 @@ func TestServer_RemoveUser_DisconnectsActiveFTPS(t *testing.T) {
 	// conn even though the session now operates on the TLS wrapper.
 	srv.mu.RLock()
 	associated := false
-	for _, u := range srv.activeConns {
-		if u == "victim" {
+	for _, state := range srv.activeConns {
+		if state.authenticated && state.username == "victim" {
 			associated = true
 			break
 		}

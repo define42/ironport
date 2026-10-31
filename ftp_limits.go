@@ -1,0 +1,135 @@
+//go:build linux
+
+package ironport
+
+import (
+	"errors"
+	"net"
+	"sync"
+	"time"
+)
+
+const (
+	defaultFTPMaxPassiveListeners        = 64
+	defaultFTPMaxPassiveListenersPerUser = 2
+	defaultFTPMaxPassiveListenersPerIP   = 8
+)
+
+var errFTPPassiveLimit = errors.New("passive listener limit reached")
+
+// ftpPassiveLimits accounts for reserved ports, including listeners currently
+// accepting and authenticating a data connection. Entries disappear on release
+// so a stream of distinct users or source addresses cannot grow the maps.
+type ftpPassiveLimits struct {
+	mu         sync.Mutex
+	maxTotal   int
+	maxPerUser int
+	maxPerIP   int
+	total      int
+	users      map[string]int
+	ips        map[string]int
+}
+
+func newFTPPassiveLimits(config *Config) ftpPassiveLimits {
+	return ftpPassiveLimits{
+		maxTotal:   positiveFTPLimit(config.FtpMaxPassiveListeners, defaultFTPMaxPassiveListeners),
+		maxPerUser: positiveFTPLimit(config.FtpMaxPassiveListenersPerUser, defaultFTPMaxPassiveListenersPerUser),
+		maxPerIP:   positiveFTPLimit(config.FtpMaxPassiveListenersPerIP, defaultFTPMaxPassiveListenersPerIP),
+	}
+}
+
+func positiveFTPLimit(value, fallback int) int {
+	if value <= 0 {
+		return fallback
+	}
+	return value
+}
+
+func (l *ftpPassiveLimits) reserve(username, ip string) (func(), error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// Retain secure defaults for zero-value Servers used by embedders/tests.
+	if l.total >= positiveFTPLimit(l.maxTotal, defaultFTPMaxPassiveListeners) ||
+		l.users[username] >= positiveFTPLimit(l.maxPerUser, defaultFTPMaxPassiveListenersPerUser) ||
+		l.ips[ip] >= positiveFTPLimit(l.maxPerIP, defaultFTPMaxPassiveListenersPerIP) {
+		return nil, errFTPPassiveLimit
+	}
+	if l.users == nil {
+		l.users = make(map[string]int)
+		l.ips = make(map[string]int)
+	}
+	l.total++
+	l.users[username]++
+	l.ips[ip]++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			l.mu.Lock()
+			defer l.mu.Unlock()
+			l.total--
+			l.users[username]--
+			if l.users[username] == 0 {
+				delete(l.users, username)
+			}
+			l.ips[ip]--
+			if l.ips[ip] == 0 {
+				delete(l.ips, ip)
+			}
+		})
+	}, nil
+}
+
+func (s *Server) listenReservedFTPData(host, username, ip string) (net.Listener, error) {
+	release, err := s.ftpPassiveLimits.reserve(username, ip)
+	if err != nil {
+		return nil, err
+	}
+	ln, err := s.listenFTPData(host)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	timeout := s.effectiveFTPDataAcceptTimeout()
+	if timeout <= 0 {
+		timeout = defaultFTPDataAcceptTimeout
+	}
+	return newFTPPassiveListener(ln, timeout, release), nil
+}
+
+// ftpPassiveListener owns its expiration and permit. Each timer closes only
+// its own listener; replacing PASV cannot let an old timer close a new port.
+type ftpPassiveListener struct {
+	net.Listener
+	deadline time.Time
+	mu       sync.Mutex
+	timer    *time.Timer
+	once     sync.Once
+	err      error
+	release  func()
+}
+
+func newFTPPassiveListener(ln net.Listener, lifetime time.Duration, release func()) *ftpPassiveListener {
+	l := &ftpPassiveListener{Listener: ln, deadline: time.Now().Add(lifetime), release: release}
+	l.mu.Lock()
+	l.timer = time.AfterFunc(lifetime, func() { _ = l.Close() })
+	l.mu.Unlock()
+	return l
+}
+
+func (l *ftpPassiveListener) Close() error {
+	l.once.Do(func() {
+		l.mu.Lock()
+		l.timer.Stop()
+		l.mu.Unlock()
+		l.err = l.Listener.Close()
+		l.release()
+	})
+	return l.err
+}
+
+func (l *ftpPassiveListener) SetDeadline(deadline time.Time) error {
+	if tcp, ok := l.Listener.(interface{ SetDeadline(time.Time) error }); ok {
+		return tcp.SetDeadline(deadline)
+	}
+	return nil
+}
