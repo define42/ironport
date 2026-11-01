@@ -109,7 +109,7 @@ func (s abortedJailProofSigner) Sign(_ io.Reader, _ []byte) (*ssh.Signature, err
 	return nil, errors.New("abort after accepted public-key query")
 }
 
-func TestSSHFailedHandshakeClosesProvisionalJail(t *testing.T) {
+func TestSSHAbortedPublicKeyHandshakeNeverOpensJail(t *testing.T) {
 	signer, key := testClientKey(t)
 	root := t.TempDir()
 	srv, addr, stop := startTestServer(t, map[string]UserInfo{
@@ -120,16 +120,12 @@ func TestSSHFailedHandshakeClosesProvisionalJail(t *testing.T) {
 	aborted := abortedJailProofSigner{Signer: signer, beforeSign: func() {
 		queryDescriptors = countRetainedJailDescriptors(t, root)
 	}}
-	client, err := ssh.Dial("tcp", addr, &ssh.ClientConfig{
-		User: "alice", Auth: []ssh.AuthMethod{ssh.PublicKeys(aborted)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // loopback test server
-		Timeout:         5 * time.Second,
-	})
+	client, err := dialSSHKeyProof(t, addr, aborted)
 	if client != nil {
 		_ = client.Close()
 	}
-	if err == nil || queryDescriptors != 1 {
-		t.Fatalf("aborted handshake error=%v; query jail descriptors=%d, want 1", err, queryDescriptors)
+	if err == nil || queryDescriptors != 0 {
+		t.Fatalf("aborted handshake error=%v; query jail descriptors=%d, want 0", err, queryDescriptors)
 	}
 	waitResourceConnections(t, srv)
 	assertSSHJailDescriptors(t, root, 0)

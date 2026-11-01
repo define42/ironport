@@ -8,9 +8,11 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/crypto/ssh"
@@ -299,35 +301,46 @@ func TestSFTPServer_PasswordAuth_ValidatesJailRoot(t *testing.T) {
 	}
 }
 
-func TestSFTPServer_PublicKeyAuth_RejectsInvalidJailRoot(t *testing.T) {
+func TestSFTPServer_PublicKeyAuth_RejectsInvalidJailRootAtProof(t *testing.T) {
 	_, clientPubKey := testClientKey(t)
 	filePath := filepath.Join(t.TempDir(), "root-file")
 	if err := os.WriteFile(filePath, []byte("x"), 0o600); err != nil {
 		t.Fatalf("os.WriteFile: %v", err)
 	}
 
-	tests := []struct {
-		name string
-		root string
-	}{
+	for _, tc := range []struct{ name, root string }{
 		{name: "empty", root: ""},
 		{name: "whitespace", root: "  "},
 		{name: "file", root: filePath},
 		{name: "missing", root: filepath.Join(t.TempDir(), "missing")},
-	}
-
-	for _, tc := range tests {
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := newTestServer(":0", "", "", map[string]UserInfo{
-				"alice": {AuthorizedKeys: []ssh.PublicKey{clientPubKey}, Root: tc.root, CanRead: true, CanWrite: true},
-			}, testSigner(t), defaultCompletedUploadsSize)
-			cfg := srv.sshServerConfig()
-
-			perms, err := cfg.PublicKeyCallback(testConnMetadata{user: "alice"}, clientPubKey)
-			if err == nil {
-				t.Fatalf("PublicKeyCallback returned nil error with permissions %+v", perms)
-			}
+			checkSSHInvalidRootRejectedAtProof(t, tc.root, clientPubKey)
 		})
+	}
+}
+
+func checkSSHInvalidRootRejectedAtProof(t *testing.T, root string, key ssh.PublicKey) {
+	t.Helper()
+	_, state, cfg := newSSHKeyQueryTestServer(t, UserInfo{
+		AuthorizedKeys: []ssh.PublicKey{key}, Root: root, CanRead: true, CanWrite: true,
+	})
+	output := captureRootDiagnosticLog(t)
+	metadata := testConnMetadata{user: "alice"}
+	query, err := cfg.PublicKeyCallback(metadata, key)
+	if err != nil {
+		t.Fatalf("unsigned key query validated the root: %v", err)
+	}
+	assertSSHKeyQueryHasNoJail(t, query, state)
+	if output.Len() != 0 {
+		t.Fatalf("unsigned key query emitted a root diagnostic: %q", output.String())
+	}
+	perms, err := cfg.VerifiedPublicKeyCallback(metadata, key, query, "")
+	if !errors.Is(err, errInvalidCredentials) || perms != nil {
+		t.Fatalf("verified proof = %v, %v; want generic credential failure", perms, err)
+	}
+	if state.fs != nil || !strings.Contains(output.String(), "authentication jail-root check failed") {
+		t.Fatalf("invalid root proof retained jail=%v or omitted diagnostic: %q", state.fs, output.String())
 	}
 }
 

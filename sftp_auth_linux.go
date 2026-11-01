@@ -14,9 +14,10 @@ type sshRevisionKey struct{}
 
 type sshJailFSKey struct{}
 
-// sshAuthState owns the last callback's provisional jail until the completed
-// handshake commits it. SSH invokes these callbacks sequentially, before any
-// session starts. Failed handshakes and superseded queries close their jails.
+// sshAuthState owns a password or verified-key callback's provisional jail
+// until the completed handshake commits it. SSH invokes callbacks sequentially,
+// before any session starts. Unsigned queries own no jail; subsequent callbacks
+// and failed handshakes close any previously retained jail.
 type sshAuthState struct {
 	fs       *jailfs.FS
 	username string

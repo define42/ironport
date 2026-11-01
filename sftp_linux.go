@@ -100,8 +100,26 @@ func deferRecoverSFTPPanicf(errp *error, onPanic func(), format string, args ...
 	}
 }
 
-// authenticateSSH checks admission and credentials for a query, password,
-// or verified key. A query's first proof reuses its already-consumed token.
+// checkSSHKeyQuery checks admission and key eligibility without opening a jail.
+// An unsigned query does not prove key ownership, so it must not trigger root
+// I/O or root diagnostics. Proof will re-read the user and check the key again.
+func (s *Server) checkSSHKeyQuery(c ssh.ConnMetadata, key ssh.PublicKey, authEvents chan<- AuthEvent) error {
+	clientIP := netconn.RemoteIP(c.RemoteAddr())
+	if s.allowAuth(c.User(), clientIP) > 0 {
+		s.authFailed(c.User(), clientIP, CompletedUploadProtocolSFTP, authEvents, true)
+		return errInvalidCredentials
+	}
+	u, revision, exists := s.userSnapshot(c.User())
+	// Match even for unknown users to preserve the public-key timing pad.
+	if !matchAuthorizedKey(u.AuthorizedKeys, key) || !exists || !s.userRevisionMatches(c.User(), revision) {
+		s.authFailed(c.User(), clientIP, CompletedUploadProtocolSFTP, authEvents, false)
+		return errInvalidCredentials
+	}
+	return nil
+}
+
+// authenticateSSH checks admission and credentials for a password or verified
+// key. A query's first proof reuses its already-consumed token.
 // Successful permissions carry an owned jail descriptor. Every new auth callback
 // must transfer that ownership through sshAuthState.config or close it itself.
 func (s *Server) authenticateSSH(c ssh.ConnMetadata, keyCheck func(UserInfo) bool, useQueryAdmission bool, authEvents chan<- AuthEvent) (*ssh.Permissions, error) {
@@ -160,13 +178,11 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 			return perms, err
 		},
 		PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			permissions, err := s.authenticateSSH(c, func(u UserInfo) bool {
-				return matchAuthorizedKey(u.AuthorizedKeys, key)
-			}, false, authEvents)
-			if err == nil {
-				permissions.ExtraData[keyAdmission{}] = true
+			if err := s.checkSSHKeyQuery(c, key, authEvents); err != nil {
+				return nil, err
 			}
-			return permissions, err
+			// Retain only admission, never the query's user snapshot or a jail.
+			return &ssh.Permissions{ExtraData: map[any]any{keyAdmission{}: true}}, nil
 		},
 		VerifiedPublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey, queryPermissions *ssh.Permissions, _ string) (*ssh.Permissions, error) {
 			// x/crypto transfers ownership of the cached query permissions here.
@@ -177,6 +193,8 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 				_, admitted = queryPermissions.ExtraData[keyAdmission{}]
 				delete(queryPermissions.ExtraData, keyAdmission{})
 			}
+			// Signature verification has proved key ownership. Re-read current
+			// credentials and permissions before opening and retaining the jail.
 			permissions, err := s.authenticateSSH(c, func(u UserInfo) bool {
 				return matchAuthorizedKey(u.AuthorizedKeys, key)
 			}, admitted, authEvents)

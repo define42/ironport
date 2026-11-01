@@ -8,6 +8,12 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
+- SSH public-key queries now check key eligibility without opening a jail or
+  emitting root-open diagnostics. The jail is opened only after signature
+  verification, using the current user configuration. Shared throttling,
+  one-use query admission, and final revision checks remain enforced. Public
+  API signatures are unchanged.
+
 - Enabled FTP now rejects `FtpRequireTLS` without `FtpTLSConfig` before opening
   listeners. Unused FTP TLS configuration errors no longer prevent SFTP startup
   when FTP is disabled, including whitespace-only `FtpAddr` values.

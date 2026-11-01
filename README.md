@@ -275,6 +275,9 @@ refilling one token every 10 ms, one second, and one second respectively.
 Successful credential checks consume tokens too. SSH public-key authentication
 consumes one admission token per bucket for the key query and signature proof
 together, then rechecks current credentials and cooldown at verified completion.
+Unsigned key queries check key eligibility without opening the jail or emitting
+root diagnostics. The jail is opened and retained only after signature
+verification, using the user's current root, keys, and permissions.
 A repeated proof after a failed completion requires fresh admission. Every bucket
 and the identity-table capacity must permit the attempt before tokens are
 consumed or new identities retained.

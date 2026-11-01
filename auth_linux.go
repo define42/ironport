@@ -95,12 +95,12 @@ func checkPassword(storedPw, suppliedPw string) bool {
 // callers should not distinguish those cases when replying to clients, to avoid
 // leaking which step failed.
 //
-// keyCheck supplies the matching logic so the SSH PasswordCallback can pass a
-// password comparator and the PublicKeyCallback can pass a constant-time-padded
-// key comparator. keyCheck receives the zero-value UserInfo when the user is
-// unknown, so it MUST be constant-time (independent of stored password length
-// and AuthorizedKeys count) to avoid leaking username existence; checkPassword
-// and the public-key timing pad already satisfy this.
+// keyCheck supplies a password comparator for PasswordCallback and a
+// constant-time-padded key comparator for VerifiedPublicKeyCallback. It receives
+// the zero-value UserInfo for unknown users, so it MUST be constant-time
+// (independent of stored password length and AuthorizedKeys count) to avoid
+// leaking username existence; checkPassword and the public-key timing pad
+// already satisfy this.
 func (s *Server) authenticateUser(username string, keyCheck func(stored UserInfo) bool) (UserInfo, *jailfs.FS, uint64, bool) {
 	u, revision, ok := s.userSnapshot(username)
 	if !keyCheck(u) || !ok {
