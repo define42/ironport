@@ -154,6 +154,19 @@ func TestSFTPServer_ReadOnlyUser(t *testing.T) {
 	if err == nil {
 		t.Error("expected write to be denied for read-only user, got nil error")
 	}
+
+	// A denied mixed handle must not apply its truncation flag.
+	if f, err := client.OpenFile("/data.txt", os.O_RDWR|os.O_TRUNC); err == nil {
+		_ = f.Close()
+		t.Error("expected O_RDWR open to be denied for read-only user, got nil error")
+	}
+	got, err = os.ReadFile(filepath.Join(root, "data.txt")) //nolint:gosec // path under t.TempDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "read me" {
+		t.Fatalf("data.txt = %q after denied O_RDWR open; want %q", got, "read me")
+	}
 }
 
 // TestSFTPServer_WriteOnlyUser verifies that a write-only user can upload files
@@ -177,7 +190,21 @@ func TestSFTPServer_WriteOnlyUser(t *testing.T) {
 	if _, err = f.Write([]byte("write only")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	_ = f.Close()
+	buf := make([]byte, len("write only"))
+	if n, err := f.ReadAt(buf, 0); !errors.Is(err, os.ErrPermission) || n != 0 {
+		t.Errorf("ReadAt on write-only upload handle = %d, %v; want 0 and %v",
+			n, err, os.ErrPermission)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "upload.txt")) //nolint:gosec // path under t.TempDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "write only" {
+		t.Fatalf("upload.txt = %q after denied read; want %q", got, "write only")
+	}
 
 	// Read must be denied.
 	_, err = client.Open("/upload.txt")
@@ -325,6 +352,116 @@ func TestSFTPServer_OpenFileAppendHonorsAppendFlag(t *testing.T) {
 	}
 	if string(got) != "first second" {
 		t.Fatalf("append.txt = %q; want %q", got, "first second")
+	}
+}
+
+//nolint:cyclop // one end-to-end handle lifecycle verifies data, close, and event behavior
+func TestSFTPServer_OpenFileReadWritePreservesData(t *testing.T) {
+	root := t.TempDir()
+	fullPath := filepath.Join(root, "readwrite.txt")
+	if err := os.WriteFile(fullPath, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+	f, err := client.OpenFile("/readwrite.txt", os.O_RDWR)
+	if err != nil {
+		t.Fatalf("OpenFile(O_RDWR): %v", err)
+	}
+	if _, err := f.WriteAt([]byte("hello"), 0); err != nil {
+		_ = f.Close()
+		t.Fatalf("WriteAt: %v", err)
+	}
+
+	buf := make([]byte, len("original"))
+	n, readErr := f.ReadAt(buf, 0)
+	if readErr != nil || n != len(buf) {
+		t.Errorf("ReadAt = %d, %v; want %d, nil", n, readErr, len(buf))
+	}
+	if got := string(buf); got != "hellonal" {
+		t.Errorf("ReadAt data = %q; want %q", got, "hellonal")
+	}
+	select {
+	case event := <-srv.CompletedUploads():
+		_ = f.Close()
+		t.Fatalf("upload announced before CLOSE: %+v", event)
+	default:
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	got, err := os.ReadFile(fullPath) //nolint:gosec // path under t.TempDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "hellonal" {
+		t.Errorf("readwrite.txt = %q; want %q", got, "hellonal")
+	}
+	select {
+	case event := <-srv.CompletedUploads():
+		if event.FilePath != "/readwrite.txt" || event.FullFilePath != fullPath ||
+			event.Username != "testuser" || event.ClientIP == "" || event.Protocol != CompletedUploadProtocolSFTP {
+			t.Fatalf("unexpected upload notification: %+v", event)
+		}
+	default:
+		t.Fatal("successful CLOSE did not announce the read/write upload")
+	}
+	select {
+	case event := <-srv.CompletedUploads():
+		t.Fatalf("read/write upload announced more than once: %+v", event)
+	default:
+	}
+}
+
+func TestSFTPServer_OpenFileReadWriteAppend(t *testing.T) {
+	root := t.TempDir()
+	fullPath := filepath.Join(root, "append-readwrite.txt")
+	if err := os.WriteFile(fullPath, []byte("first"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+	f, err := client.OpenFile("/append-readwrite.txt", os.O_RDWR|os.O_APPEND)
+	if err != nil {
+		t.Fatalf("OpenFile(O_RDWR|O_APPEND): %v", err)
+	}
+	if _, err := f.WriteAt([]byte(" second"), 0); err != nil {
+		_ = f.Close()
+		t.Fatalf("WriteAt append: %v", err)
+	}
+
+	buf := make([]byte, len("first second"))
+	if n, err := f.ReadAt(buf, 0); err != nil || n != len(buf) {
+		_ = f.Close()
+		t.Fatalf("ReadAt = %d, %v; want %d, nil", n, err, len(buf))
+	}
+	if got := string(buf); got != "first second" {
+		_ = f.Close()
+		t.Fatalf("ReadAt data = %q; want %q", got, "first second")
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	got, err := os.ReadFile(fullPath) //nolint:gosec // path under t.TempDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "first second" {
+		t.Fatalf("append-readwrite.txt = %q; want %q", got, "first second")
 	}
 }
 

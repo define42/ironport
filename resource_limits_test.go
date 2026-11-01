@@ -35,6 +35,27 @@ func closeHandle(t *testing.T, handle any) {
 	}
 }
 
+func openHandleForTest(t *testing.T, j jail, method string, r *sftp.Request) error {
+	t.Helper()
+	switch method {
+	case "Get":
+		_, err := j.Fileread(r)
+		return err
+	case "Put":
+		_, err := j.Filewrite(r)
+		return err
+	case "Open":
+		_, err := j.OpenFile(r)
+		return err
+	case "List":
+		_, err := j.Filelist(r)
+		return err
+	default:
+		t.Fatalf("unknown handle method %q", method)
+		return nil
+	}
+}
+
 //nolint:funlen // one lifecycle verifies interacting session/user/global caps and safe slot reuse
 func TestSFTPHandleBudgets(t *testing.T) {
 	root := t.TempDir()
@@ -96,7 +117,7 @@ func TestSFTPHandleBudgets(t *testing.T) {
 }
 
 func TestSFTPHandleOpenFailuresReleaseSlots(t *testing.T) {
-	for _, method := range []string{"Get", "Put", "List"} {
+	for _, method := range []string{"Get", "Put", "Open", "List"} {
 		t.Run(method, func(t *testing.T) {
 			root := t.TempDir()
 			if err := os.WriteFile(filepath.Join(root, "existing"), nil, 0o600); err != nil {
@@ -106,15 +127,10 @@ func TestSFTPHandleOpenFailuresReleaseSlots(t *testing.T) {
 			j := handleTestJail(t, root, &sessionHandleBudget{owner: owner, username: "alice"})
 			r := sftp.NewRequest(method, "/missing/child")
 			r.Flags = 2 | 8 | 16 // WRITE | CREAT | TRUNC
-			var err error
-			switch method {
-			case "Get":
-				_, err = j.Fileread(r)
-			case "Put":
-				_, err = j.Filewrite(r)
-			case "List":
-				_, err = j.Filelist(r)
+			if method == "Open" {
+				r.Flags |= 1 // READ
 			}
+			err := openHandleForTest(t, j, method, r)
 			if err == nil {
 				t.Fatal("missing path unexpectedly opened")
 			}
@@ -124,6 +140,35 @@ func TestSFTPHandleOpenFailuresReleaseSlots(t *testing.T) {
 			}
 			closeHandle(t, handle)
 		})
+	}
+}
+
+func TestSFTPReadWriteHandleUsesOneBudgetSlot(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "existing"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	owner := &handleBudget{max: 1, maxUser: 1, maxSession: 1}
+	j := handleTestJail(t, root, &sessionHandleBudget{owner: owner, username: "alice"})
+	req := sftp.NewRequest("Open", "/existing")
+	req.Flags = 1 | 2 // READ | WRITE
+	handle, err := j.OpenFile(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Fileread(sftp.NewRequest("Get", "/existing")); err == nil {
+		t.Fatal("read/write handle used more than one slot or bypassed the budget")
+	}
+	closeHandle(t, handle)
+	closeHandle(t, handle) // double CLOSE must not release an extra slot
+
+	reused, err := j.Fileread(sftp.NewRequest("Get", "/existing"))
+	if err != nil {
+		t.Fatalf("closed read/write slot not reusable: %v", err)
+	}
+	defer closeHandle(t, reused)
+	if _, err := j.Fileread(sftp.NewRequest("Get", "/existing")); err == nil {
+		t.Fatal("double close over-released the read/write handle budget")
 	}
 }
 

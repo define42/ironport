@@ -68,7 +68,9 @@ type jail struct {
 	sftpAllowChown bool
 }
 
-// jail implements the four sftp handler interfaces for a chrooted filesystem.
+var _ sftp.OpenFileWriter = jail{}
+
+// jail implements pkg/sftp's handler interfaces for a chrooted filesystem.
 // Fileread implements sftp.FileReader.
 func (j jail) Fileread(r *sftp.Request) (reader io.ReaderAt, err error) {
 	defer deferRecoverSFTPHandlerPanic(j.username, j.clientIP, r, &err, func() { reader = nil })()
@@ -187,12 +189,60 @@ func (j jail) Filewrite(r *sftp.Request) (writer io.WriterAt, err error) {
 	if !j.canWrite {
 		return nil, os.ErrPermission
 	}
+	w, err := j.openWriter(r, os.O_WRONLY)
+	if err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+// readWriteHandle keeps pkg/sftp's combined read/write dispatch on one file
+// descriptor and one handle permit. Write-only users still need a combined
+// handle because pkg/sftp's Client.Create requests O_RDWR; their reads are
+// rejected explicitly instead of reaching an O_RDWR descriptor.
+type readWriteHandle struct {
+	*budgetWriter
+
+	canRead bool
+}
+
+func (h *readWriteHandle) ReadAt(p []byte, off int64) (int, error) {
+	if !h.canRead {
+		return 0, sftp.ErrSSHFxPermissionDenied
+	}
+	return h.writeLogger.File.ReadAt(p, off)
+}
+
+// OpenFile implements sftp.OpenFileWriter. pkg/sftp requires this optional
+// interface to route reads and writes on an O_RDWR handle to the corresponding
+// ReaderAt and WriterAt methods.
+func (j jail) OpenFile(r *sftp.Request) (file sftp.WriterAtReaderAt, err error) {
+	defer deferRecoverSFTPHandlerPanic(j.username, j.clientIP, r, &err, func() { file = nil })()
+	if !j.canWrite {
+		return nil, os.ErrPermission
+	}
+	if !r.Pflags().Read {
+		return nil, os.ErrInvalid
+	}
+
+	accessMode := os.O_WRONLY
+	if j.canRead {
+		accessMode = os.O_RDWR
+	}
+	w, err := j.openWriter(r, accessMode)
+	if err != nil {
+		return nil, err
+	}
+	return &readWriteHandle{budgetWriter: w, canRead: j.canRead}, nil
+}
+
+func (j jail) openWriter(r *sftp.Request, accessMode int) (writer *budgetWriter, err error) {
 	if hasCRLF(r.Filepath) {
 		return nil, syscall.EINVAL
 	}
 	clientPath := cleanSFTPClientPath(r.Filepath)
 	log.Printf("upload: %q", clientPath)
-	openFlags, appendMode, err := sftpWriteOpenFlags(r)
+	openFlags, appendMode, err := sftpWriteOpenFlags(r, accessMode)
 	if err != nil {
 		return nil, err
 	}
@@ -200,12 +250,16 @@ func (j jail) Filewrite(r *sftp.Request) (writer io.WriterAt, err error) {
 	if err != nil {
 		return nil, err
 	}
+	var f *os.File
 	defer func() {
 		if writer == nil {
+			if f != nil {
+				_ = f.Close()
+			}
 			release()
 		}
 	}()
-	f, err := j.fs.OpenWrite(r.Filepath, openFlags, 0o600)
+	f, err = j.fs.OpenWrite(r.Filepath, openFlags, 0o600)
 	if err != nil {
 		return nil, sanitizeSFTPErr(err)
 	}
@@ -221,13 +275,16 @@ func (j jail) Filewrite(r *sftp.Request) (writer io.WriterAt, err error) {
 	}, release: release}, nil
 }
 
-func sftpWriteOpenFlags(r *sftp.Request) (int, bool, error) {
+func sftpWriteOpenFlags(r *sftp.Request, accessMode int) (int, bool, error) {
 	pflags := r.Pflags()
 	if !pflags.Write && !pflags.Append {
 		return 0, false, os.ErrInvalid
 	}
+	if accessMode != os.O_WRONLY && accessMode != os.O_RDWR {
+		return 0, false, os.ErrInvalid
+	}
 
-	openFlags := os.O_WRONLY
+	openFlags := accessMode
 	if pflags.Append {
 		openFlags |= os.O_APPEND
 	}

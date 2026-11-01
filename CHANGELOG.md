@@ -8,6 +8,10 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
+- SFTP read/write handles now dispatch reads to the file reader instead of
+  writing zero-filled response buffers into the file. Combined handles retain
+  write-only account compatibility while denying their read attempts.
+
 - Authentication limits now use bounded, privately hashed source and username
   buckets, preventing identity-table saturation from rejecting every new
   identity. Collisions share limits conservatively without evicting active
