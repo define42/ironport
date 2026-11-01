@@ -4,7 +4,9 @@ import (
 	"errors"
 	"net"
 	"slices"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -172,32 +174,47 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 }
 
 func TestHandleSession_RecoversFromPanic(t *testing.T) {
-	j := handleTestJail(t, t.TempDir(), nil)
-	ch := &panicReadChannel{closed: make(chan struct{})}
-	inReqs := make(chan *ssh.Request, 1)
-	inReqs <- &ssh.Request{
-		Type:    "subsystem",
-		Payload: append([]byte{0, 0, 0, 4}, []byte("sftp")...),
-	}
-	close(inReqs)
+	synctest.Test(t, func(t *testing.T) {
+		j := handleTestJail(t, t.TempDir(), nil)
+		ch := &panicReadChannel{closed: make(chan struct{})}
+		inReqs := make(chan *ssh.Request, 1)
+		closeRequests := sync.OnceFunc(func() { close(inReqs) })
+		defer closeRequests()
+		inReqs <- &ssh.Request{
+			Type:    "subsystem",
+			Payload: append([]byte{0, 0, 0, 4}, []byte("sftp")...),
+		}
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		handleSession(ch, inReqs, j.fs, "testuser", "127.0.0.1", true, true, make(chan CompletedUpload, 1), nil, false)
-	}()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			handleSession(ch, inReqs, j.fs, "testuser", "127.0.0.1", true, true, make(chan CompletedUpload, 1), nil, false)
+		}()
+		synctest.Wait()
+		select {
+		case <-ch.closed:
+		default:
+			t.Fatal("handleSession did not close the channel after recovered panic")
+		}
+		select {
+		case <-done:
+			t.Fatal("handleSession released its slot before the request stream closed")
+		default:
+		}
 
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("handleSession did not return after recovered panic")
-	}
-
-	select {
-	case <-ch.closed:
-	default:
-		t.Fatal("handleSession did not close the channel after recovered panic")
-	}
+		// A peer may keep sending requests before acknowledging our channel
+		// close. Panic cleanup must keep the mux free to process that close.
+		for range 40 {
+			inReqs <- &ssh.Request{Type: "ignored-after-panic"}
+		}
+		closeRequests()
+		synctest.Wait()
+		select {
+		case <-done:
+		default:
+			t.Fatal("handleSession did not return after the request stream closed")
+		}
+	})
 }
 
 func TestCleanSFTPClientPath(t *testing.T) {

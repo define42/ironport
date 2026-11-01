@@ -319,6 +319,10 @@ func (s *Server) serveSSHChannels(chans <-chan ssh.NewChannel, fs *jailfs.FS, us
 }
 
 func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, fs *jailfs.FS, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool, handles ...*sessionHandleBudget) {
+	var requestWG sync.WaitGroup
+	// Close the channel before waiting for its request stream to finish. Keep
+	// the session slot occupied until the drainer exits, even after a panic.
+	defer requestWG.Wait()
 	defer func() {
 		recoverSFTPSessionPanic(username, clientIP, recover())
 		_ = ch.Close()
@@ -341,6 +345,12 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, fs *jailfs.FS, us
 				continue
 			}
 			_ = req.Reply(true, nil)
+
+			// SSH channel requests arrive independently of SFTP data. Drain them
+			// until the peer or connection closes the channel: a full request
+			// queue otherwise blocks the SSH mux, even after TCP is closed.
+			// Start after the subsystem reply to preserve request reply order.
+			requestWG.Go(func() { ssh.DiscardRequests(inReqs) })
 
 			// Serving the SFTP subsystem is delegated to a helper so that
 			// its cleanup defer (server.Close) runs on its own

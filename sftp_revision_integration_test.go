@@ -4,6 +4,8 @@ package ironport
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"net"
 	"runtime"
 	"sync"
@@ -11,10 +13,140 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
 
 const sshRejectionTestTimeout = 10 * time.Second
+
+func TestSFTPChannelRequestFloodCannotWedgeShutdown(t *testing.T) {
+	baselineMuxes := countSSHMuxLoops()
+	srv, addr, serveDone := startListenAndServe(t, map[string]UserInfo{
+		"alice": {Password: "pw", Root: t.TempDir(), CanRead: true, CanWrite: true},
+	})
+	t.Cleanup(func() { _ = srv.Close() })
+	ch, client := openSFTPShutdownTestChannel(t, addr)
+	requireAuthEvent(t, srv.AuthEvents(), AuthEventLoginSuccess, "alice", CompletedUploadProtocolSFTP)
+
+	waitForSFTPChannelRequestFlood(t, ch)
+
+	ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel()
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- srv.Shutdown(ctx) }()
+	select {
+	case err := <-shutdownDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Shutdown error = %v; want deadline exceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown remained blocked after force-closing a connection with queued channel requests")
+	}
+
+	srv.mu.RLock()
+	active, cancels := len(srv.activeConns), len(srv.connCancels)
+	srv.mu.RUnlock()
+	if active != 0 || cancels != 0 {
+		t.Fatalf("Shutdown retained connection state: active=%d cancellations=%d", active, cancels)
+	}
+	requireAuthEvent(t, srv.AuthEvents(), AuthEventLogout, "alice", CompletedUploadProtocolSFTP)
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("ListenAndServe: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ListenAndServe did not return after Shutdown")
+	}
+	_ = client.Close()
+	waitForSSHMuxCountAtMost(t, baselineMuxes)
+}
+
+func openSFTPShutdownTestChannel(t *testing.T, addr string) (ssh.Channel, *ssh.Client) {
+	t.Helper()
+	client, err := ssh.Dial("tcp", addr, &ssh.ClientConfig{
+		User: "alice", Auth: []ssh.AuthMethod{ssh.Password("pw")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // loopback test server with an ephemeral host key
+		Timeout:         sshRejectionTestTimeout,
+	})
+	if err != nil {
+		t.Fatalf("dial SSH: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	ch, requests, err := client.OpenChannel("session", nil)
+	if err != nil {
+		t.Fatalf("open SSH channel: %v", err)
+	}
+	go ssh.DiscardRequests(requests)
+	accepted, err := ch.SendRequest("subsystem", true, ssh.Marshal(struct{ Name string }{"sftp"}))
+	if err != nil || !accepted {
+		t.Fatalf("start SFTP subsystem: accepted=%t err=%v", accepted, err)
+	}
+	// The version handshake proves the server has entered SFTP Serve before
+	// channel requests arrive. The subsystem reply alone precedes that handoff.
+	sftpClient, err := sftp.NewClientPipe(ch, ch)
+	if err != nil {
+		t.Fatalf("SFTP version handshake: %v", err)
+	}
+	t.Cleanup(func() {
+		// Closing SSH first also keeps cleanup bounded on the vulnerable code.
+		_ = client.Close()
+		_ = sftpClient.Close()
+	})
+	return ch, client
+}
+
+func waitForSFTPChannelRequestFlood(t *testing.T, ch ssh.Channel) {
+	t.Helper()
+	// x/crypto/ssh has a 16-entry per-channel request queue. A final request
+	// requiring a reply proves that every earlier request was consumed.
+	for range 40 {
+		if _, err := ch.SendRequest("ironport-shutdown-test", false, nil); err != nil {
+			t.Fatalf("send queued channel request: %v", err)
+		}
+	}
+	type requestResult struct {
+		accepted bool
+		err      error
+	}
+	barrierDone := make(chan requestResult, 1)
+	go func() {
+		accepted, err := ch.SendRequest("ironport-shutdown-barrier", true, nil)
+		barrierDone <- requestResult{accepted: accepted, err: err}
+	}()
+	deadline := time.Now().Add(sshRejectionTestTimeout)
+	for {
+		select {
+		case result := <-barrierDone:
+			if result.err != nil || result.accepted {
+				t.Fatalf("unsupported channel request: accepted=%t err=%v", result.accepted, result.err)
+			}
+			return
+		default:
+		}
+		// On the vulnerable code the barrier cannot return. Observe the
+		// saturated mux instead so the test still exercises Shutdown itself.
+		stacks := sshGoroutineStacks()
+		if sshMuxBlockedOnChannelRequests(stacks) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("channel requests were neither drained nor queued in the mux\n%s", sshMuxStackDump(stacks))
+		}
+		runtime.Gosched()
+	}
+}
+
+func sshMuxBlockedOnChannelRequests(stacks []byte) bool {
+	for stack := range bytes.SplitSeq(stacks, []byte("\n\n")) {
+		if bytes.Contains(stack, []byte("[chan send]")) &&
+			bytes.Contains(stack, []byte("golang.org/x/crypto/ssh.(*channel).handlePacket")) &&
+			bytes.Contains(stack, []byte("golang.org/x/crypto/ssh.(*mux).loop")) {
+			return true
+		}
+	}
+	return false
+}
 
 // postAuthWriteGateConn pauses the first server write after arm is called. The
 // password callback arms it immediately before sending the authentication

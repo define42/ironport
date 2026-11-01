@@ -8,6 +8,10 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
+- SFTP sessions now drain and reject subsequent SSH channel requests for the
+  lifetime of the channel, preventing authenticated clients from filling the
+  SSH request queue and permanently blocking forced shutdown.
+
 - SFTP read/write handles now dispatch reads to the file reader instead of
   writing zero-filled response buffers into the file. Combined handles retain
   write-only account compatibility while denying their read attempts.
