@@ -8,6 +8,14 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
+- Jail roots are opened securely during authentication and retained through the
+  SSH/FTP session or HTTP request. All SFTP channels share the authenticated
+  root, so later path replacement cannot redirect access. Relative roots keep
+  their reporting path consistent during concurrent working-directory changes.
+  Configured root paths now reject symlinks in any component and literal `..`
+  components; deployments using these must supply a direct directory path.
+  Public API signatures are unchanged.
+
 - SFTP directory reads and FTP `STAT` now stream entries with bounded memory,
   matching the existing FTP `LIST`/`MLSD` behavior. SFTP directory handles keep
   an open jailed cursor instead of a full snapshot, and release the descriptor

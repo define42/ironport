@@ -32,15 +32,11 @@ func TestFTPAuthenticationCommitRejectsStaleOrClosedConnections(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			u := UserInfo{Password: "pw", Root: t.TempDir(), CanRead: true}
 			s, f := newFTPRevisionSession(t, u)
-			snapshot, root, revision, ok := s.authenticateUser("alice", func(stored UserInfo) bool {
+			snapshot, jfs, revision, ok := s.authenticateUser("alice", func(stored UserInfo) bool {
 				return checkPassword(stored.Password, "pw")
 			})
 			if !ok {
 				t.Fatal("initial credential check failed")
-			}
-			jfs, err := jailfs.Open(root)
-			if err != nil {
-				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = jfs.Close() })
 			change(s, f, u)

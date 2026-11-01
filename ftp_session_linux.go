@@ -414,22 +414,14 @@ func parseFTPCommand(line string) (string, string) {
 }
 
 func (f *ftpSession) authenticate(pass string) bool {
-	u, jailRoot, revision, ok := f.server.authenticateUser(f.username, func(stored UserInfo) bool {
+	u, jfs, revision, ok := f.server.authenticateUser(f.username, func(stored UserInfo) bool {
 		return checkPassword(stored.Password, pass)
 	})
 	if !ok {
 		return false
 	}
-	// Open the fd-relative jail filesystem now. If openat2 is not available
-	// on the running kernel this fails and the login is rejected, preserving
-	// the package's hardened guarantee that all subsequent FTP commands
-	// operate via openat2.
-	jfs, err := jailfs.Open(jailRoot)
-	if err != nil {
-		log.Printf("ftp open jail root %q for user %q: %v", jailRoot, f.username, err)
-		return false
-	}
-	u.Root = jailRoot
+	// Authentication already opened the jail. Transfer that descriptor to the
+	// session so a pathname replacement cannot redirect the committed login.
 	return f.commitAuthentication(u, revision, jfs)
 }
 

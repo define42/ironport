@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/define42/ironport/internal/jailfs"
 	"github.com/define42/ironport/internal/netconn"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -99,10 +100,10 @@ func deferRecoverSFTPPanicf(errp *error, onPanic func(), format string, args ...
 	}
 }
 
-type sshRevisionKey struct{}
-
 // authenticateSSH checks admission and credentials for a query, password,
 // or verified key. A query's first proof reuses its already-consumed token.
+// Successful permissions carry an owned jail descriptor. Every new auth callback
+// must transfer that ownership through sshAuthState.config or close it itself.
 func (s *Server) authenticateSSH(c ssh.ConnMetadata, keyCheck func(UserInfo) bool, useQueryAdmission bool, authEvents chan<- AuthEvent) (*ssh.Permissions, error) {
 	clientIP := netconn.RemoteIP(c.RemoteAddr())
 	var retry time.Duration
@@ -115,13 +116,13 @@ func (s *Server) authenticateSSH(c ssh.ConnMetadata, keyCheck func(UserInfo) boo
 		s.authFailed(c.User(), clientIP, CompletedUploadProtocolSFTP, authEvents, true)
 		return nil, errInvalidCredentials
 	}
-	u, jailRoot, revision, ok := s.authenticateUser(c.User(), keyCheck)
+	u, fs, revision, ok := s.authenticateUser(c.User(), keyCheck)
 	if !ok {
 		s.authFailed(c.User(), clientIP, CompletedUploadProtocolSFTP, authEvents, false)
 		return nil, errInvalidCredentials
 	}
-	permissions := permissionsFor(u, c.User(), jailRoot)
-	permissions.ExtraData = map[any]any{sshRevisionKey{}: revision}
+	permissions := permissionsFor(u, c.User(), u.Root)
+	permissions.ExtraData = map[any]any{sshRevisionKey{}: revision, sshJailFSKey{}: fs}
 	return permissions, nil
 }
 
@@ -209,7 +210,9 @@ func acceptSSHConnection(nc net.Conn, cfg *ssh.ServerConfig, idleTimeout time.Du
 func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent, tempExts []string, idleTimeout time.Duration, sftpAllowChown bool) {
 	defer func() { _ = nc.Close() }()
 
-	sshConn, chans, reqs, err := acceptSSHConnection(nc, cfg, idleTimeout)
+	var authState sshAuthState
+	defer authState.close()
+	sshConn, chans, reqs, err := acceptSSHConnection(nc, authState.config(cfg), idleTimeout)
 	if err != nil {
 		if allowed, suppressed := s.authLogs.allow(time.Now()); allowed {
 			log.Printf("ssh handshake: %v (suppressed=%d)", err, suppressed)
@@ -225,7 +228,8 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- C
 		_ = sshConn.Close()
 		<-globalRequestsDone
 	}()
-	if !s.commitSSHConnection(nc, sshConn, authEvents) {
+	fs, committed := s.commitSSHConnection(nc, sshConn, &authState, authEvents)
+	if !committed {
 		// Closing the transport alone cannot release a mux blocked on its
 		// incoming-channel queue. Drain queued opens after revocation too.
 		_ = sshConn.Close()
@@ -235,6 +239,7 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- C
 		return
 	}
 
+	defer func() { _ = fs.Close() }()
 	jailRoot := sshConn.Permissions.Extensions["jailRoot"]
 	user := sshConn.Permissions.Extensions["user"]
 	canRead := sshConn.Permissions.Extensions["canRead"] == "true"
@@ -251,23 +256,10 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- C
 	authEvent.Type = AuthEventLogout
 	defer announceAuthEvent(authEvents, authEvent)
 
-	s.serveSSHChannels(chans, jailRoot, user, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown)
+	s.serveSSHChannels(chans, fs, user, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown)
 }
 
-// commitSSHConnection binds only the exact authentication snapshot that
-// completed this handshake. Revocation before commit produces no session.
-func (s *Server) commitSSHConnection(nc net.Conn, conn *ssh.ServerConn, events chan<- AuthEvent) bool {
-	if conn.Permissions != nil {
-		revision, _ := conn.Permissions.ExtraData[sshRevisionKey{}].(uint64)
-		if s.commitConnUser(nc, conn.User(), revision) {
-			return true
-		}
-	}
-	s.authFailed(conn.User(), netconn.RemoteIP(conn.RemoteAddr()), CompletedUploadProtocolSFTP, events, false)
-	return false
-}
-
-func (s *Server) serveSSHChannels(chans <-chan ssh.NewChannel, jailRoot, user, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool) {
+func (s *Server) serveSSHChannels(chans <-chan ssh.NewChannel, fs *jailfs.FS, user, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool) {
 	// Track the per-channel session goroutines so this function does not
 	// return until they have all finished. handleConn returning is what
 	// triggers untrackConn/connWG.Done in acceptLoop, which Shutdown waits
@@ -300,12 +292,12 @@ func (s *Server) serveSSHChannels(chans <-chan ssh.NewChannel, jailRoot, user, c
 
 		sessionWG.Go(func() {
 			defer func() { <-sessionSlots }()
-			handleSession(ch, inReqs, jailRoot, user, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown, handles)
+			handleSession(ch, inReqs, fs, user, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown, handles)
 		})
 	}
 }
 
-func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool, handles ...*sessionHandleBudget) {
+func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, fs *jailfs.FS, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool, handles ...*sessionHandleBudget) {
 	defer func() {
 		recoverSFTPSessionPanic(username, clientIP, recover())
 		_ = ch.Close()
@@ -330,11 +322,11 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, usernam
 			_ = req.Reply(true, nil)
 
 			// Serving the SFTP subsystem is delegated to a helper so that
-			// its cleanup defers (fs.Close, server.Close) run on its own
+			// its cleanup defer (server.Close) runs on its own
 			// return rather than accumulating inside this for/switch — a
 			// defer placed directly in this case would survive across loop
 			// iterations if the trailing `return` were ever removed.
-			serveSFTPSubsystem(ch, jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown, handles...)
+			serveSFTPSubsystem(ch, fs, username, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown, handles...)
 			return
 
 		default:
@@ -343,17 +335,11 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, usernam
 	}
 }
 
-// serveSFTPSubsystem opens the per-session jail, runs the SFTP request server
-// to completion, and tears both down via defer so the cleanup is local to this
-// function and not to handleSession's loop body. Callers must already have
-// replied to the "subsystem" request before invoking it.
-func serveSFTPSubsystem(ch ssh.Channel, jailRoot, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool, handles ...*sessionHandleBudget) {
-	handlers, fs, err := jailedHandlers(jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown, handles...)
-	if err != nil {
-		log.Printf("open jail root %q: %v", jailRoot, err)
-		return
-	}
-	defer func() { _ = fs.Close() }()
+// serveSFTPSubsystem runs one channel against the connection's authenticated
+// jail. The connection retains that jail until every channel has finished.
+// Callers must already have replied to the "subsystem" request before invoking it.
+func serveSFTPSubsystem(ch ssh.Channel, fs *jailfs.FS, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool, handles ...*sessionHandleBudget) {
+	handlers := jailedHandlers(fs, username, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown, handles...)
 
 	server := sftp.NewRequestServer(ch, handlers)
 	defer func() { _ = server.Close() }()

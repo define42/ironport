@@ -9,7 +9,6 @@ import (
 	"log"
 	"math"
 	"os"
-	"path/filepath"
 	"sync"
 	"syscall"
 
@@ -47,11 +46,9 @@ func sanitizeSFTPErr(err error) error {
 
 type jail struct {
 	handles *sessionHandleBudget
-	// fs is the fd-relative filesystem implementation backing this jail. It
-	// is constructed once per session and shared by all handler invocations.
-	// Its lifetime is bound to the session: jailedHandlers (SFTP) or
-	// ftpSession.openJail (FTP) creates it; the corresponding teardown path
-	// calls fs.Close() exactly once.
+	// fs is opened during authentication. The SSH connection shares it across
+	// all SFTP channels and closes it after every channel finishes. FTP sessions
+	// likewise own their authenticated filesystem until session teardown.
 	fs       *jailfs.FS
 	username string
 	clientIP string
@@ -410,11 +407,7 @@ func (j jail) applyTimes(r *sftp.Request, flags sftp.FileAttrFlags, attrs *sftp.
 	return nil
 }
 
-func jailedHandlers(root, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool, handles ...*sessionHandleBudget) (sftp.Handlers, *jailfs.FS, error) {
-	fs, err := jailfs.Open(filepath.Clean(root))
-	if err != nil {
-		return sftp.Handlers{}, nil, err
-	}
+func jailedHandlers(fs *jailfs.FS, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool, handles ...*sessionHandleBudget) sftp.Handlers {
 	j := jail{
 		fs:             fs,
 		username:       username,
@@ -433,7 +426,7 @@ func jailedHandlers(root, username, clientIP string, canRead, canWrite bool, upl
 		FilePut:  j,
 		FileCmd:  j,
 		FileList: j,
-	}, fs, nil
+	}
 }
 
 type fileInfoLister struct{ infos []os.FileInfo }

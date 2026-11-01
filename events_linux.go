@@ -82,7 +82,9 @@ type CompletedUpload struct {
 	// Username is the authenticated SFTP, FTP, or HTTP user that performed the upload.
 	Username string
 	// FullFilePath is the absolute path of the uploaded file on the server's
-	// local filesystem (i.e. resolved through the user's jail root).
+	// local filesystem, constructed from the root path at authentication. This
+	// reporting path may become stale if the root or a parent directory is moved;
+	// filesystem operations remain pinned to the originally opened directory.
 	FullFilePath string
 	// FilePath is the file path as seen by the client, relative to the
 	// user's jail root (e.g. "/incoming/foo.txt").

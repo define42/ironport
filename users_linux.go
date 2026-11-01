@@ -9,7 +9,10 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// UserInfo holds the credentials and jail root for a single SFTP/FTP user.
+// UserInfo holds the credentials and jail root for a single SFTP/FTP/HTTP user.
+// Root must name an existing directory when authenticating. Symlinks in any
+// configured root component and literal ".." components are rejected. Relative
+// roots are resolved from the working directory at authentication time.
 type UserInfo struct {
 	Password       string
 	AuthorizedKeys []ssh.PublicKey // public keys allowed for SFTP authentication; nil or empty means public-key auth is disabled for this user

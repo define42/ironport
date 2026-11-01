@@ -125,18 +125,27 @@ func checkRevisionAuthentication(t *testing.T, original UserInfo, update func(*S
 	t.Helper()
 	s := NewServer(&Config{Users: map[string]UserInfo{"alice": original}})
 	_, before, _ := s.userSnapshot("alice")
+	beforeFDs := countRetainedJailDescriptors(t, original.Root)
 	_, root, revision, ok := s.authenticateUser("alice", func(stored UserInfo) bool {
 		update(s)
 		return checkPassword(stored.Password, original.Password)
 	})
+	if root != nil {
+		t.Cleanup(func() { _ = root.Close() })
+	}
 	if ok == changed {
 		t.Fatalf("authentication succeeded=%t after revision changed=%t", ok, changed)
 	}
-	if changed && (root != "" || revision != 0) {
-		t.Fatalf("rejected authentication retained stale metadata: root=%q revision=%d", root, revision)
+	if changed {
+		if afterFDs := countRetainedJailDescriptors(t, original.Root); afterFDs != beforeFDs {
+			t.Fatalf("rejected authentication leaked jail descriptors: %d -> %d", beforeFDs, afterFDs)
+		}
 	}
-	if !changed && (root == "" || revision != before) {
-		t.Fatalf("equivalent update lost authentication: root=%q revision=%d; want %d", root, revision, before)
+	if changed && (root != nil || revision != 0) {
+		t.Fatalf("rejected authentication retained stale metadata: root=%v revision=%d", root, revision)
+	}
+	if !changed && (root == nil || revision != before) {
+		t.Fatalf("equivalent update lost authentication: root=%v revision=%d; want %d", root, revision, before)
 	}
 }
 

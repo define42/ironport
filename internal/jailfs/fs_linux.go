@@ -110,32 +110,15 @@ func splitParent(rel string) (string, string) {
 // directory. Every method validates the path through the kernel using
 // openat2; no string-level resolution or pre-check is performed.
 //
-// Methods are safe for concurrent use; the only mutable state is the root fd
-// which is set at construction and closed at teardown.
+// Filesystem operations are safe for concurrent use. The root descriptor is
+// fixed at construction; Close must run only after those operations finish.
 type FS struct {
 	root   string // textual jail root, for constructing client-visible full paths
 	rootFd int    // O_PATH fd to the jail root; closed by Close
 }
 
-// Open opens a jail root at the given on-disk path and returns a
-// FS whose root fd refers to that directory. The path is opened with
-// O_PATH|O_DIRECTORY|O_NOFOLLOW so the root itself cannot be substituted by
-// a symlink at construction time.
-//
-// openat2 availability is verified on first use; if the running kernel does
-// not support it the call returns errOpenat2Unsupported.
-func Open(root string) (*FS, error) {
-	if err := probeOpenat2(); err != nil {
-		return nil, err
-	}
-	fd, err := unix.Open(root, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return nil, &os.PathError{Op: "open", Path: root, Err: err}
-	}
-	return &FS{root: root, rootFd: fd}, nil
-}
-
-// Close releases the jail root fd. After Close, further calls return EBADF.
+// Close releases the jail root fd after all filesystem operations finish.
+// After Close, further calls return EBADF.
 func (j *FS) Close() error {
 	if j == nil || j.rootFd < 0 {
 		return nil
@@ -166,13 +149,10 @@ func (j *FS) openat(rel string, flags int, perm os.FileMode) (int, error) {
 	return fd, nil
 }
 
-// FullPath returns the on-disk path that corresponds to a client-supplied
-// path. The argument is cleaned and confined to the jail relative form
-// before being joined to the textual root, so callers may pass raw client
-// input. Because openat2 with RESOLVE_NO_SYMLINKS guarantees that no
-// symlink is traversed when this path is actually used, simple string
-// concatenation here yields the actual on-disk path. This is used purely
-// for reporting (e.g. CompletedUpload.FullFilePath).
+// FullPath returns the reporting path for a client-supplied path. The input
+// is cleaned and confined to the jail-relative form before joining it to the
+// configured root. Filesystem operations use the retained root descriptor;
+// this reporting path may become stale if the root or an ancestor is renamed.
 func (j *FS) FullPath(clientPath string) string {
 	rel := CleanPath(clientPath)
 	if rel == "." || rel == "" {

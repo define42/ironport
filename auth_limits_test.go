@@ -36,7 +36,9 @@ func TestAuthenticationLimitsSharedByProtocols(t *testing.T) {
 	if response := doHTTPUpload(t, server, "alice", "bad", "file", "x", nil); response.Code != http.StatusUnauthorized {
 		t.Fatalf("HTTP status=%d", response.Code)
 	}
-	config := server.sshServerConfig()
+	var authState sshAuthState
+	defer authState.close()
+	config := authState.config(server.sshServerConfig())
 	if _, err := config.PasswordCallback(testConnMetadata{user: "alice"}, []byte("correct")); err == nil {
 		t.Fatal("SSH bypassed the shared username limit")
 	}
@@ -68,7 +70,9 @@ func TestSSHKeyProofUsesSharedAuthenticationLimit(t *testing.T) {
 			for range 2 {
 				limiter.Result("alice", "192.0.2.1", false, time.Now())
 			}
-			config := server.sshServerConfig()
+			var authState sshAuthState
+			defer authState.close()
+			config := authState.config(server.sshServerConfig())
 			metadata := testConnMetadata{user: "alice"}
 			permissions, err := config.PublicKeyCallback(metadata, key)
 			if err != nil {
@@ -100,7 +104,9 @@ func TestSSHKeyProofCannotReuseQueryAdmission(t *testing.T) {
 		SftpSigner: testSigner(t), Users: map[string]UserInfo{"alice": user},
 		AuthLimits: AuthLimitConfig{UserBurst: 1, UserInterval: time.Hour},
 	})
-	config := server.sshServerConfig()
+	var authState sshAuthState
+	defer authState.close()
+	config := authState.config(server.sshServerConfig())
 	metadata := testConnMetadata{user: "alice"}
 	permissions, err := config.PublicKeyCallback(metadata, key)
 	if err != nil {

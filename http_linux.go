@@ -164,69 +164,79 @@ func (s *Server) handleHTTPIngest(w http.ResponseWriter, r *http.Request) {
 		s.rejectHTTPUpload(w, r, http.StatusMethodNotAllowed)
 		return
 	}
-	username, user, jailRoot, ok := s.httpAuthenticate(w, r)
+	username, user, jfs, ok := s.httpAuthenticate(w, r)
 	if !ok {
 		return
 	}
+	// Own the authenticated descriptor before any permission/body rejection.
+	// All request filesystem operations use this same retained jail.
+	defer func() { _ = jfs.Close() }()
 	if !user.CanWrite {
 		s.rejectHTTPUpload(w, r, http.StatusForbidden)
 		return
 	}
-	s.httpStoreUpload(w, r, username, jailRoot)
+	s.httpStoreUpload(w, r, username, jfs)
 }
 
 // httpAuthenticate validates HTTP Basic credentials against the shared user
 // database. On success it returns the username, the user's snapshot, and the
-// canonical jail root. On failure it has rejected the upload with 401, 429, or
-// 431 (or closed the connection when only Hijacker is available), and
-// returns ok=false. A bare request with no Authorization header is answered
+// open jail, which the caller must close. On failure it returns ok=false after
+// rejecting the upload with 401, 429, or 431, or closing the connection when only
+// Hijacker is available. A bare request with no Authorization header is answered
 // with a challenge but does not emit a LoginFailed event, so unauthenticated
 // probes (and the first leg of a browser's challenge/response) do not flood the
 // AuthEvents stream.
-func (s *Server) httpAuthenticate(w http.ResponseWriter, r *http.Request) (username string, user UserInfo, jailRoot string, ok bool) {
+func (s *Server) httpAuthenticate(w http.ResponseWriter, r *http.Request) (username string, user UserInfo, jfs *jailfs.FS, ok bool) {
 	authorizationValues := r.Header.Values("Authorization")
 	if len(authorizationValues) == 0 {
 		s.rejectHTTPUpload(w, r, http.StatusUnauthorized)
-		return "", UserInfo{}, "", false
+		return "", UserInfo{}, nil, false
 	}
 	rawLimit := s.httpAuthorizationByteLimit()
 	rawBytes := 0
 	for _, value := range authorizationValues {
 		if len(value) > rawLimit-rawBytes {
 			s.rejectHTTPUpload(w, r, http.StatusRequestHeaderFieldsTooLarge)
-			return "", UserInfo{}, "", false
+			return "", UserInfo{}, nil, false
 		}
 		rawBytes += len(value)
 	}
 	if len(authorizationValues) != 1 {
 		s.rejectHTTPUpload(w, r, http.StatusUnauthorized)
-		return "", UserInfo{}, "", false
+		return "", UserInfo{}, nil, false
 	}
 	reqUser, reqPass, hasAuth := r.BasicAuth()
 	if !hasAuth || len(reqUser) > s.httpUsernameByteLimit() || len(reqPass) > s.httpPasswordByteLimit() {
 		s.rejectHTTPUpload(w, r, http.StatusUnauthorized)
-		return "", UserInfo{}, "", false
+		return "", UserInfo{}, nil, false
 	}
 	clientIP := netconn.HostFromAddr(r.RemoteAddr)
 	if retry := s.allowAuth(reqUser, clientIP); retry > 0 {
 		s.authFailed(reqUser, clientIP, CompletedUploadProtocolHTTP, s.authEventsChan(), true)
 		w.Header().Set("Retry-After", strconv.FormatInt(int64((retry-1)/time.Second+1), 10))
 		s.rejectHTTPUpload(w, r, http.StatusTooManyRequests)
-		return "", UserInfo{}, "", false
+		return "", UserInfo{}, nil, false
 	}
-	u, root, _, authOK := s.authenticateUser(reqUser, func(stored UserInfo) bool {
+	u, jail, _, authOK := s.authenticateUser(reqUser, func(stored UserInfo) bool {
 		return checkPassword(stored.Password, reqPass)
 	})
 	if !authOK {
 		s.authFailed(reqUser, clientIP, CompletedUploadProtocolHTTP, s.authEventsChan(), false)
 		s.rejectHTTPUpload(w, r, http.StatusUnauthorized)
-		return "", UserInfo{}, "", false
+		return "", UserInfo{}, nil, false
 	}
+	// Retain ownership until the successful return, including calls into an
+	// application-supplied log writer that may panic before the handler can defer Close.
+	defer func() {
+		if !ok {
+			_ = jail.Close()
+		}
+	}()
 	s.authSucceeded(reqUser, clientIP)
 	//nolint:gosec // G706: username/IP are logged with %q, which escapes CR/LF and so neutralises log-line injection from the client-supplied Authorization header
-	log.Printf("login protocol=http user=%q root=%q from=%q", reqUser, root, clientIP)
+	log.Printf("login protocol=http user=%q root=%q from=%q", reqUser, u.Root, clientIP)
 	s.announceHTTPAuthEvent(AuthEventLoginSuccess, reqUser, clientIP)
-	return reqUser, u, root, true
+	return reqUser, u, jail, true
 }
 
 // httpStoreUpload reads every multipart part named "file" and stores each into
@@ -236,21 +246,13 @@ func (s *Server) httpAuthenticate(w http.ResponseWriter, r *http.Request) (usern
 // least one file was stored and none failed; otherwise it is an error status
 // (400 for client errors / no "file" part, 500 when any file hit a server-side
 // error) whose body lists every file's outcome. All filesystem detail is logged
-// server-side, never echoed to the client.
-func (s *Server) httpStoreUpload(w http.ResponseWriter, r *http.Request, username, jailRoot string) {
+// server-side, never echoed to the client. The caller retains ownership of jfs.
+func (s *Server) httpStoreUpload(w http.ResponseWriter, r *http.Request, username string, jfs *jailfs.FS) {
 	mr, err := r.MultipartReader()
 	if err != nil {
 		s.rejectHTTPUpload(w, r, http.StatusBadRequest)
 		return
 	}
-	jfs, err := jailfs.Open(jailRoot)
-	if err != nil {
-		log.Printf("http open jail root %q for user %q: %v", jailRoot, username, err)
-		s.rejectHTTPUpload(w, r, http.StatusInternalServerError)
-		return
-	}
-	defer func() { _ = jfs.Close() }()
-
 	results, bodyOK := s.storeUploadParts(mr, jfs, username, netconn.HostFromAddr(r.RemoteAddr))
 	if bodyOK {
 		// The closing multipart boundary can precede the HTTP body's EOF.

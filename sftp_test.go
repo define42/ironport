@@ -172,6 +172,7 @@ func TestHandleConn_HandshakeTimeout(t *testing.T) {
 }
 
 func TestHandleSession_RecoversFromPanic(t *testing.T) {
+	j := handleTestJail(t, t.TempDir(), nil)
 	ch := &panicReadChannel{closed: make(chan struct{})}
 	inReqs := make(chan *ssh.Request, 1)
 	inReqs <- &ssh.Request{
@@ -183,7 +184,7 @@ func TestHandleSession_RecoversFromPanic(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleSession(ch, inReqs, t.TempDir(), "testuser", "127.0.0.1", true, true, make(chan CompletedUpload, 1), nil, false)
+		handleSession(ch, inReqs, j.fs, "testuser", "127.0.0.1", true, true, make(chan CompletedUpload, 1), nil, false)
 	}()
 
 	select {

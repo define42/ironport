@@ -34,6 +34,18 @@ This package is **Linux-only**. The path-containment guarantee depends on the
 since Linux 5.6. `ListenAndServe` probes for `openat2` at startup and
 returns an error on older kernels rather than silently degrading the policy.
 
+Configured `UserInfo.Root` paths must name existing directories at login.
+Symlinks in any root-path component and literal `..` components are rejected;
+use the real directory path when migrating a symlinked configuration. Relative
+roots are resolved from a verified working-directory snapshot at authentication
+time, keeping the retained directory and its reporting path consistent.
+
+Authentication opens and retains the root directory for the SSH/FTP session or
+HTTP request, including every SFTP channel on that SSH connection. Renaming or
+replacing the configured path does not redirect an authenticated session.
+`CompletedUpload.FullFilePath` is a reporting path and may become stale after
+a root or parent directory is renamed.
+
 ## Project policy
 
 - Security reports: see [SECURITY.md](SECURITY.md).

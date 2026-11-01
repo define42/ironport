@@ -85,7 +85,10 @@ func checkPassword(storedPw, suppliedPw string) bool {
 }
 
 // authenticateUser performs the credential check shared by SFTP, FTP, and
-// HTTP. It returns a cloned user, canonical jail-root path, and revision.
+// HTTP. It returns a cloned user, an opened jail, and revision. On success,
+// the caller owns the jail and must close it after all session/request work.
+// The user's Root is the absolute reporting path; filesystem operations must
+// use the returned jail so that replacing that path cannot redirect access.
 // The final revision check linearizes HTTP authentication with user updates;
 // connection protocols must also commit that revision before starting a session.
 // ok is false when credentials, root validation, or the revision check fail;
@@ -98,19 +101,21 @@ func checkPassword(storedPw, suppliedPw string) bool {
 // unknown, so it MUST be constant-time (independent of stored password length
 // and AuthorizedKeys count) to avoid leaking username existence; checkPassword
 // and the public-key timing pad already satisfy this.
-func (s *Server) authenticateUser(username string, keyCheck func(stored UserInfo) bool) (UserInfo, string, uint64, bool) {
+func (s *Server) authenticateUser(username string, keyCheck func(stored UserInfo) bool) (UserInfo, *jailfs.FS, uint64, bool) {
 	u, revision, ok := s.userSnapshot(username)
 	if !keyCheck(u) || !ok {
-		return UserInfo{}, "", 0, false
+		return UserInfo{}, nil, 0, false
 	}
-	jailRoot, err := jailfs.CanonicalRoot(u.Root)
+	jfs, err := jailfs.Open(u.Root)
 	if err != nil {
-		return UserInfo{}, "", 0, false
+		return UserInfo{}, nil, 0, false
 	}
 	if !s.userRevisionMatches(username, revision) {
-		return UserInfo{}, "", 0, false
+		_ = jfs.Close()
+		return UserInfo{}, nil, 0, false
 	}
-	return u, jailRoot, revision, true
+	u.Root = jfs.FullPath(".")
+	return u, jfs, revision, true
 }
 
 // matchAuthorizedKey reports whether the presented SSH public key matches any

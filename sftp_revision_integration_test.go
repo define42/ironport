@@ -72,12 +72,12 @@ type sshRevisionRejectionHarness struct {
 	commitMuLocked bool
 }
 
-func newSSHRevisionRejectionHarness(t *testing.T) *sshRevisionRejectionHarness {
+func newSSHRevisionRejectionHarness(t *testing.T, root string) *sshRevisionRejectionHarness {
 	t.Helper()
 	baselineMuxes := countSSHMuxLoops()
 
 	config := newTestConfig("", "", "", map[string]UserInfo{
-		"alice": {Password: "pw", Root: t.TempDir(), CanRead: true},
+		"alice": {Password: "pw", Root: root, CanRead: true},
 	}, testSigner(t), defaultCompletedUploadsSize)
 	server := NewServer(config)
 
@@ -201,7 +201,7 @@ func (h *sshRevisionRejectionHarness) finish() {
 }
 
 func TestSSHRevisionRejectionDrainsGlobalRequests(t *testing.T) {
-	h := newSSHRevisionRejectionHarness(t)
+	h := newSSHRevisionRejectionHarness(t, t.TempDir())
 
 	// x/crypto/ssh's incoming request queue has 16 entries. The reply-required
 	// barrier can complete only if handleConn started consuming the 40 earlier
@@ -229,7 +229,7 @@ func TestSSHRevisionRejectionDrainsGlobalRequests(t *testing.T) {
 }
 
 func TestSSHRevisionRejectionDrainsChannelOpens(t *testing.T) {
-	h := newSSHRevisionRejectionHarness(t)
+	h := newSSHRevisionRejectionHarness(t, t.TempDir())
 
 	// Fill the 16-entry incoming-channel queue and wait until the server mux is
 	// blocked attempting to enqueue another open. Closing only the raw socket

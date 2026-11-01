@@ -255,6 +255,7 @@ func TestSFTPServer_PasswordAuth_ValidatesJailRoot(t *testing.T) {
 		{name: "file", root: filePath},
 		{name: "missing", root: filepath.Join(t.TempDir(), "missing")},
 		{name: "directory", root: target, want: target},
+		{name: "dot-dot", root: target + "/../" + filepath.Base(target)},
 	}
 
 	for _, tc := range tests {
@@ -262,7 +263,9 @@ func TestSFTPServer_PasswordAuth_ValidatesJailRoot(t *testing.T) {
 			srv := newTestServer(":0", "", "", map[string]UserInfo{
 				"alice": {Password: "alicepw", Root: tc.root, CanRead: true, CanWrite: true},
 			}, testSigner(t), defaultCompletedUploadsSize)
-			cfg := srv.sshServerConfig()
+			state := &sshAuthState{}
+			t.Cleanup(state.close)
+			cfg := state.config(srv.sshServerConfig())
 
 			perms, err := cfg.PasswordCallback(testConnMetadata{user: "alice"}, []byte("alicepw"))
 			if tc.want == "" {
@@ -287,13 +290,12 @@ func TestSFTPServer_PasswordAuth_ValidatesJailRoot(t *testing.T) {
 	srv := newTestServer(":0", "", "", map[string]UserInfo{
 		"alice": {Password: "alicepw", Root: link, CanRead: true, CanWrite: true},
 	}, testSigner(t), defaultCompletedUploadsSize)
-	cfg := srv.sshServerConfig()
+	state := &sshAuthState{}
+	t.Cleanup(state.close)
+	cfg := state.config(srv.sshServerConfig())
 	perms, err := cfg.PasswordCallback(testConnMetadata{user: "alice"}, []byte("alicepw"))
-	if err != nil {
-		t.Fatalf("PasswordCallback: %v", err)
-	}
-	if actualJailRoot := perms.Extensions["jailRoot"]; actualJailRoot != target {
-		t.Fatalf("permissions jailRoot = %q; want %q", actualJailRoot, target)
+	if err == nil {
+		t.Fatalf("PasswordCallback accepted symlink root with permissions %+v", perms)
 	}
 }
 
@@ -442,7 +444,9 @@ func TestFTPSessionAuthenticate_ValidatesJailRoot(t *testing.T) {
 		{name: "whitespace", root: "  ", want: false},
 		{name: "file", root: filePath, want: false},
 		{name: "missing", root: filepath.Join(t.TempDir(), "missing"), want: false},
-		{name: "symlink", root: link, want: true},
+		{name: "symlink", root: link, want: false},
+		{name: "dot-dot", root: target + "/../" + filepath.Base(target), want: false},
+		{name: "directory", root: target, want: true},
 	}
 
 	for _, tc := range tests {
