@@ -1,14 +1,159 @@
 package jailfs
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+func TestOpenat2ProbeRetriesNonDefinitiveErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"EMFILE", syscall.EMFILE},
+		{"ENFILE", syscall.ENFILE},
+		{"EINTR", syscall.EINTR},
+		{"ENOMEM", syscall.ENOMEM},
+		{"EAGAIN", syscall.EAGAIN},
+		{"EPERM", syscall.EPERM},
+		{"EACCES", syscall.EACCES},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			probe := openat2Probe{run: func() error {
+				calls++
+				if calls <= 2 {
+					return tc.err
+				}
+				return nil
+			}}
+			assertOpenat2ProbeRetrySequence(t, &probe, tc.err)
+			if calls != 3 {
+				t.Fatalf("probe calls = %d; want 3 with recovered success cached", calls)
+			}
+		})
+	}
+}
+
+func assertOpenat2ProbeRetrySequence(t *testing.T, probe *openat2Probe, retryErr error) {
+	t.Helper()
+	for i, want := range []error{retryErr, retryErr, nil, nil} {
+		err := probe.check()
+		if !errors.Is(err, want) {
+			t.Fatalf("check %d = %v; want %v", i+1, err, want)
+		}
+		if want != nil && !errors.Is(errors.Unwrap(err), want) {
+			t.Fatalf("check %d = %v; want a wrapped cause", i+1, err)
+		}
+	}
+}
+
+func TestOpenat2ProbeCachesDefinitiveResults(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  error
+		want error
+	}{
+		{"success", nil, nil},
+		{"unsupported", syscall.ENOSYS, errOpenat2Unsupported},
+		{"wrapped_unsupported", fmt.Errorf("syscall: %w", syscall.ENOSYS), errOpenat2Unsupported},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			probe := openat2Probe{run: func() error {
+				calls++
+				return tc.run
+			}}
+			for range 3 {
+				if err := probe.check(); !errors.Is(err, tc.want) {
+					t.Fatalf("check = %v; want %v", err, tc.want)
+				}
+			}
+			if calls != 1 {
+				t.Fatalf("definitive result made %d probe calls; want 1", calls)
+			}
+		})
+	}
+}
+
+func TestOpenat2ProbeConcurrentDefinitiveResults(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  error
+		want error
+	}{
+		{"success", nil, nil},
+		{"unsupported", fmt.Errorf("syscall: %w", syscall.ENOSYS), errOpenat2Unsupported},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			probe := openat2Probe{run: func() error {
+				calls.Add(1)
+				return tc.run
+			}}
+			for _, err := range concurrentOpenat2ProbeChecks(&probe) {
+				if !errors.Is(err, tc.want) {
+					t.Errorf("concurrent check = %v; want %v", err, tc.want)
+				}
+			}
+			if got := calls.Load(); got != 1 {
+				t.Fatalf("concurrent definitive result made %d probe calls; want 1", got)
+			}
+		})
+	}
+}
+
+func TestOpenat2ProbeConcurrentTransientThenSuccess(t *testing.T) {
+	var calls atomic.Int32
+	probe := openat2Probe{run: func() error {
+		if calls.Add(1) == 1 {
+			return syscall.EMFILE
+		}
+		return nil
+	}}
+	transientResults := 0
+	for _, err := range concurrentOpenat2ProbeChecks(&probe) {
+		switch {
+		case errors.Is(err, syscall.EMFILE):
+			transientResults++
+		case err != nil:
+			t.Errorf("concurrent check = %v; want EMFILE or success", err)
+		}
+	}
+	if transientResults != 1 {
+		t.Errorf("transient results = %d; want exactly 1", transientResults)
+	}
+	if err := probe.check(); err != nil {
+		t.Errorf("cached check after concurrent recovery = %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("probe calls = %d; want transient attempt and cached success", got)
+	}
+}
+
+func concurrentOpenat2ProbeChecks(probe *openat2Probe) []error {
+	results := make([]error, 32)
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	for i := range results {
+		workers.Go(func() {
+			<-start
+			results[i] = probe.check()
+		})
+	}
+	close(start)
+	workers.Wait()
+	return results
+}
 
 // ---- CleanPath / FS path-handling tests ----
 

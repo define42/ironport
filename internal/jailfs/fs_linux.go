@@ -40,42 +40,70 @@ import (
 // race-prone and would silently weaken the policy.
 var errOpenat2Unsupported = errors.New("kernel does not support openat2 (Linux 5.6+ required)")
 
-// One-time probe state for openat2. These are package-level globals so the
-// probe result is cached across all jail instances in the process; openat2
-// availability is a kernel property and cannot change at runtime.
-//
-//nolint:gochecknoglobals // process-wide cache of kernel capability probe
-var (
-	openat2ProbeOnce sync.Once
-	openat2ProbeErr  error
+const (
+	openat2Unknown uint8 = iota
+	openat2Available
+	openat2Unavailable
 )
 
-// probeOpenat2 verifies that openat2 is available by issuing a harmless call
-// against /. The result is cached after the first successful probe. Callers
-// that need this guarantee at startup (e.g. before reporting a configured
-// jail root) can invoke it directly; it is also invoked transparently by
-// Open on every jail creation.
-func probeOpenat2() error {
-	openat2ProbeOnce.Do(func() {
-		fd, err := unix.Openat2(unix.AT_FDCWD, "/", &unix.OpenHow{
-			Flags:   unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC,
-			Resolve: 0,
-		})
-		if err != nil {
-			if errors.Is(err, syscall.ENOSYS) {
-				openat2ProbeErr = errOpenat2Unsupported
-				return
-			}
-			openat2ProbeErr = fmt.Errorf("openat2 probe: %w", err)
-			return
-		}
-		_ = unix.Close(fd)
+// openat2Probe caches only definitive capability results. Other failures leave
+// the probe unresolved so a later check can recover without a process restart.
+type openat2Probe struct {
+	mu    sync.Mutex
+	state uint8
+	run   func() error
+}
+
+// check serializes capability detection and cache updates. Each invocation
+// makes at most one probe attempt; transient failures are returned to its caller.
+func (p *openat2Probe) check() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	switch p.state {
+	case openat2Available:
+		return nil
+	case openat2Unavailable:
+		return errOpenat2Unsupported
+	}
+
+	err := p.run()
+	if err == nil {
+		p.state = openat2Available
+		return nil
+	}
+	if errors.Is(err, syscall.ENOSYS) {
+		p.state = openat2Unavailable
+		return errOpenat2Unsupported
+	}
+	return fmt.Errorf("openat2 probe: %w", err)
+}
+
+func runOpenat2Probe() error {
+	fd, err := unix.Openat2(unix.AT_FDCWD, "/", &unix.OpenHow{
+		Flags:   unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC,
+		Resolve: 0,
 	})
-	return openat2ProbeErr
+	if err != nil {
+		return err
+	}
+	_ = unix.Close(fd)
+	return nil
+}
+
+//nolint:gochecknoglobals // process-wide cache of kernel capability results
+var openat2Availability = openat2Probe{run: runOpenat2Probe}
+
+// probeOpenat2 verifies that openat2 is available by issuing a harmless call
+// against /. Success and ENOSYS are cached; other failures are retried on the
+// next call. Open invokes this check before opening each jail root.
+func probeOpenat2() error {
+	return openat2Availability.check()
 }
 
 // CheckSupport checks whether openat2 is available so callers can fail at
-// startup rather than at the first filesystem request.
+// startup rather than at the first filesystem request. Temporary probe errors
+// are returned to the caller and can be retried by calling CheckSupport again.
 func CheckSupport() error { return probeOpenat2() }
 
 // CleanPath normalises a client-supplied path into a slash-separated,

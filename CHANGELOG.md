@@ -8,6 +8,10 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
+- Temporary `openat2` capability-probe failures, such as descriptor exhaustion,
+  no longer prevent all subsequent jail opens. Only success and `ENOSYS` are
+  cached; other errors are returned to the caller and retried on the next check.
+
 - SFTP handles now retain write errors, including append failures, so a later
   successful `CLOSE` does not emit a false `CompletedUploads` event. Successful
   writes after a failure do not clear that handle's failed-upload state.
