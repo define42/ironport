@@ -2,7 +2,7 @@
 //
 // This file implements the "no symlinks anywhere" filesystem policy by
 // performing every per-request filesystem operation through file descriptors
-// rooted at the jail. Every path lookup uses openat2 with
+// rooted at the jail. Every client path lookup uses openat2 with
 // RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS so that:
 //
 //   - The supplied directory fd is treated as the filesystem root.
@@ -164,28 +164,16 @@ func (j *FS) FullPath(clientPath string) string {
 // OpenRead opens a regular file for reading. Symlinks anywhere in the path
 // (including the final component) cause the call to fail with EACCES/ELOOP.
 func (j *FS) OpenRead(clientPath string) (*os.File, error) {
-	rel := CleanPath(clientPath)
-	fd, err := j.openat(rel, os.O_RDONLY, 0)
-	if err != nil {
-		return nil, &os.PathError{Op: "open", Path: clientPath, Err: err}
-	}
-	return os.NewFile(uintptr(fd), rel), nil
+	return j.openRegular(clientPath, os.O_RDONLY, 0)
 }
 
-// OpenWrite opens a file for writing using the given flags and mode. Callers
-// pass the standard os.O_* flags (typically O_CREATE|O_WRONLY|O_TRUNC for
-// uploads, or |O_APPEND for FTP APPE). The file is opened through openat2 so
-// the kernel rejects symlink traversal at all components.
+// OpenWrite opens a regular file for writing using the given flags and mode.
+// Callers pass the standard os.O_* flags (typically O_CREATE|O_WRONLY|O_TRUNC
+// for uploads, or O_APPEND for FTP APPE). Client paths are resolved through
+// openat2 with no symlinks. Existing inodes are pinned and type-checked before
+// opening for I/O, and truncation follows successful reopening.
 func (j *FS) OpenWrite(clientPath string, flags int, perm os.FileMode) (*os.File, error) {
-	rel := CleanPath(clientPath)
-	if flags&os.O_CREATE == 0 {
-		perm = 0
-	}
-	fd, err := j.openat(rel, flags, perm)
-	if err != nil {
-		return nil, &os.PathError{Op: "open", Path: clientPath, Err: err}
-	}
-	return os.NewFile(uintptr(fd), rel), nil
+	return j.openRegular(clientPath, flags, perm)
 }
 
 // Stat returns os.FileInfo for the given client path. Because openat2 with
@@ -376,14 +364,21 @@ func (j *FS) Rename(oldPath, newPath string) error {
 	return nil
 }
 
-// Chmod changes the permission bits of the entry at clientPath via fchmod on
-// an openat2-obtained fd. Symlinks anywhere in the path cause failure.
+// Chmod changes the permission bits of a regular file or directory. The inode
+// is pinned and type-checked before opening it for fchmod. Symlinks anywhere
+// in the client path cause failure.
 func (j *FS) Chmod(clientPath string, perm os.FileMode) error {
 	rel := CleanPath(clientPath)
-	// Open read-only; fchmod requires a non-O_PATH fd on Linux.
-	fd, err := j.openat(rel, os.O_RDONLY, 0)
+	pathFD, err := j.openat(rel, unix.O_PATH, 0)
 	if err != nil {
-		// Fall back to read-write if the file is write-only; failing that,
+		return &os.PathError{Op: "chmod", Path: clientPath, Err: err}
+	}
+	defer func() { _ = unix.Close(pathFD) }()
+	// Open read-only after checking the pinned inode's type; fchmod requires
+	// a non-O_PATH fd on supported kernels. Both attempts use the same pin.
+	fd, err := reopenCheckedFile(pathFD, os.O_RDONLY, true)
+	if err != nil {
+		// Fall back to write-only if the file is write-only; failing that,
 		// surface the original O_RDONLY error. The O_WRONLY error is
 		// intentionally discarded: the O_RDONLY result is the one the
 		// caller actually asked about (it covers the common cases —
@@ -391,7 +386,7 @@ func (j *FS) Chmod(clientPath string, perm os.FileMode) error {
 		// failure on the fallback only tells us that "the second guess
 		// didn't work either", which would be more confusing than
 		// helpful.
-		fd2, err2 := j.openat(rel, os.O_WRONLY, 0)
+		fd2, err2 := reopenCheckedFile(pathFD, os.O_WRONLY, true)
 		if err2 != nil {
 			return &os.PathError{Op: "chmod", Path: clientPath, Err: err}
 		}
@@ -420,16 +415,15 @@ func (j *FS) Chown(clientPath string, uid, gid int) error {
 	return nil
 }
 
-// Truncate sets the file size at clientPath. The fd is obtained through
-// openat2 so symlink traversal is impossible.
+// Truncate sets the size of a regular file after pinning and validating its
+// inode. The initial lookup uses openat2 so symlink traversal is impossible.
 func (j *FS) Truncate(clientPath string, size int64) error {
-	rel := CleanPath(clientPath)
-	fd, err := j.openat(rel, os.O_WRONLY, 0)
+	f, err := j.OpenWrite(clientPath, os.O_WRONLY, 0)
 	if err != nil {
 		return &os.PathError{Op: "truncate", Path: clientPath, Err: err}
 	}
-	defer func() { _ = unix.Close(fd) }()
-	if err := unix.Ftruncate(fd, size); err != nil {
+	defer func() { _ = f.Close() }()
+	if err := f.Truncate(size); err != nil {
 		return &os.PathError{Op: "truncate", Path: clientPath, Err: err}
 	}
 	return nil

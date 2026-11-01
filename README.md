@@ -12,7 +12,7 @@ A production-ready, embeddable SFTP server and FTP server library for Go with a 
 - **SFTP and FTP/FTPS in one binary** — a single server hosts both protocols against the same user database, jails, and permission flags. FTPS (explicit TLS via `AUTH TLS`, RFC 4217) opt-in with `FtpTLSConfig`; pair with `FtpRequireTLS` to refuse plaintext logins entirely
 - **HTTP upload endpoint** — `HttpIngest()` returns an `http.HandlerFunc` you mount on your own router (`mux.HandleFunc("/upload", srv.HttpIngest())`). It accepts a `multipart/form-data` POST with the file under the `file` field (`key=file`), authenticates with HTTP Basic auth using the **same** username/password as SFTP/FTP/FTPS, and stores the file in the user's jail — sharing the same permission flags, `CompletedUploads`, and `AuthEvents` streams. Put it behind TLS (your own `http.Server`/reverse proxy), since Basic credentials are otherwise sent in the clear
 - **SSH public-key and password authentication** — both methods use constant-time comparisons to prevent username enumeration via timing side-channels
-- **Per-user jail (chroot)** — each user is confined to a configurable root directory. Every filesystem operation is performed via Linux `openat2` with `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS`, so the kernel itself rejects path traversal and any symlink anywhere in the lookup
+- **Per-user jail (chroot)** — each user is confined to a configurable root directory. Every client path is resolved via Linux `openat2` with `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS`, so the kernel itself rejects path traversal and any symlink anywhere in the lookup
 - **Fine-grained permissions** — independent `CanRead` / `CanWrite` flags per user
 - **Dynamic user management** — add, remove, and update users and their authorized keys at runtime without restarting the server
 - **Upload notifications** — a buffered `CompletedUploads()` stream delivers a `CompletedUpload` struct (protocol — `SFTP`, `FTP`, or `HTTP` — username, full on-disk path, jail-relative path, and client IP) for every successfully closed upload
@@ -33,6 +33,13 @@ This package is **Linux-only**. The path-containment guarantee depends on the
 `openat2` syscall with `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS`, available
 since Linux 5.6. `ListenAndServe` probes for `openat2` at startup and
 returns an error on older kernels rather than silently degrading the policy.
+
+Existing files are pinned with `O_PATH`, checked to be regular files, and then
+reopened through an accessible, trusted `/proc/self/fd` for I/O. This rejects
+FIFOs, sockets, and devices before opening them for I/O while preserving normal
+file-lease waits. Truncation occurs only after a successful open. Chmod uses the
+same checks and also permits directories. These operations fail closed if
+required descriptor reopening is unavailable.
 
 Configured `UserInfo.Root` paths must name existing directories at login.
 Symlinks in any root-path component and literal `..` components are rejected;

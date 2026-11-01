@@ -8,6 +8,14 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
+- File reads, writes, truncation, and chmod now validate a pinned inode before
+  opening it for I/O, rejecting FIFOs, sockets, and devices without triggering
+  their open behavior. Existing files are reopened through `/proc/self/fd`, and
+  truncation follows a successful open; normal file-lease waits are preserved.
+  Chmod continues to support directories. **Deployment requirement:** an
+  accessible, trusted procfs at `/proc/self/fd` is now required for descriptor
+  reopening. Exported Go API signatures are unchanged.
+
 - Jail roots are opened securely during authentication and retained through the
   SSH/FTP session or HTTP request. All SFTP channels share the authenticated
   root, so later path replacement cannot redirect access. Relative roots keep
