@@ -263,7 +263,7 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- C
 	canRead := sshConn.Permissions.Extensions["canRead"] == "true"
 	canWrite := sshConn.Permissions.Extensions["canWrite"] == "true"
 	clientIP := netconn.RemoteIP(sshConn.RemoteAddr())
-	log.Printf("login protocol=sftp user=%s root=%s from=%s", user, jailRoot, sshConn.RemoteAddr())
+	log.Printf("login protocol=sftp user=%q root=%q from=%s", user, jailRoot, sshConn.RemoteAddr())
 	authEvent := AuthEvent{
 		Type:     AuthEventLoginSuccess,
 		Username: user,

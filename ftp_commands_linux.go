@@ -154,7 +154,7 @@ func (f *ftpSession) cmdPass(arg string) {
 		return
 	}
 	f.server.authSucceeded(f.username, f.clientIP)
-	log.Printf("login protocol=ftp user=%s root=%s from=%s", f.username, f.user.Root, f.conn.RemoteAddr())
+	log.Printf("login protocol=ftp user=%q root=%q from=%s", f.username, f.user.Root, f.conn.RemoteAddr())
 	f.announceAuthEvent(AuthEventLoginSuccess)
 	_ = f.reply(230, "login successful")
 }

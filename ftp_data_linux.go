@@ -363,7 +363,7 @@ func (f *ftpSession) acceptPassiveDataConn(ctx context.Context, ln net.Listener,
 
 func (f *ftpSession) dialActiveDataConn(ctx context.Context, addr *net.TCPAddr, deadline time.Time) (net.Conn, error) {
 	dialer := net.Dialer{Deadline: deadline}
-	log.Printf("ftp active data dial user=%s from=%s to=%s", f.username, f.conn.RemoteAddr(), addr)
+	log.Printf("ftp active data dial user=%q from=%s to=%s", f.username, f.conn.RemoteAddr(), addr)
 	dc, err := dialer.DialContext(ctx, "tcp", addr.String())
 	if err != nil {
 		return nil, err

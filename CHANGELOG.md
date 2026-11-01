@@ -8,6 +8,9 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
+- Escape usernames and jail roots in SFTP/FTP login logs, usernames in FTP
+  active-data dial logs, and HTTP upload-error text to prevent log injection.
+
 - SSH public-key queries now check key eligibility without opening a jail or
   emitting root-open diagnostics. The jail is opened only after signature
   verification, using the current user configuration. Shared throttling,

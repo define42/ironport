@@ -328,11 +328,11 @@ func (s *Server) storeUploadPart(jfs *jailfs.FS, p *multipart.Part, username, cl
 	}
 	log.Printf("upload protocol=http user=%q path=%q", username, clientPath)
 	if err := jfs.MkdirAll(path.Dir(clientPath), httpUploadDirPerm); err != nil {
-		log.Printf("upload failed protocol=http user=%q path=%q: create parent dirs: %v", username, clientPath, err)
+		log.Printf("upload failed protocol=http user=%q path=%q: create parent dirs: %q", username, clientPath, err.Error())
 		return uploadResult{path: clientPath, serverErr: true}
 	}
 	if err := streamToJailFile(jfs, clientPath, p); err != nil {
-		log.Printf("upload interrupted protocol=http user=%q path=%q: %v", username, clientPath, err)
+		log.Printf("upload interrupted protocol=http user=%q path=%q: %q", username, clientPath, err.Error())
 		return uploadResult{path: clientPath, serverErr: true}
 	}
 	s.announceHTTPUpload(username, clientIP, clientPath, jfs.FullPath(clientPath))
