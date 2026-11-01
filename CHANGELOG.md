@@ -8,6 +8,13 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
+- SFTP directory reads and FTP `STAT` now stream entries with bounded memory,
+  matching the existing FTP `LIST`/`MLSD` behavior. SFTP directory handles keep
+  an open jailed cursor instead of a full snapshot, and release the descriptor
+  and handle permit on `CLOSE` or session teardown. `STAT` retains its multiline
+  format and complete-reply write deadline; failures after the reply starts
+  close the control session. Public API signatures are unchanged.
+
 - Hardened FTP control and data setup: rejected pre-TLS command logs omit
   passwords and other arguments; complete control replies have a five-minute
   write deadline, with failed writes closing the session and cancelling data

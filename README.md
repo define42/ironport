@@ -223,6 +223,14 @@ reservation expires from the time of `PASV`/`EPSV`, normally after 30 seconds,
 and releases on replacement, logout, disconnect, cancellation, or completed
 data setup. Established FTP transfers no longer occupy passive-listener slots.
 
+Directory listings use bounded server memory: SFTP reads entries on demand
+from an open directory cursor, and FTP `LIST`, `MLSD`, and `STAT` stream their
+output. SFTP directory descriptors and handle permits remain held until the
+client closes the handle or the session ends, including after end-of-directory.
+Listings reflect filesystem changes during enumeration rather than a stable
+snapshot. FTP `STAT` uses the complete-reply write deadline; a failure after
+its multiline reply starts closes the control session.
+
 SSH has an absolute 30-second handshake deadline in addition to its read idle
 timeout. FTP successful login stops its login timer; logging out starts a new
 window. `FTPMaxAuthFailures` is not reset by `USER`, `REIN`, or a successful login.

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -503,20 +504,59 @@ func (f *ftpSession) cmdStat(arg string) {
 		_ = f.reply(550, ftpErrMsg(err))
 		return
 	}
-	var lines []string
 	if st.IsDir() {
-		entries, err := f.fs.List(ftpPath)
-		if err != nil {
-			_ = f.reply(550, ftpErrMsg(err))
-			return
-		}
-		for _, info := range entries {
-			lines = append(lines, ftpListLine(info, info.Name()))
-		}
-	} else {
-		lines = append(lines, ftpListLine(st, ftpPathBase(ftpPath)))
+		f.replyStatDirectory(ftpPath, f.fs.ListStream)
+		return
 	}
+	lines := []string{ftpListLine(st, ftpPathBase(ftpPath))}
 	_ = f.multilineReply(213, "Status of "+ftpQuotePath(ftpPath)+":", lines, "End of status")
+}
+
+// replyStatDirectory streams one control response without collecting the
+// directory or formatted lines. Delay its header until enumeration succeeds
+// or yields an entry, preserving a standalone 550 for initial open/read errors.
+// Once the header starts, any error closes the connection: a partial multiline
+// listing must never be followed by a success terminator or another reply.
+func (f *ftpSession) replyStatDirectory(ftpPath string, list func(string, func(os.FileInfo) error) error) {
+	started := false
+	var listErr error
+	err := f.writeControlReply(func() error {
+		listErr = f.writeStatDirectory(ftpPath, list, &started)
+		if listErr != nil && !started {
+			return nil
+		}
+		return listErr
+	})
+	if err == nil && listErr != nil {
+		_ = f.reply(550, ftpErrMsg(listErr))
+	}
+}
+
+func (f *ftpSession) writeStatDirectory(ftpPath string, list func(string, func(os.FileInfo) error) error, started *bool) error {
+	begin := func() error {
+		if *started {
+			return nil
+		}
+		*started = true
+		_, err := fmt.Fprintf(f.w, "213-Status of %s:\r\n", ftpQuotePath(ftpPath))
+		return err
+	}
+	if err := list(ftpPath, func(info os.FileInfo) error {
+		if err := begin(); err != nil {
+			return err
+		}
+		_, err := fmt.Fprintf(f.w, " %s\r\n", ftpListLine(info, info.Name()))
+		return err
+	}); err != nil {
+		return err
+	}
+	if err := begin(); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprint(f.w, "213 End of status\r\n"); err != nil {
+		return err
+	}
+	return f.w.Flush()
 }
 
 // cmdAllo answers the ALLO command (RFC 959 §4.1.3). The size argument is

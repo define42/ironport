@@ -327,11 +327,11 @@ func (j jail) Filelist(r *sftp.Request) (lister sftp.ListerAt, err error) {
 				release()
 			}
 		}()
-		infos, err := j.fs.List(r.Filepath)
+		dir, err := j.fs.OpenDir(r.Filepath)
 		if err != nil {
 			return nil, sanitizeSFTPErr(err)
 		}
-		return &budgetLister{ListerAt: listerFromFileInfo(infos), release: release}, nil
+		return &budgetLister{ListerAt: &directoryLister{dir: dir}, release: release}, nil
 	case "Stat", "Lstat":
 		// Under the no-symlink policy Stat and Lstat are equivalent: the
 		// kernel rejects any symlink in the path lookup, so the entry being

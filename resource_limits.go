@@ -3,6 +3,7 @@
 package ironport
 
 import (
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -124,12 +125,19 @@ func (f *budgetWriter) Close() error {
 type budgetLister struct {
 	sftp.ListerAt
 
-	release func()
+	once     sync.Once
+	release  func()
+	closeErr error
 }
 
-// Directory listings retain their snapshot until the client closes its handle.
-// The release callback is already guarded by sync.OnceFunc.
+// Directory cursors and their permits live until CLOSE or session teardown,
+// including after EOF, while pkg/sftp still retains the protocol handle.
 func (f *budgetLister) Close() error {
-	f.release()
-	return nil
+	f.once.Do(func() {
+		defer f.release()
+		if closer, ok := f.ListerAt.(io.Closer); ok {
+			f.closeErr = sanitizeSFTPErr(closer.Close())
+		}
+	})
+	return f.closeErr
 }
