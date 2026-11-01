@@ -236,26 +236,23 @@ func (f *ftpSession) cmdStor(arg string, appendMode bool) {
 	}
 	ftpPath := f.cleanPath(arg)
 
-	// Open the destination file before sending 150 / accepting the data
-	// connection. Opening first means an open failure (permission, path,
-	// restart offset past EOF) is reported with the client still idle,
-	// rather than after it has already begun streaming data.
-	file, ok := f.openUploadFile(ftpPath, appendMode, restartOffset)
-	if !ok {
-		return
-	}
-
 	if err := f.reply(150, "opening data connection"); err != nil {
-		_ = file.Close()
 		return
 	}
 	dc, err := f.acceptDataConn()
 	if err != nil {
-		_ = file.Close()
 		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
 	defer closeDataConn(dc)
+
+	// O_CREATE/O_TRUNC can change the destination before any bytes arrive.
+	// Open only after the data peer and, for FTPS, the control-session TLS
+	// binding are validated, so failed setup leaves the destination untouched.
+	file, ok := f.openUploadFile(ftpPath, appendMode, restartOffset)
+	if !ok {
+		return
+	}
 
 	// When resuming a STOR via REST, ALLO carried the total file size but
 	// only the bytes from restartOffset onward travel on this transfer;

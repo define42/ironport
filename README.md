@@ -311,6 +311,13 @@ the active dial deadline; passive reservations still expire after 30 seconds. Be
 external IPv4 address so the `PASV` reply advertises an address clients can
 reach instead of the server's internal address.
 
+For `STOR` and `APPE`, the server sends `150` and validates the data
+connection, including FTPS session binding, before creating or truncating the
+destination. Failed data setup leaves existing files unchanged and creates no
+new file. Destination-open errors (`550`) and invalid restart offsets (`554`)
+are reported after `150` and successful data setup; the data connection is
+then closed and no upload-completion event is emitted.
+
 FTP and FTPS clients can read modification times with `MDTM` or the `modify`
 fact in `MLST`/`MLSD`, and can set file modification times with `MFMT
 YYYYMMDDHHMMSS path`.

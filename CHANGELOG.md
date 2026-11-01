@@ -8,6 +8,12 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
+- FTP `STOR`/`APPE` now validate the data connection, including FTPS session
+  binding, before creating or truncating the destination. Failed data setup
+  preserves existing files and does not create new ones. Destination-open and
+  restart-offset errors now follow the `150` reply and data setup; failed
+  transfers do not emit `CompletedUploads` events.
+
 - User changes now invalidate pending authentication snapshots. SSH and FTP
   atomically check the user revision when registering an authenticated
   connection, closing the race with removal, replacement, and remove/re-add.
@@ -95,9 +101,6 @@ and patch releases; breaking API changes require a major version bump.
   bypass the binding.
 - The FTP control idle timeout now sends a `421` reply before closing the
   connection instead of dropping it silently.
-- `STOR`/`APPE` now open the destination file before sending `150` and
-  accepting the data connection, so an open failure is reported before the
-  client starts streaming.
 - The accept loop now caps consecutive non-transient `Accept` errors so a
   permanently poisoned listener fd no longer spins and logs forever, while
   transient errors (timeouts, `EMFILE`/`ENFILE`, …) are still retried.

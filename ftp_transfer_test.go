@@ -333,12 +333,12 @@ func TestFTPServer_RestBeyondFileSizeRejected(t *testing.T) {
 	client.command(200, "TYPE I")
 
 	// REST past EOF of an existing file: STOR must fail with 554 and the
-	// existing bytes must remain untouched. The destination is opened before
-	// the 150 reply, so the rejection arrives immediately with no 150 and no
-	// data transfer.
+	// existing bytes must remain untouched. Destination validation follows
+	// the 150 reply and data setup, but no upload bytes are written.
 	client.command(350, "REST 99")
 	rejectConn, _ := client.passiveConn()
-	client.command(554, "STOR existing.txt")
+	client.command(150, "STOR existing.txt")
+	client.read(554)
 	_ = rejectConn.Close()
 
 	if got, err := os.ReadFile(existingPath); err != nil { //nolint:gosec // path under t.TempDir()
@@ -351,7 +351,8 @@ func TestFTPServer_RestBeyondFileSizeRejected(t *testing.T) {
 	// be created at size 0 and writing at offset N would leave a hole.
 	client.command(350, "REST 10")
 	newConn, _ := client.passiveConn()
-	client.command(554, "STOR new.txt")
+	client.command(150, "STOR new.txt")
+	client.read(554)
 	_ = newConn.Close()
 
 	// REST at exactly EOF is still allowed (equivalent to APPE-style
@@ -374,18 +375,16 @@ func TestFTPServer_RestBeyondFileSizeRejected(t *testing.T) {
 	}
 }
 
-// TestFTPServer_StorOpenFailureBefore150 verifies that when the upload
-// destination cannot be opened (here: the path is an existing directory),
-// the server rejects the STOR with 550 *before* sending any 150 reply and
-// without ever accepting a data connection. Opening the file first means a
-// client never starts streaming into a transfer that is doomed to fail.
-func TestFTPServer_StorOpenFailureBefore150(t *testing.T) {
+// TestFTPServer_StorOpenFailureAfterDataSetup verifies that an invalid
+// destination produces 550 after 150 and validated data setup, closes the data
+// connection, and leaves the control session usable without announcing success.
+func TestFTPServer_StorOpenFailureAfterDataSetup(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Mkdir(filepath.Join(root, "adir"), 0o700); err != nil {
 		t.Fatalf("os.Mkdir: %v", err)
 	}
 
-	_, addr, stop := startTestFTPServer(t, map[string]UserInfo{
+	srv, addr, stop := startTestFTPServer(t, map[string]UserInfo{
 		"ftpuser": {Password: "ftppw", Root: root, CanRead: true, CanWrite: true},
 	}, "")
 	t.Cleanup(stop)
@@ -394,11 +393,20 @@ func TestFTPServer_StorOpenFailureBefore150(t *testing.T) {
 	client.login("ftpuser", "ftppw")
 	client.command(200, "TYPE I")
 
-	// Set up a passive listener, then STOR onto a directory: openUploadFile
-	// fails and the server must reply 550 directly, never 150.
 	dataConn, _ := client.passiveConn()
-	client.command(550, "STOR adir")
-	_ = dataConn.Close()
+	defer func() { _ = dataConn.Close() }()
+	client.command(150, "STOR adir")
+	client.read(550)
+	_ = dataConn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := dataConn.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("data connection after destination failure: %v; want EOF", err)
+	}
+	select {
+	case event := <-srv.CompletedUploads():
+		t.Fatalf("failed upload announced success: %+v", event)
+	default:
+	}
+	client.command(200, "NOOP")
 }
 
 func TestFTPServer_CmdStorSanitizesCopyErrors(t *testing.T) {
