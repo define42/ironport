@@ -8,6 +8,14 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
+- Hardened FTP control and data setup: rejected pre-TLS command logs omit
+  passwords and other arguments; complete control replies have a five-minute
+  write deadline, with failed writes closing the session and cancelling data
+  operations. Passive endpoints retry rejected IPs and FTPS handshakes within
+  their original reservation deadline, capped at 32 rejections. `AUTH TLS`
+  also clears `EPSV ALL`, `PBSZ`, and `PROT` state. Public API signatures are
+  unchanged.
+
 - FTP `STOR`/`APPE` now validate the data connection, including FTPS session
   binding, before creating or truncating the destination. Failed data setup
   preserves existing files and does not create new ones. Destination-open and

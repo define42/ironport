@@ -51,6 +51,8 @@ func newFTPUploadSafetySession(t *testing.T) (*Server, *ftpTestClient, string) {
 	cfg := newTestFTPConfig(t, map[string]UserInfo{
 		"alice": {Password: "pw", Root: root, CanWrite: true},
 	}, "", true)
+	// A rejected foreign peer leaves PASV pending until this original
+	// deadline; the failure cases deliberately provide no legitimate retry.
 	cfg.FtpDataAcceptTimeout = 250 * time.Millisecond
 	srv, addr, stop := startTestFTPServerWithConfig(t, cfg)
 	t.Cleanup(stop)

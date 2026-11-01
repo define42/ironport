@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -276,11 +277,13 @@ func (f *ftpSession) acceptDataConn() (net.Conn, error) {
 		// PASV/EPSV starts the absolute lifetime; later commands cannot extend it.
 		deadline = reserved.Deadline()
 	}
-	dc, err := f.dialOrAcceptDataConn(ctx, ln, addr, deadline)
-	if err != nil {
-		return nil, err
+	if ln != nil {
+		return f.acceptPassiveDataConn(ctx, ln, deadline)
 	}
-	return f.protectDataConn(ctx, dc, deadline)
+	if addr != nil {
+		return f.dialActiveDataConn(ctx, addr, deadline)
+	}
+	return nil, errors.New("data connection not prepared")
 }
 
 func (f *ftpSession) protectDataConn(ctx context.Context, dc net.Conn, setupDeadline time.Time) (net.Conn, error) {
@@ -299,7 +302,7 @@ func (f *ftpSession) protectDataConn(ctx context.Context, dc net.Conn, setupDead
 	// resumption of its own ticket. The handshake is part of setup and cannot
 	// outlive the passive reservation.
 	if f.dataTLSConfig == nil {
-		_ = dc.Close()
+		f.closeFailedDataConn(dc)
 		return nil, errors.New("PROT P requested but FTPS is not configured")
 	}
 	deadline := time.Now().Add(ftpTLSHandshakeTimeout)
@@ -309,43 +312,63 @@ func (f *ftpSession) protectDataConn(ctx context.Context, dc net.Conn, setupDead
 	_ = dc.SetDeadline(deadline)
 	tc := tls.Server(dc, f.dataTLSConfig)
 	if err := tc.HandshakeContext(ctx); err != nil {
-		_ = dc.Close()
+		f.closeFailedDataConn(dc)
 		return nil, fmt.Errorf("data tls handshake: %w", err)
 	}
 	_ = dc.SetDeadline(time.Time{})
 	return tc, nil
 }
 
-func (f *ftpSession) dialOrAcceptDataConn(ctx context.Context, ln net.Listener, addr *net.TCPAddr, deadline time.Time) (net.Conn, error) {
-	if ln != nil {
-		return f.acceptPassiveDataConn(ln, deadline)
+// closeFailedDataConn removes a rejected handshake from cancellation tracking
+// before the next passive accept, without disturbing concurrent cancellation.
+func (f *ftpSession) closeFailedDataConn(dc net.Conn) {
+	_ = dc.Close()
+	f.dataMu.Lock()
+	if f.dataConn == dc {
+		f.dataConn = nil
 	}
-	if addr != nil {
-		return f.dialActiveDataConn(ctx, addr, deadline)
-	}
-	return nil, errors.New("data connection not prepared")
+	f.dataMu.Unlock()
 }
 
-func (f *ftpSession) acceptPassiveDataConn(ln net.Listener, deadline time.Time) (net.Conn, error) {
+func (f *ftpSession) acceptPassiveDataConn(ctx context.Context, ln net.Listener, deadline time.Time) (net.Conn, error) {
 	if tcpLn, ok := ln.(interface{ SetDeadline(time.Time) error }); ok {
 		_ = tcpLn.SetDeadline(deadline)
 	}
-	dc, err := ln.Accept()
-	if err != nil {
-		return nil, err
+	// A rejected source address or TLS peer must not consume the legitimate
+	// client's passive port. Bound both attempts and the original reservation
+	// lifetime; neither a new peer nor its TLS handshake extends that deadline.
+	const maxRejectedPeers = 32
+	for range maxRejectedPeers {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			return nil, os.ErrDeadlineExceeded
+		}
+		dc, err := ln.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if f.clientIP != "" && netconn.RemoteIP(dc.RemoteAddr()) != f.clientIP {
+			_ = dc.Close()
+			continue
+		}
+		protected, err := f.protectDataConn(ctx, dc, deadline)
+		if err == nil {
+			return protected, nil
+		}
 	}
-	// Prevent passive data-port stealing by requiring the control peer's IP.
-	if f.clientIP != "" && netconn.RemoteIP(dc.RemoteAddr()) != f.clientIP {
-		_ = dc.Close()
-		return nil, fmt.Errorf("data connection from unexpected IP %s", netconn.RemoteIP(dc.RemoteAddr()))
-	}
-	return dc, nil
+	return nil, errors.New("too many rejected data connections")
 }
 
 func (f *ftpSession) dialActiveDataConn(ctx context.Context, addr *net.TCPAddr, deadline time.Time) (net.Conn, error) {
 	dialer := net.Dialer{Deadline: deadline}
 	log.Printf("ftp active data dial user=%s from=%s to=%s", f.username, f.conn.RemoteAddr(), addr)
-	return dialer.DialContext(ctx, "tcp", addr.String())
+	dc, err := dialer.DialContext(ctx, "tcp", addr.String())
+	if err != nil {
+		return nil, err
+	}
+	return f.protectDataConn(ctx, dc, deadline)
 }
 
 // closeDataConn closes an FTP data connection. For TLS-wrapped data

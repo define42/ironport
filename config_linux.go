@@ -31,6 +31,9 @@ const (
 	// suppresses the CompletedUpload notification for a STOR/APPE that did
 	// not finish cleanly.
 	ftpDataIdleTimeout = 5 * time.Minute
+	// ftpControlWriteTimeout bounds a complete control reply, including a
+	// multiline response, when a connected client stops reading.
+	ftpControlWriteTimeout = 5 * time.Minute
 	// defaultFTPDataAcceptTimeout bounds how long a passive-mode FTP data
 	// listener waits after PASV/EPSV and how long an active-mode FTP dial may
 	// take after PORT/EPRT.

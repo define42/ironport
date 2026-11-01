@@ -10,7 +10,6 @@ import (
 	"net/textproto"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -186,26 +185,9 @@ func TestFTPSGetConfigForClientCannotOverrideControlSessionTicketKey(t *testing.
 		t.Fatal("attacker's cached ticket was not offered on the victim data connection")
 	}
 	_ = attackerData.Close()
-	victim.read(425)
-	// Hardening the dynamic config must not disable legitimate resumption.
-	victimData := victim.passiveDial()
-	defer func() { _ = victimData.Close() }()
-	_ = victimData.SetDeadline(time.Now().Add(5 * time.Second))
-	victim.send("RETR secret.bin")
-	victim.read(150)
-	victimTLS := victim.upgradeDataConn(victimData)
-	if !victimTLS.ConnectionState().DidResume {
-		t.Fatal("victim data handshake did not resume its control session")
-	}
-	got, err := io.ReadAll(victimTLS)
-	if err != nil {
-		t.Fatalf("victim RETR: %v", err)
-	}
-	if !bytes.Equal(got, payload) {
-		t.Fatalf("victim RETR payload = %q; want %q", got, payload)
-	}
-	_ = victimTLS.Close()
-	victim.read(226)
+	// A rejected dynamic-config candidate must leave this same passive
+	// reservation available to the control session's legitimate ticket.
+	assertFTPSRetryDownload(t, victim, attackerData.RemoteAddr().String(), payload)
 }
 
 // ---- FTPS (explicit, RFC 4217) integration tests ----
@@ -572,40 +554,43 @@ func TestFTPS_BufferedBytesAttackRejected(t *testing.T) {
 // must fail the handshake.
 func TestFTPS_DataConnRequiresResumption(t *testing.T) {
 	root := t.TempDir()
+	payload := []byte("fresh sessions must not read this file")
+	if err := os.WriteFile(filepath.Join(root, "secret.bin"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	users := map[string]UserInfo{"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true}}
 	cfg, pool := newTestFTPSConfig(t, users, false)
 	_, addr, stop := startTestFTPServerWithConfig(t, cfg)
-	defer stop()
+	t.Cleanup(stop)
 
 	c := dialFTPS(t, addr, pool)
 	c.authTLS()
 	c.login("alice", "alicepw")
 	c.command(200, "PBSZ 0")
 	c.command(200, "PROT P")
-	c.command(200, "TYPE I")
-
-	host, port, err := parseFTPPASVResponse(c.command(227, "PASV"))
-	if err != nil {
-		t.Fatalf("parse PASV: %v", err)
-	}
-	dc, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), 5*time.Second)
-	if err != nil {
-		t.Fatalf("dial data: %v", err)
-	}
+	dc := c.passiveDial()
 	defer func() { _ = dc.Close() }()
-
-	// Fresh session cache => no ticket presented => handshake fresh.
-	freshCfg := &tls.Config{
-		RootCAs:            pool,
-		ServerName:         "127.0.0.1",
-		ClientSessionCache: tls.NewLRUClientSessionCache(1),
-	}
-	tc := tls.Client(dc, freshCfg)
 	_ = dc.SetDeadline(time.Now().Add(5 * time.Second))
-	err = tc.HandshakeContext(t.Context())
+	c.command(150, "RETR secret.bin")
+
+	// Start an actual transfer before testing the handshake. Without RETR,
+	// a client-side timeout would not establish that the server rejected it.
+	freshCfg := c.tlsCfg.Clone()
+	freshCfg.ClientSessionCache = tls.NewLRUClientSessionCache(1)
+	tc := tls.Client(dc, freshCfg)
+	err := tc.HandshakeContext(t.Context())
 	if err == nil {
-		t.Fatal("data-conn handshake without session resumption succeeded; want failure")
+		if tc.ConnectionState().DidResume {
+			t.Fatal("fresh data session unexpectedly resumed")
+		}
+		_, err = tc.Read(make([]byte, 1))
 	}
+	var netErr net.Error
+	if err == nil || (errors.As(err, &netErr) && netErr.Timeout()) {
+		t.Fatalf("fresh data session was not rejected promptly: %v", err)
+	}
+	_ = dc.Close()
+	assertFTPSRetryDownload(t, c, dc.RemoteAddr().String(), payload)
 }
 
 // TestFTPS_DataConnRejectsTicketFromDifferentControlSession covers the
@@ -707,30 +692,37 @@ func TestFTPS_DataConnRejectsTicketFromDifferentControlSession(t *testing.T) {
 				}
 			}
 			_ = attackerData.Close()
-			victim.read(425)
-
-			// Rejection must be scoped to the foreign ticket. The ticket from
-			// this victim control session still resumes and transfers data.
-			victimData := victim.passiveDial()
-			defer func() { _ = victimData.Close() }()
-			_ = victimData.SetDeadline(time.Now().Add(5 * time.Second))
-			victim.send("RETR secret.bin")
-			victim.read(150)
-			victimTLS := victim.upgradeDataConn(victimData)
-			if !victimTLS.ConnectionState().DidResume {
-				t.Fatal("victim data handshake did not resume its control session")
-			}
-			got, err := io.ReadAll(victimTLS)
-			if err != nil {
-				t.Fatalf("victim RETR: %v", err)
-			}
-			if !bytes.Equal(got, payload) {
-				t.Fatalf("victim RETR payload = %q; want %q", got, payload)
-			}
-			_ = victimTLS.Close()
-			victim.read(226)
+			// Rejection is scoped to the foreign ticket. Resume the victim's
+			// own ticket on the same passive endpoint and pending RETR.
+			assertFTPSRetryDownload(t, victim, attackerData.RemoteAddr().String(), payload)
 		})
 	}
+}
+
+func dialFTPDataRetry(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("retry original passive endpoint: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	return conn
+}
+
+func assertFTPSRetryDownload(t *testing.T, client *ftpsTestClient, dataAddr string, want []byte) {
+	t.Helper()
+	raw := dialFTPDataRetry(t, dataAddr)
+	tc := client.upgradeDataConn(raw)
+	defer func() { _ = tc.Close() }()
+	if !tc.ConnectionState().DidResume {
+		t.Fatal("legitimate data connection did not resume its control session")
+	}
+	got, err := io.ReadAll(tc)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("download after rejected peer = %q, %v; want %q", got, err, want)
+	}
+	client.read(226)
 }
 
 // TestFTPS_AuthTLSDiscardsPlaintextLogin verifies that when a plaintext

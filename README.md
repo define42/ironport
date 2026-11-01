@@ -305,11 +305,19 @@ When FTP is enabled, passive mode (`PASV` / `EPSV`) is supported by default.
 Active mode (`PORT` / `EPRT`) is refused unless `FtpAllowActiveMode` is true.
 Even then, the server only dials back to the same IP as the control connection
 to prevent FTP bounce behavior. Passive data connections are checked against the
-control connection IP to prevent passive-port stealing. Passive listeners and
-active dials wait up to `FtpDataAcceptTimeout`. A negative value disables only
-the active dial deadline; passive reservations still expire after 30 seconds. Behind NAT or a port-forward, set `FtpPassiveAdvertisedIP` to the
-external IPv4 address so the `PASV` reply advertises an address clients can
-reach instead of the server's internal address.
+control connection IP to prevent passive-port stealing. A rejected IP or FTPS
+handshake leaves the passive endpoint available for another peer, up to 32
+rejected connections within the original reservation deadline. Passive
+reservations start at `PASV`/`EPSV` and active dials wait up to
+`FtpDataAcceptTimeout`; retries do not extend that deadline. A negative value
+disables only the active dial deadline; passive reservations still expire
+after 30 seconds. Behind NAT or a port-forward, set `FtpPassiveAdvertisedIP`
+to the external IPv4 address so the `PASV` reply advertises an address clients
+can reach instead of the server's internal address.
+
+Each complete FTP control reply, including multiline replies, has a five-minute
+write deadline. A failed control write closes the session and cancels its data
+operations.
 
 For `STOR` and `APPE`, the server sends `150` and validates the data
 connection, including FTPS session binding, before creating or truncating the
@@ -347,6 +355,12 @@ srv := ironport.NewServer(config)
 `WrapSession` and `UnwrapSession` must remain unset: custom ticket handling
 could bypass the control-session binding, so the server rejects such FTPS
 configs at startup.
+
+A successful `AUTH TLS` clears the plaintext login, data endpoint, and
+`EPSV ALL`/`PBSZ`/`PROT` state. Clients must log in again and send `PBSZ 0`
+followed by `PROT P` to protect data transfers. Diagnostics for rejected
+buffered commands record only a recognized command verb and byte count;
+arguments and unknown command tokens are omitted.
 
 The implementation covers the three FTPS implementation traps that are easy
 to get wrong:

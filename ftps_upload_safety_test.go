@@ -27,13 +27,6 @@ func TestFTPSUploadSafetyRejectedData(t *testing.T) {
 			for _, failure := range []string{"malformed handshake", "fresh session", "foreign session"} {
 				fixture.checkRejectedUploadCases(t, failure)
 			}
-			// Rejected candidates must not poison the control session or its
-			// own ticket. Both overwrite and append still work afterward.
-			for _, command := range []string{"STOR", "APPE"} {
-				t.Run("bound session/"+command, func(t *testing.T) {
-					fixture.checkBoundUpload(t, command)
-				})
-			}
 		})
 	}
 }
@@ -107,13 +100,16 @@ func (f *ftpsUploadSafetyServer) checkRejectedUpload(t *testing.T, failure, comm
 		config, cache := f.rejectedDataConfig(t, failure)
 		checkFTPSUploadTLSRejected(t, raw, config, cache)
 	}
-	client.read(425)
 	assertFTPSUploadSafetyTarget(t, f.root, filename, original, existing)
 	select {
 	case event := <-f.server.CompletedUploads():
 		t.Fatalf("rejected data setup announced a completed upload: %+v", event)
 	default:
 	}
+	// Keep the original PASV reservation and pending command. No second
+	// PASV/STOR is needed after the invalid data peer has been rejected.
+	retry := dialFTPDataRetry(t, raw.RemoteAddr().String())
+	f.completeBoundUpload(t, &client, retry, filename, command, original, existing)
 }
 
 func (f *ftpsUploadSafetyServer) rejectedDataConfig(t *testing.T, failure string) (*tls.Config, *trackingTLSSessionCache) {
@@ -193,18 +189,11 @@ func assertFTPSUploadSafetyTarget(t *testing.T, root *os.Root, filename string, 
 	}
 }
 
-func (f *ftpsUploadSafetyServer) checkBoundUpload(t *testing.T, command string) {
+func (f *ftpsUploadSafetyServer) completeBoundUpload(
+	t *testing.T, client *ftpsTestClient, raw net.Conn, filename, command string, original []byte, existing bool,
+) {
 	t.Helper()
-	client := *f.client
-	client.t = t
-	_ = client.conn.SetDeadline(time.Now().Add(5 * time.Second))
-	filename := "accepted.bin"
-	original, payload := []byte("old content"), []byte("new payload")
-	prepareFTPSUploadSafetyTarget(t, f.root, filename, original, true)
-	raw := client.passiveDial()
-	defer func() { _ = raw.Close() }()
-	_ = raw.SetDeadline(time.Now().Add(5 * time.Second))
-	client.command(150, "%s accepted.bin", command)
+	payload := []byte("new payload")
 	tc := client.upgradeDataConn(raw)
 	if !tc.ConnectionState().DidResume {
 		t.Fatal("legitimate data upload did not resume its control session")
@@ -218,7 +207,7 @@ func (f *ftpsUploadSafetyServer) checkBoundUpload(t *testing.T, command string) 
 	_ = tc.Close()
 	client.read(226)
 	want := payload
-	if command == "APPE" {
+	if command == "APPE" && existing {
 		want = bytes.Clone(original)
 		want = append(want, payload...)
 	}
@@ -228,7 +217,7 @@ func (f *ftpsUploadSafetyServer) checkBoundUpload(t *testing.T, command string) 
 	}
 	select {
 	case event := <-f.server.CompletedUploads():
-		if event.Username != "alice" || event.Protocol != CompletedUploadProtocolFTP {
+		if event.Username != "alice" || event.Protocol != CompletedUploadProtocolFTP || event.FilePath != "/"+filename {
 			t.Fatalf("unexpected completed upload: %+v", event)
 		}
 	default:

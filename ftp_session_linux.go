@@ -494,24 +494,53 @@ func (f *ftpSession) closeJail() {
 }
 
 func (f *ftpSession) reply(code int, message string) error {
-	_, err := fmt.Fprintf(f.w, "%d %s\r\n", code, message)
-	if err != nil {
-		return err
-	}
-	return f.w.Flush()
+	return f.writeControlReply(func() error {
+		if _, err := fmt.Fprintf(f.w, "%d %s\r\n", code, message); err != nil {
+			return err
+		}
+		return f.w.Flush()
+	})
 }
 
 func (f *ftpSession) multilineReply(code int, first string, lines []string, last string) error {
-	if _, err := fmt.Fprintf(f.w, "%d-%s\r\n", code, first); err != nil {
-		return err
-	}
-	for _, line := range lines {
-		if _, err := fmt.Fprintf(f.w, " %s\r\n", line); err != nil {
+	return f.writeControlReply(func() error {
+		if _, err := fmt.Fprintf(f.w, "%d-%s\r\n", code, first); err != nil {
 			return err
 		}
+		for _, line := range lines {
+			if _, err := fmt.Fprintf(f.w, " %s\r\n", line); err != nil {
+				return err
+			}
+		}
+		if _, err := fmt.Fprintf(f.w, "%d %s\r\n", code, last); err != nil {
+			return err
+		}
+		return f.w.Flush()
+	})
+}
+
+// writeControlReply sets the deadline before any write can fill the buffer.
+// A failed reply ends the session and its data operations, preventing queued
+// commands from running after the client can no longer receive their results.
+func (f *ftpSession) writeControlReply(write func() error) error {
+	var err error
+	if f.conn != nil {
+		err = f.conn.SetWriteDeadline(time.Now().Add(ftpControlWriteTimeout))
 	}
-	if _, err := fmt.Fprintf(f.w, "%d %s\r\n", code, last); err != nil {
-		return err
+	if err == nil {
+		err = write()
 	}
-	return f.w.Flush()
+	if err == nil && f.conn != nil {
+		// TLS reads can write protocol records (for example, KeyUpdate).
+		// A completed reply must not leave an expiring deadline on those
+		// later writes while the FTP session is idle or transferring data.
+		err = f.conn.SetWriteDeadline(time.Time{})
+	}
+	if err != nil {
+		f.cancelDataOperations()
+		if f.conn != nil {
+			_ = f.conn.Close()
+		}
+	}
+	return err
 }

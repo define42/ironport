@@ -224,7 +224,8 @@ func (f *ftpSession) preTLSChannelClean() bool {
 				return f.r.Buffered() == 0 || f.logPreTLSBuffered()
 			}
 			if msg.err == nil && strings.TrimSpace(msg.line) != "" {
-				log.Printf("ftp AUTH TLS rejected from=%s: pre-TLS line buffered: %q", f.conn.RemoteAddr(), msg.line)
+				log.Printf("ftp AUTH TLS rejected from=%s: pre-TLS command buffered: verb=%q bytes=%d",
+					f.conn.RemoteAddr(), preTLSLogVerb(msg.line), len(msg.line))
 				return false
 			}
 		default:
@@ -233,6 +234,23 @@ func (f *ftpSession) preTLSChannelClean() bool {
 			}
 			return true
 		}
+	}
+}
+
+// preTLSLogVerb never returns arbitrary plaintext: an unknown command token
+// may itself be a misplaced credential. Known verbs are canonical constants;
+// every argument and every malformed or unknown verb stays out of the log.
+func preTLSLogVerb(line string) string {
+	verb, _ := parseFTPCommand(strings.TrimRight(line, "\r\n"))
+	switch verb {
+	case "USER", "PASS", "QUIT", "NOOP", "SYST", "FEAT", "HELP", "STAT", "LANG", "HOST", "REIN",
+		"AUTH", "PBSZ", "PROT", "CCC", "PWD", "XPWD", "CWD", "CDUP", "TYPE", "MODE", "STRU", "OPTS",
+		"PASV", "EPSV", "PORT", "EPRT", "LIST", "NLST", "RETR", "STOR", "APPE", "ALLO", "REST",
+		"SIZE", "MDTM", "MFMT", "MFCT", "DELE", "MKD", "XMKD", "RMD", "XRMD", "RNFR", "RNTO",
+		"ABOR", "MLST", "MLSD", "SITE":
+		return verb
+	default:
+		return "UNKNOWN"
 	}
 }
 
@@ -256,6 +274,9 @@ func (f *ftpSession) resetSessionStateForAuthTLS() {
 	f.rnfrPath = ""
 	f.restartOffset = 0
 	f.expectedUploadSize = 0
+	f.epsvAll = false
+	f.pbszSet = false
+	f.dataProt = 'C'
 	f.server.clearConnUser(f.rawConn)
 }
 
