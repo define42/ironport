@@ -25,7 +25,16 @@ A production-ready, embeddable SFTP server and FTP server library for Go with a 
 - **SSH algorithm pinning** — optionally constrain SSH key exchange, ciphers, MACs, and public-key auth signature algorithms
 - **Idle-session timeout** — configurable via `IdleTimeout` on the config (default 15 minutes); inactive authenticated SFTP sessions are reaped
 - **Empty-password protection** — users whose stored `Password` is empty cannot authenticate via password, and empty supplied passwords are always rejected
-- **Chown opt-in** — `Setstat`/`Fsetstat` requests that try to change file ownership (uid/gid) are rejected with a permission error unless `SftpAllowChown` is explicitly set to `true` on the config. Symlink creation by clients is always refused, while SFTP access/modification time changes (`Chtimes`) are applied through the same fd-relative jail policy.
+- **Chown opt-in** — pathname `Setstat` requests that try to change file ownership (uid/gid) are rejected with a permission error unless `SftpAllowChown` is explicitly set to `true` on the config. Symlink creation by clients is always refused, while SFTP access/modification time changes (`Chtimes`) are applied through the same fd-relative jail policy.
+
+For users with write permission, SFTP attribute updates through an open handle
+(`FSETSTAT`, including `sftp.File.Truncate`, `Chmod`, and `Chown`) return
+`SSH_FX_OP_UNSUPPORTED`. Read-only users retain the existing permission denial.
+The pinned `pkg/sftp` request server dispatches them using the original pathname,
+which could identify a different file after a rename or replacement. Pathname
+`SETSTAT` operations, such as `sftp.Client.Truncate`, `Chmod`, `Chown`, and
+`Chtimes`, remain supported subject to the user's write permission and ownership
+policy.
 
 ## Platform support
 
@@ -443,7 +452,10 @@ to get wrong:
   different control connection is rejected even when both clients share one
   public IP. A peer that hijacks the data port cannot mount a fresh handshake
   or reuse a ticket from another session.
-- **Clean `close_notify` on transfers** — every TLS-wrapped data
+- **Clean `close_notify` on transfers** — protected `STOR`/`APPE` uploads
+  require the client to send TLS `close_notify`. A bare transport close returns
+  `426` and emits no `CompletedUpload`, even when an `ALLO` byte count matches;
+  partial data remains on disk. Every TLS-wrapped data
   connection is half-closed with `CloseWrite` before the underlying
   socket is closed, so the client sees a proper TLS EOF and can
   distinguish a complete download from a truncated one.

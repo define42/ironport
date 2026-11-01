@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -310,13 +311,40 @@ func (f *ftpSession) protectDataConn(ctx context.Context, dc net.Conn, setupDead
 		deadline = setupDeadline
 	}
 	_ = dc.SetDeadline(deadline)
-	tc := tls.Server(dc, f.dataTLSConfig)
+	tc := tls.Server(&ftpsDataTransport{Conn: dc}, f.dataTLSConfig)
 	if err := tc.HandshakeContext(ctx); err != nil {
 		f.closeFailedDataConn(dc)
 		return nil, fmt.Errorf("data tls handshake: %w", err)
 	}
 	_ = dc.SetDeadline(time.Time{})
 	return tc, nil
+}
+
+// ftpsDataTransport distinguishes transport EOF from TLS close_notify. Go's
+// crypto/tls accepts bare EOF at a record boundary for compatibility, but an
+// FTP upload requires authenticated TLS closure before reporting completion.
+// A distinct error below TLS preserves that distinction without parsing records.
+type ftpsDataTransport struct {
+	net.Conn
+
+	readErr error // accessed only by the serialized TLS reader
+}
+
+func (c *ftpsDataTransport) Read(p []byte) (int, error) {
+	if c.readErr != nil {
+		return 0, c.readErr
+	}
+	n, err := c.Conn.Read(p)
+	if errors.Is(err, io.EOF) {
+		c.readErr = fmt.Errorf("FTPS data connection closed without TLS close_notify: %w", io.ErrUnexpectedEOF)
+		if n > 0 {
+			// TLS must process any final records, including close_notify,
+			// before it observes transport closure on a subsequent read.
+			return n, nil
+		}
+		return n, c.readErr
+	}
+	return n, err
 }
 
 // closeFailedDataConn removes a rejected handshake from cancellation tracking

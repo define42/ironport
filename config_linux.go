@@ -181,7 +181,8 @@ type Config struct {
 	// firewalls/NAT and surface half-open peers as read errors.
 	TCPKeepAlivePeriod time.Duration
 	// SftpAllowChown controls whether SFTP clients may change file ownership
-	// inside their jail. It defaults to false.
+	// inside their jail through pathname SETSTAT. It defaults to false.
+	// Attribute updates through an open handle (FSETSTAT) are unsupported.
 	SftpAllowChown bool
 }
 

@@ -133,7 +133,7 @@ type Server struct {
 	// package default; a negative value disables keepalive entirely.
 	tcpKeepAlivePeriod time.Duration
 	// sftpAllowChown controls whether SFTP clients may change the ownership
-	// (uid/gid) of files in their jail via Setstat/Fsetstat requests.
+	// (uid/gid) of files in their jail via pathname Setstat requests.
 	// It defaults to false: chown requests are rejected with a permission
 	// error. Enable it only when the server runs with sufficient privilege
 	// (typically as root with CAP_CHOWN) AND the deployment trusts

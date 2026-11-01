@@ -408,7 +408,9 @@ func parseFTPCommand(line string) (string, string) {
 	arg := ""
 	if i := strings.IndexAny(line, " \t"); i >= 0 {
 		cmd = line[:i]
-		arg = strings.TrimLeft(line[i+1:], " \t")
+		// Only one byte separates the verb from its argument. Additional
+		// whitespace belongs to the argument; RFC 3659 requires this for paths.
+		arg = line[i+1:]
 	}
 	return strings.ToUpper(cmd), arg
 }

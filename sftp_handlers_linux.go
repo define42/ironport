@@ -60,7 +60,7 @@ type jail struct {
 	// announced on uploads; renaming such a file to a name without any of
 	// these extensions announces the final path on uploads instead.
 	tempExts []string
-	// sftpAllowChown controls whether Setstat/Fsetstat requests carrying a
+	// sftpAllowChown controls whether pathname Setstat requests carrying a
 	// uid/gid attribute are honoured. When false, chown requests are
 	// rejected with a permission error so an authenticated user cannot
 	// change ownership of jailed files even if the server process has
@@ -307,8 +307,20 @@ func (j jail) Filecmd(r *sftp.Request) (err error) {
 		return os.ErrPermission
 	}
 	switch r.Method {
-	case "Setstat", "Fsetstat":
+	case "Setstat":
+		// pkg/sftp v1.13.12 dispatches FSETSTAT as a fresh Setstat request
+		// containing only the handle's original pathname, without a context.
+		// Pathname SETSTAT requests have a cancellable context. Fail closed
+		// when that context is absent: reopening the saved path could mutate
+		// a replacement after the opened file was renamed or removed. Keep
+		// the protocol regression tests when updating pkg/sftp; safely
+		// supporting FSETSTAT requires access to its retained file handle.
+		if r.Context().Done() == nil {
+			return sftp.ErrSSHFxOpUnsupported
+		}
 		return sanitizeSFTPErr(j.applyAttrs(r))
+	case "Fsetstat":
+		return sftp.ErrSSHFxOpUnsupported
 
 	case "Rename":
 		if hasCRLF(r.Target) {
@@ -391,7 +403,7 @@ func (j jail) Filelist(r *sftp.Request) (lister sftp.ListerAt, err error) {
 	}
 }
 
-// applyAttrs applies SFTP Setstat/Fsetstat attributes to the file referenced
+// applyAttrs applies SFTP pathname Setstat attributes to the file referenced
 // by r.Filepath, constrained to the operations that can run safely as the
 // server process and consistent with the hardened "no symlinks anywhere"
 // policy.

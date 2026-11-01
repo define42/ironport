@@ -17,16 +17,22 @@ func TestFTPPathHelpers(t *testing.T) {
 		want string
 	}{
 		{"", ""},
-		{"   ", ""},
+		{"   ", "   "},
 		{"-la", ""},
 		{"-la /incoming", "/incoming"},
 		{"-la -- almost", "almost"},
-		// Only the first non-flag token is honoured. Extra positional
-		// arguments (whether they look like paths, "/a /b", or like a
-		// multi-word filename, "file name.txt") are dropped rather than
-		// silently concatenated — RFC 959 specifies one pathname.
-		{"-la /a /b", "/a"},
-		{"file name.txt", "file"},
+		{"-la /a /b", "/a /b"},
+		{"file name.txt", "file name.txt"},
+		{"file name.txt ", "file name.txt "},
+		{" file name.txt ", " file name.txt "},
+		{"-la  file name.txt ", " file name.txt "},
+		{"-la\tfile name.txt\t", "file name.txt\t"},
+		{"-- -file name.txt ", "-file name.txt "},
+		{"--", ""},
+		{"--  name ", " name "},
+		{"-la -- -- name ", "-- name "},
+		{"-la  ", " "},
+		{" -file name.txt", " -file name.txt"},
 	}
 	for _, tc := range listCases {
 		if got := listPathArg(tc.in); got != tc.want {
@@ -39,7 +45,10 @@ func TestFTPPathHelpers(t *testing.T) {
 		want string
 	}{
 		{`plain.txt`, "plain.txt"},
-		{` "space dir" `, "space dir"},
+		{`"space dir"`, "space dir"},
+		{` "space dir" `, ` "space dir" `},
+		{`" space dir "`, " space dir "},
+		{" plain.txt\t", " plain.txt\t"},
 		{`"a""quote.txt"`, `a"quote.txt`},
 		{`"unterminated`, `"unterminated`},
 	}
@@ -47,6 +56,25 @@ func TestFTPPathHelpers(t *testing.T) {
 		if got := unquoteFTPPath(tc.in); got != tc.want {
 			t.Errorf("unquoteFTPPath(%q) = %q; want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestFTPPathnameWhitespace(t *testing.T) {
+	for _, name := range []string{"report ", " report", "report detail", " ", "\treport\t"} {
+		t.Run(name, func(t *testing.T) {
+			cmd, arg := parseFTPCommand("DELE " + name)
+			if cmd != "DELE" || arg != name {
+				t.Fatalf("command parser changed pathname: cmd=%q arg=%q; want %q", cmd, arg, name)
+			}
+			session := &ftpSession{cwd: "/"}
+			if got := session.cleanPath(arg); got != "/"+name {
+				t.Fatalf("cleanPath(%q)=%q; want %q", name, got, "/"+name)
+			}
+			_, got, ok := parseMFMTArg("20240102030405 " + name)
+			if !ok || got != name {
+				t.Fatalf("MFMT parser changed pathname: path=%q ok=%t; want %q", got, ok, name)
+			}
+		})
 	}
 }
 
@@ -457,8 +485,8 @@ func FuzzUnquoteFTPPath(f *testing.F) {
 	})
 }
 
-// FuzzListPathArg confirms that listPathArg never returns a value beginning
-// with '-' — flag tokens must always be skipped, regardless of input shape.
+// FuzzListPathArg confirms that option parsing only removes a prefix and that
+// a pathname without options is preserved byte for byte.
 func FuzzListPathArg(f *testing.F) {
 	f.Add("-la /tmp")
 	f.Add("")
@@ -467,11 +495,15 @@ func FuzzListPathArg(f *testing.F) {
 	f.Add("file with spaces")
 	f.Add("-x -y -z")
 	f.Add("\t-la\t/incoming\t")
+	f.Add("-- -file with spaces ")
 
 	f.Fuzz(func(t *testing.T, arg string) {
 		got := listPathArg(arg)
-		if strings.HasPrefix(got, "-") {
-			t.Fatalf("listPathArg(%q) = %q; result must not start with '-'", arg, got)
+		if !strings.HasSuffix(arg, got) {
+			t.Fatalf("listPathArg(%q) = %q; result must be an unchanged suffix", arg, got)
+		}
+		if !strings.HasPrefix(arg, "-") && got != arg {
+			t.Fatalf("listPathArg(%q) = %q; pathname was changed", arg, got)
 		}
 	})
 }

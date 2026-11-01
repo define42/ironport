@@ -8,6 +8,22 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
+- Protected FTPS uploads now require TLS `close_notify` before returning
+  `226` or emitting `CompletedUpload`. Raw transport closure returns `426`,
+  including when `ALLO` matches the received byte count. Partial data remains
+  on disk; plain FTP retains its STREAM-mode completion behavior.
+
+- FTP pathnames preserve leading, trailing, and internal whitespace through
+  command parsing and filesystem operations. `LIST`, `NLST`, and `STAT` retain
+  the full pathname after optional flags; `--` ends option parsing.
+
+- SFTP `FSETSTAT` is now rejected before mutation because the pinned request
+  server dispatches it using the original pathname instead of the retained
+  handle. Writable sessions receive `SSH_FX_OP_UNSUPPORTED`; existing account
+  permission checks still apply. This prevents a rename and replacement from
+  redirecting handle attribute updates to a different file. Pathname `SETSTAT`
+  remains supported.
+
 - SFTP sessions now drain and reject subsequent SSH channel requests for the
   lifetime of the channel, preventing authenticated clients from filling the
   SSH request queue and permanently blocking forced shutdown.

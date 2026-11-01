@@ -303,11 +303,11 @@ func (f *ftpSession) openUploadFile(ftpPath string, appendMode bool, restartOffs
 // count, abort flag, copy error, and close error. It owns the idle-deadline
 // wrapping of the data connection so cmdStor's main flow stays linear.
 //
-// FTP STREAM mode signals "end of file" by half-closing the data
-// connection, so a client that uploads N bytes then half-closes is
-// indistinguishable at the protocol level from a client that intended to
-// upload exactly N bytes. The only reliable defense is an explicit size
-// hint from the client (ALLO); finalizeUploadStatus enforces it.
+// Plain FTP STREAM mode signals end of file by closing the data connection;
+// only an explicit size hint (ALLO) can detect a short upload in that case.
+// Protected uploads additionally require TLS close_notify: ftpsDataTransport
+// turns raw transport EOF into an error before crypto/tls can treat it as a
+// clean end of stream. finalizeUploadStatus enforces the size hint when set.
 func (f *ftpSession) runUploadCopy(dc net.Conn, file *os.File) (written int64, aborted bool, copyErr, closeErr error) {
 	idleDC := &netconn.IdleConn{Conn: dc}
 	idleDC.SetReadTimeout(ftpDataIdleTimeout)
@@ -372,12 +372,11 @@ func (f *ftpSession) applyRestartOffset(file *os.File, restartOffset int64) bool
 
 // announceUpload publishes the CompletedUpload event for a successful STOR.
 //
-// Completeness guarantee: when the client preceded STOR with ALLO, cmdStor
-// verifies the byte count matches before calling here, so the event is
-// authoritative. Without an ALLO hint, FTP STREAM mode cannot distinguish
-// "client sent every intended byte then half-closed" from "client truncated
-// mid-transfer", so the event is best-effort — its absence is not proof of
-// failure and its presence is not proof of byte-level integrity.
+// Completion requires a successful file close and, for protected transfers,
+// the client's TLS close_notify. When ALLO is set, the received byte count
+// must also match. Plain FTP has no authenticated stream closure, so without
+// ALLO it cannot detect a short upload. These checks do not establish whether
+// the client supplied its intended content or a correct size hint.
 func (f *ftpSession) announceUpload(ftpPath, fullPath string) {
 	log.Printf("upload complete: %q", ftpPath)
 	if shouldDeferCompletion(ftpPath, f.tempExts) {

@@ -312,7 +312,7 @@ func (f *ftpSession) cmdFeat() {
 }
 
 func (f *ftpSession) cleanPath(p string) string {
-	p = strings.TrimSpace(unquoteFTPPath(p))
+	p = unquoteFTPPath(p)
 	p = strings.ReplaceAll(p, "\\", "/")
 	if p == "" {
 		return f.cwd
@@ -328,7 +328,6 @@ func (f *ftpSession) cleanPath(p string) string {
 }
 
 func unquoteFTPPath(p string) string {
-	p = strings.TrimSpace(p)
 	if len(p) >= 2 && p[0] == '"' && p[len(p)-1] == '"' {
 		p = p[1 : len(p)-1]
 		p = strings.ReplaceAll(p, "\"\"", "\"")
@@ -342,20 +341,23 @@ func ftpQuotePath(p string) string {
 }
 
 // listPathArg extracts the pathname argument from a LIST/NLST/STAT line,
-// discarding any leading ls-style flags. Only the first non-flag token is
-// honoured: anything after it is dropped on the floor rather than being
-// silently concatenated. FTP has no quoting convention for the LIST
-// argument, so an unquoted multi-word path is ambiguous with a series of
-// stray arguments — RFC 959 specifies a single optional pathname, so the
-// strict interpretation is the safer one.
+// accepting leading ls-style flags for compatibility. After the flags, the
+// entire remainder is one pathname; spaces within it are significant. Each
+// token consumes exactly one separator, and -- ends option parsing so names
+// beginning with a dash can be addressed without a ./ prefix.
 func listPathArg(arg string) string {
-	for field := range strings.FieldsSeq(arg) {
-		if strings.HasPrefix(field, "-") {
-			continue
+	for strings.HasPrefix(arg, "-") {
+		i := strings.IndexAny(arg, " \t")
+		if i < 0 {
+			return ""
 		}
-		return field
+		option := arg[:i]
+		arg = arg[i+1:]
+		if option == "--" {
+			return arg
+		}
 	}
-	return ""
+	return arg
 }
 
 func (f *ftpSession) cmdCWD(arg string) {
@@ -480,7 +482,7 @@ func (f *ftpSession) cmdStat(arg string) {
 	// the imported "path" package, so any future edit that calls path.Base
 	// or path.Clean inside this function would silently become a method
 	// call on a string.
-	rawPath := strings.TrimSpace(arg)
+	rawPath := arg
 	if rawPath == "" {
 		lines := []string{
 			fmt.Sprintf("Connected from %s", sanitizeFTPText(f.clientIP)),
@@ -640,9 +642,7 @@ func (f *ftpSession) cmdMFMT(arg string) {
 }
 
 func parseMFMTArg(arg string) (time.Time, string, bool) {
-	arg = strings.TrimSpace(arg)
 	stamp, rawPath, ok := strings.Cut(arg, " ")
-	rawPath = strings.TrimSpace(rawPath)
 	if !ok || len(stamp) != len(ftpTimestampLayout) || rawPath == "" {
 		return time.Time{}, "", false
 	}
