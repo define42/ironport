@@ -66,7 +66,7 @@ func buildConfig(f flags, signer ssh.Signer, users map[string]ironport.UserInfo)
 	}
 	config.Users = users
 	config.SftpSigner = signer
-	config.CompletedUploadSize = 64
+	config.CompletedUploadSize = 65_536
 	config.AuthEventSize = 64
 	config.SSHKeyExchanges = splitCSV(*f.sshKex)
 	config.SSHCiphers = splitCSV(*f.sshCiphers)

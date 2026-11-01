@@ -149,7 +149,7 @@ func (s *Server) authEventsChan() chan AuthEvent {
 // stalls an upload. Callers should drain the stream continuously.
 //
 // The buffer capacity is set by Config.CompletedUploadSize. A
-// non-positive value falls back to the package default (64).
+// non-positive value falls back to the package default (65,536).
 func (s *Server) CompletedUploads() <-chan CompletedUpload {
 	return s.completedUploadsChan()
 }

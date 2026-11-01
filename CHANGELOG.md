@@ -8,6 +8,10 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
+- Increased the default `CompletedUploads` notification buffer from 64 to
+  65,536 entries. Explicit positive `CompletedUploadSize` values are unchanged;
+  non-positive values now select the larger default.
+
 - Protected FTPS uploads now require TLS `close_notify` before returning
   `226` or emitting `CompletedUpload`. Raw transport closure returns `426`,
   including when `ALLO` matches the received byte count. Partial data remains

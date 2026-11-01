@@ -141,13 +141,14 @@ func main() {
 
 ### Configuring the upload-notification buffer size
 
-Set `CompletedUploadSize` on the server config:
+The default capacity is 65,536 entries. Set `CompletedUploadSize` on the server
+config to override it:
 
 ```go
 config := ironport.DefaultConfig()
 config.Users = users
 config.SftpSigner = signer
-config.CompletedUploadSize = 256
+config.CompletedUploadSize = 131_072
 srv := ironport.NewServer(config)
 ```
 

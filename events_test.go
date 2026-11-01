@@ -96,6 +96,8 @@ func TestSFTPServer_AuthEventsPublicKeyLoginFailed(t *testing.T) {
 // TestCompletedUploadsBufferSize verifies that NewServer controls the buffer
 // capacity of the CompletedUploads channel.
 func TestCompletedUploadsBufferSize(t *testing.T) {
+	const wantDefaultCapacity = 65_536
+
 	signer := testSigner(t)
 	users := map[string]UserInfo{
 		"u": {Password: "pw", Root: t.TempDir(), CanWrite: true},
@@ -109,8 +111,8 @@ func TestCompletedUploadsBufferSize(t *testing.T) {
 	config.SftpSigner = signer
 	config.CompletedUploadSize = 0
 	srv := NewServer(config)
-	if cap(srv.CompletedUploads()) != defaultCompletedUploadsSize {
-		t.Errorf("default cap = %d; want %d", cap(srv.CompletedUploads()), defaultCompletedUploadsSize)
+	if cap(srv.CompletedUploads()) != wantDefaultCapacity {
+		t.Errorf("default cap = %d; want %d", cap(srv.CompletedUploads()), wantDefaultCapacity)
 	}
 
 	// Custom capacity via NewServer config.

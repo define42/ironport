@@ -7,6 +7,8 @@ import (
 
 //nolint:gocognit,cyclop,funlen // verifies every default field; splitting would just rename the function
 func TestDefaultConfig(t *testing.T) {
+	const wantCompletedUploadSize = 65_536
+
 	config := DefaultConfig()
 	if config.SftpAddr != ":2022" {
 		t.Errorf("SftpAddr = %q; want :2022", config.SftpAddr)
@@ -23,8 +25,8 @@ func TestDefaultConfig(t *testing.T) {
 	if config.FtpAllowActiveMode {
 		t.Error("FtpAllowActiveMode = true; want false")
 	}
-	if config.CompletedUploadSize != defaultCompletedUploadsSize {
-		t.Errorf("CompletedUploadSize = %d; want %d", config.CompletedUploadSize, defaultCompletedUploadsSize)
+	if config.CompletedUploadSize != wantCompletedUploadSize {
+		t.Errorf("CompletedUploadSize = %d; want %d", config.CompletedUploadSize, wantCompletedUploadSize)
 	}
 	if config.AuthEventSize != defaultAuthEventsSize {
 		t.Errorf("AuthEventSize = %d; want %d", config.AuthEventSize, defaultAuthEventsSize)

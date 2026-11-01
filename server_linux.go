@@ -181,13 +181,14 @@ type connCancelState struct {
 // FTP. Leave FtpPassivePortRange empty to use OS-assigned passive data ports.
 //
 // CompletedUploadSize sets the buffer capacity of the CompletedUploads channel.
+// A non-positive value falls back to the package default (65,536).
 // AuthEventSize sets the buffer capacity of the AuthEvents channel. A
-// non-positive value falls back to the package default (64) for either stream:
+// non-positive value falls back to the package default (64):
 //
 //	cfg := ironport.DefaultConfig()
 //	cfg.Users = users
 //	cfg.SftpSigner = signer
-//	cfg.CompletedUploadSize = 256
+//	cfg.CompletedUploadSize = 131_072
 //	cfg.AuthEventSize = 256
 //	srv := ironport.NewServer(cfg)
 func NewServer(config *Config) *Server {

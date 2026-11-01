@@ -40,7 +40,7 @@ const (
 	defaultFTPDataAcceptTimeout = 30 * time.Second
 	// defaultCompletedUploadsSize is the fallback buffer size used for the
 	// CompletedUploads channel.
-	defaultCompletedUploadsSize = 64
+	defaultCompletedUploadsSize = 65_536
 	// defaultAuthEventsSize is the fallback buffer size used for the
 	// AuthEvents channel.
 	defaultAuthEventsSize = 64
@@ -150,8 +150,12 @@ type Config struct {
 	FtpPassiveAdvertisedIP string
 	Users                  map[string]UserInfo
 	SftpSigner             ssh.Signer
-	CompletedUploadSize    int
-	AuthEventSize          int
+	// CompletedUploadSize sets the CompletedUploads channel capacity.
+	// Non-positive values select the default of 65,536.
+	CompletedUploadSize int
+	// AuthEventSize sets the AuthEvents channel capacity.
+	// Non-positive values select the default of 64.
+	AuthEventSize int
 	// SSHKeyExchanges, SSHCiphers, SSHMACs, and
 	// SSHPublicKeyAuthAlgorithms optionally pin SSH negotiation and public-key
 	// auth signature algorithms. Nil slices use golang.org/x/crypto/ssh
