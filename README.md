@@ -47,6 +47,21 @@ use the real directory path when migrating a symlinked configuration. Relative
 roots are resolved from a verified working-directory snapshot at authentication
 time, keeping the retained directory and its reporting path consistent.
 
+`srv.ValidateJailRoots()` checks kernel support and logs warnings for configured
+roots that cannot be opened securely. It returns an error only if the kernel
+capability probe fails; invalid or missing user roots are advisory so directories
+can be provisioned later. `ListenAndServe` and `HttpIngest()` call it automatically,
+including for HTTP-only deployments. `AddUser` also checks its root after
+publishing the user update and disconnecting revoked sessions. These checks may
+block on filesystem or logger I/O, but do not hold the user lock or retain root
+handles. They do not verify permissions for later file operations.
+
+Root-open failures after a successful credential check produce server-side
+explanations, sampled at most once per second per server with a suppressed count.
+Usernames, paths, and errors are escaped in diagnostics; authentication replies
+and events retain their generic failure reasons. These advisory checks do not
+replace authentication-time validation.
+
 Authentication opens and retains the root directory for the SSH/FTP session or
 HTTP request, including every SFTP channel on that SSH connection. Renaming or
 replacing the configured path does not redirect an authenticated session.
@@ -381,7 +396,10 @@ srv := ironport.NewServer(config)
 
 `WrapSession` and `UnwrapSession` must remain unset: custom ticket handling
 could bypass the control-session binding, so the server rejects such FTPS
-configs at startup.
+configs at startup when FTP is enabled. An enabled FTP listener also requires
+`FtpTLSConfig` when `FtpRequireTLS` is true; otherwise `ListenAndServe` fails
+before opening any listener. These FTP TLS checks are skipped when `FtpAddr`
+is empty or whitespace-only.
 
 A successful `AUTH TLS` clears the plaintext login, data endpoint, and
 `EPSV ALL`/`PBSZ`/`PROT` state. Clients must log in again and send `PBSZ 0`

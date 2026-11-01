@@ -85,7 +85,7 @@ func TestFTPTLSSessionBindingRejectsCustomSessionCallbacks(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srv := NewServer(&Config{FtpTLSConfig: tt.config()})
+			srv := NewServer(&Config{FtpAddr: "127.0.0.1:0", FtpTLSConfig: tt.config()})
 			if err := srv.prepareForListen(); err == nil {
 				t.Fatal("prepareForListen accepted a custom TLS session callback")
 			} else if !strings.Contains(err.Error(), "custom TLS session wrapping") {

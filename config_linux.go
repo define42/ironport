@@ -136,8 +136,8 @@ type Config struct {
 	// FtpRequireTLS, when true, refuses USER/PASS over the FTP control
 	// connection until AUTH TLS has succeeded and refuses data-transfer
 	// commands until the client has negotiated PBSZ followed by PROT P.
-	// Requires FtpTLSConfig to be set; otherwise the FTP listener would have
-	// no path to authentication and every login attempt would be rejected.
+	// When FTP is enabled, ListenAndServe requires FtpTLSConfig to be set and
+	// fails before opening listeners if it is nil. Ignored when FTP is disabled.
 	FtpRequireTLS bool
 	// FtpPassiveAdvertisedIP optionally overrides the IPv4 address sent to
 	// clients in the PASV (227) reply. By default the control connection's

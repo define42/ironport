@@ -115,8 +115,26 @@ const (
 // Middleware that replaces or limits the request body also needs WithHTTPControl
 // so the original body is consumed before successful uploads return capacity.
 // Without transport control, HTTP/1 cleanup depends on the caller's read timeout.
+//
+// Creating the handler checks kernel support and warns about unusable jail roots,
+// including in HTTP-only deployments. A failed capability check makes requests
+// return 503 until a later probe succeeds; root warnings remain advisory.
 func (s *Server) HttpIngest() http.HandlerFunc { //nolint:revive // exported name HttpIngest is the documented API (mirrors this package's Ftp/Sftp naming and the caller example)
-	return s.limitHTTPRequests(s.handleHTTPIngest)
+	handler := http.HandlerFunc(s.handleHTTPIngest)
+	if err := s.ValidateJailRoots(); err != nil {
+		// Quote error text to escape control characters.
+		log.Printf("HTTP ingest jail validation failed: %q", err.Error())
+		handler = func(w http.ResponseWriter, r *http.Request) {
+			// Transient resource pressure during handler creation must not
+			// permanently disable uploads. CheckSupport caches definitive results.
+			if jailfs.CheckSupport() != nil {
+				s.rejectHTTPUpload(w, r, http.StatusServiceUnavailable)
+				return
+			}
+			s.handleHTTPIngest(w, r)
+		}
+	}
+	return s.limitHTTPRequests(handler)
 }
 
 // limitHTTPRequests rejects excess work before inspecting credentials or bodies.

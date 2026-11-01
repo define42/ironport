@@ -55,8 +55,9 @@ func authorizedKeyValues(keys []ssh.PublicKey) []string {
 // linearization point. The caller closes those connections after the lock is
 // released. The comparison runs outside the lock; retrying after a concurrent
 // revision change preserves atomic update/commit semantics, including
-// remove-and-readd of an otherwise identical user.
-func (s *Server) replaceUser(username string, info UserInfo) []func() {
+// remove-and-readd of an otherwise identical user. The returned revision
+// identifies exactly the published configuration for later diagnostics.
+func (s *Server) replaceUser(username string, info UserInfo) (uint64, []func()) {
 	info = cloneUserInfo(info)
 	for {
 		s.mu.RLock()
@@ -78,11 +79,11 @@ func (s *Server) replaceUser(username string, info UserInfo) []func() {
 		s.users[username] = info
 		var toClose []func()
 		if !unchanged {
-			s.bumpUserRevisionLocked(username)
+			revision = s.bumpUserRevisionLocked(username)
 			toClose = s.cancelUserConnsLocked(username)
 		}
 		s.mu.Unlock()
-		return toClose
+		return revision, toClose
 	}
 }
 
@@ -138,10 +139,14 @@ func (s *Server) userRevisionMatches(username string, revision uint64) bool {
 // logins and closes the user's established SFTP/FTP sessions. Equivalent
 // replacements preserve sessions; authorized keys are compared as sets of
 // wire-format values, ignoring order, duplicates, and nil entries.
+// After publishing the update and closing revoked sessions, it checks the root
+// and logs a warning if it cannot be opened. Invalid roots do not prevent user
+// registration. This diagnostic may block on filesystem or logger I/O.
 // It is safe to call concurrently with active connections.
 func (s *Server) AddUser(username string, info UserInfo) {
-	toClose := s.replaceUser(username, info)
+	revision, toClose := s.replaceUser(username, info)
 	closeConns(toClose)
+	s.warnUnusableJailRoot(username, info.Root, revision)
 }
 
 // RemoveUser removes a user and closes their authenticated SFTP/FTP connections,

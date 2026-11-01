@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/define42/ironport/internal/authlimit"
-	"github.com/define42/ironport/internal/jailfs"
 	"github.com/define42/ironport/internal/netconn"
 	"golang.org/x/crypto/ssh"
 )
@@ -52,7 +51,7 @@ type Server struct {
 	// value disables FTPS — the AUTH command will be refused with 502.
 	ftpTLSConfig *tls.Config
 	// ftpTLSConfigErr records a fatal validation error in the supplied FTP TLS
-	// template. It is surfaced at startup by prepareForListen.
+	// template. It is surfaced by prepareForListen when FTP is enabled.
 	ftpTLSConfigErr error
 	// ftpRequireTLS, when true, refuses USER/PASS until the control connection
 	// has been wrapped with AUTH TLS and refuses data transfers until the client
@@ -96,6 +95,7 @@ type Server struct {
 	authOnce                  sync.Once
 	authLimiter               *authlimit.Limiter
 	authLogs                  authLogSampler
+	rootAuthLogs              authLogSampler
 	httpMaxConcurrentRequests int
 	httpMaxAuthorizationBytes int
 	httpMaxUsernameBytes      int
@@ -475,10 +475,18 @@ func (s *Server) ListenAndServe() error {
 
 // prepareForListen runs the startup checks that must succeed before any
 // listener is opened: the FTPS config is valid, a signer is available, and the
-// running kernel supports the openat2 containment primitive.
+// running kernel supports the openat2 containment primitive. Unusable user
+// roots are logged as advisory warnings.
 func (s *Server) prepareForListen() error {
-	if s.ftpTLSConfigErr != nil {
-		return fmt.Errorf("ironport: %w", s.ftpTLSConfigErr)
+	// Match openListeners: unused FTP settings must not prevent an SFTP-only
+	// deployment from starting, including when FtpAddr contains whitespace.
+	if strings.TrimSpace(s.ftpAddr) != "" {
+		if s.ftpTLSConfigErr != nil {
+			return fmt.Errorf("ironport: %w", s.ftpTLSConfigErr)
+		}
+		if s.ftpRequireTLS && s.ftpTLSConfig == nil {
+			return errors.New("ironport: FtpRequireTLS requires FtpTLSConfig")
+		}
 	}
 	if err := s.ensureSigner(); err != nil {
 		return fmt.Errorf("ironport: %w", err)
@@ -487,10 +495,7 @@ func (s *Server) prepareForListen() error {
 	// openat2(RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS), available since Linux
 	// 5.6. Fail fast at startup on older kernels rather than silently
 	// degrading the policy at first request.
-	if err := jailfs.CheckSupport(); err != nil {
-		return fmt.Errorf("ironport: %w", err)
-	}
-	return nil
+	return s.ValidateJailRoots()
 }
 
 func (s *Server) openListeners() (net.Listener, net.Listener, error) {

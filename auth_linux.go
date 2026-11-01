@@ -108,6 +108,7 @@ func (s *Server) authenticateUser(username string, keyCheck func(stored UserInfo
 	}
 	jfs, err := jailfs.Open(u.Root)
 	if err != nil {
+		s.logRootAuthFailure(username, u.Root, revision, err)
 		return UserInfo{}, nil, 0, false
 	}
 	if !s.userRevisionMatches(username, revision) {

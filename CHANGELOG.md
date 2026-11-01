@@ -8,6 +8,18 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
+- Enabled FTP now rejects `FtpRequireTLS` without `FtpTLSConfig` before opening
+  listeners. Unused FTP TLS configuration errors no longer prevent SFTP startup
+  when FTP is disabled, including whitespace-only `FtpAddr` values.
+
+- Added `Server.ValidateJailRoots()` and advisory root warnings at listener
+  startup, HTTP handler creation, and `AddUser`. Missing or invalid user roots
+  do not block startup or registration, allowing later provisioning. Root-open
+  authentication failures now have escaped, sampled server-side explanations;
+  client replies and authentication-event reasons stay generic. Temporary
+  capability-probe failures during HTTP handler creation are retried on requests.
+  Existing public API signatures are unchanged.
+
 - Jailed `MkdirAll` now verifies every path component is a directory, including
   the final component. Existing files and symlinks are rejected instead of
   treating their `EEXIST` result as success.
