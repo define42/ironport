@@ -112,7 +112,10 @@ func (s *Server) checkSSHKeyQuery(c ssh.ConnMetadata, key ssh.PublicKey, authEve
 	u, revision, exists := s.userSnapshot(c.User())
 	// Match even for unknown users to preserve the public-key timing pad.
 	if !matchAuthorizedKey(u.AuthorizedKeys, key) || !exists || !s.userRevisionMatches(c.User(), revision) {
-		s.authFailed(c.User(), clientIP, CompletedUploadProtocolSFTP, authEvents, false)
+		// Clients commonly offer several keys before finding an authorized one.
+		// Eligibility is checked before signature verification, even for signed
+		// requests, so a rejection must not advance credential-failure backoff.
+		s.reportAuthFailure(c.User(), clientIP, CompletedUploadProtocolSFTP, authEvents, false)
 		return errInvalidCredentials
 	}
 	return nil

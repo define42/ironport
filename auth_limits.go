@@ -34,6 +34,7 @@ type AuthLimitConfig struct {
 	EntryTTL   time.Duration
 	// Backoff starts after three failed verifications and doubles after each
 	// further failure. Defaults are 250 ms initial and 30 seconds maximum.
+	// SSH key eligibility rejections consume tokens but do not advance backoff.
 	// When BackoffInitial is unset, it is capped by BackoffMax. Explicit positive
 	// values with BackoffInitial greater than BackoffMax fail Config.Validate.
 	// An unset maximum is raised to an explicit initial value above 30 seconds.
@@ -72,12 +73,18 @@ func (s *Server) authSucceeded(username, clientIP string) {
 }
 
 func (s *Server) authFailed(username, clientIP, protocol string, events chan<- AuthEvent, throttled bool) {
-	l := s.authControl()
+	if !throttled {
+		s.authControl().Result(username, clientIP, false, time.Now())
+	}
+	s.reportAuthFailure(username, clientIP, protocol, events, throttled)
+}
+
+// reportAuthFailure preserves rejection diagnostics without advancing backoff.
+// SSH key eligibility checks use it before the client proves key ownership.
+func (s *Server) reportAuthFailure(username, clientIP, protocol string, events chan<- AuthEvent, throttled bool) {
 	reason := AuthFailureCredentials
 	if throttled {
 		reason = AuthFailureThrottled
-	} else {
-		l.Result(username, clientIP, false, time.Now())
 	}
 	sample, suppressed := s.authLogs.allow(time.Now())
 	if sample {

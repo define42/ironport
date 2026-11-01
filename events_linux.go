@@ -36,6 +36,7 @@ type AuthFailureReason string
 
 const (
 	// AuthFailureCredentials identifies a login rejected during credential validation.
+	// It includes SSH key eligibility rejections, which do not advance backoff.
 	AuthFailureCredentials AuthFailureReason = "Credentials"
 	// AuthFailureThrottled identifies a login rejected by authentication limits.
 	AuthFailureThrottled AuthFailureReason = "Throttled"

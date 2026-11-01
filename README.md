@@ -272,9 +272,12 @@ window. `FTPMaxAuthFailures` is not reset by `USER`, `REIN`, or a successful log
 `AuthLimits` configures token buckets shared by SSH, FTP, and HTTP. Defaults
 allow bursts of 200 attempts server-wide, 30 per source IP, and 20 per username,
 refilling one token every 10 ms, one second, and one second respectively.
-Successful credential checks consume tokens too. SSH public-key authentication
-consumes one admission token per bucket for the key query and signature proof
-together, then rechecks current credentials and cooldown at verified completion.
+Successful credential checks consume tokens too. Each admitted SSH key eligibility
+check consumes one token per bucket; an accepted check and its first signature
+proof share that admission. Verified completion rechecks current credentials and
+cooldown. Rejected key eligibility checks do not advance credential-failure
+backoff, allowing clients to offer several keys before the authorized one. They
+still emit `LoginFailed` events with reason `AuthFailureCredentials`.
 Unsigned key queries check key eligibility without opening the jail or emitting
 root diagnostics. The jail is opened and retained only after signature
 verification, using the user's current root, keys, and permissions.

@@ -8,6 +8,12 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
+- SSH key eligibility rejections no longer advance username or shared-IP
+  credential-failure backoff, allowing clients to offer multiple keys before the
+  authorized one. Key offers still consume admission tokens, and existing
+  rejected-key authentication events remain unchanged. Password and verified-key
+  completion failures continue to advance backoff. Public APIs are unchanged.
+
 - Escape usernames and jail roots in SFTP/FTP login logs, usernames in FTP
   active-data dial logs, and HTTP upload-error text to prevent log injection.
 
