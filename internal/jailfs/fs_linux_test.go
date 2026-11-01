@@ -336,6 +336,85 @@ func TestJailFS_MkdirAll(t *testing.T) {
 	}
 }
 
+func TestJailFS_MkdirAllRejectsFinalNonDirectory(t *testing.T) {
+	jfs, outside := symlinkRejectFixture(t)
+	links := map[string]string{"real/file_link": "file.txt", "outside": outside}
+	for name, target := range links {
+		if err := os.Symlink(target, jfs.FullPath(name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	links["real_link"] = "real"
+	links["escape"] = filepath.Join(outside, "missing.txt")
+	for _, tc := range []struct {
+		name, path string
+		want       error
+	}{
+		{"nested_file", "real/file.txt", syscall.ENOTDIR},
+		{"file_trailing_slash", "/real/file.txt/", syscall.ENOTDIR},
+		{"directory_link", "real_link", syscall.ELOOP},
+		{"link_trailing_slash", "/real_link/", syscall.ELOOP},
+		{"nested_file_link", "real/file_link", syscall.ELOOP},
+		{"outside_link", "outside", syscall.ELOOP},
+		{"dangling_link", "escape", syscall.ELOOP},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assertMkdirAllRejected(t, jfs, tc.path, tc.want)
+		})
+	}
+	assertRegularPathContents(t, jfs, "real/file.txt", "hi")
+	for name, want := range links {
+		if got, err := os.Readlink(jfs.FullPath(name)); err != nil || got != want {
+			t.Errorf("link %q = %q, %v; want unchanged target %q", name, got, err, want)
+		}
+	}
+	if entries, err := os.ReadDir(outside); err != nil || len(entries) != 0 {
+		t.Fatalf("outside directory changed: entries=%v err=%v", entries, err)
+	}
+}
+
+func assertMkdirAllRejected(t *testing.T, jfs *FS, name string, want error) {
+	t.Helper()
+	err := jfs.MkdirAll(name, 0o700)
+	if !errors.Is(err, want) {
+		t.Fatalf("MkdirAll(%q) = %v; want %v", name, err, want)
+	}
+	var pathErr *os.PathError
+	if !errors.As(err, &pathErr) || pathErr.Op != "mkdir" || pathErr.Path != name {
+		t.Fatalf("MkdirAll error = %v; want mkdir PathError preserving %q", err, name)
+	}
+}
+
+func TestJailFS_MkdirAllAcceptsUnreadableLeaf(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		existing bool
+	}{
+		{"create", false},
+		{"existing", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			jfs, root := newDirectoryTestFS(t)
+			leaf := filepath.Join(root, "closed")
+			// Restore access before TempDir cleanup, without requiring an I/O
+			// open of the mode-000 directory through the jailed Chmod method.
+			t.Cleanup(func() { _ = os.Chmod(leaf, 0o700) }) //nolint:gosec // G302: restore owner access to this test directory for cleanup
+			if tc.existing {
+				if err := os.Mkdir(leaf, 0); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := jfs.MkdirAll("closed", 0); err != nil {
+				t.Fatalf("MkdirAll of mode-000 leaf: %v", err)
+			}
+			info, err := jfs.Stat("closed")
+			if err != nil || !info.IsDir() || info.Mode().Perm() != 0 {
+				t.Fatalf("leaf = %v, %v; want directory with mode 000", info, err)
+			}
+		})
+	}
+}
+
 func TestStatFileInfoMode(t *testing.T) {
 	tests := []struct {
 		name string

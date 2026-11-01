@@ -322,12 +322,19 @@ func (j *FS) MkdirAll(clientPath string, perm os.FileMode) error {
 		} else {
 			prefix += "/" + segment
 		}
-		// A pre-existing directory yields EEXIST, which is not an error for
-		// MkdirAll; any other failure (ENOTDIR on a file component, ELOOP on a
-		// symlink, EACCES) is fatal and returned to the caller.
+		// EEXIST may describe a directory, regular file, or symlink. Other
+		// creation errors are returned without attempting to validate the path.
 		if err := j.Mkdir(prefix, perm); err != nil && !errors.Is(err, syscall.EEXIST) {
 			return err
 		}
+		// Validate every created or existing component, including the final
+		// one, with the jail's no-symlink policy. O_PATH avoids requiring read
+		// permission on the directory just to check its type.
+		fd, err := j.openat(prefix, unix.O_PATH|unix.O_DIRECTORY, 0)
+		if err != nil {
+			return &os.PathError{Op: "mkdir", Path: clientPath, Err: err}
+		}
+		_ = unix.Close(fd)
 	}
 	return nil
 }
