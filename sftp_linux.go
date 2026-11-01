@@ -99,6 +99,8 @@ func deferRecoverSFTPPanicf(errp *error, onPanic func(), format string, args ...
 	}
 }
 
+type sshRevisionKey struct{}
+
 // authenticateSSH checks admission and credentials for a query, password,
 // or verified key. A query's first proof reuses its already-consumed token.
 func (s *Server) authenticateSSH(c ssh.ConnMetadata, keyCheck func(UserInfo) bool, useQueryAdmission bool, authEvents chan<- AuthEvent) (*ssh.Permissions, error) {
@@ -113,12 +115,14 @@ func (s *Server) authenticateSSH(c ssh.ConnMetadata, keyCheck func(UserInfo) boo
 		s.authFailed(c.User(), clientIP, CompletedUploadProtocolSFTP, authEvents, true)
 		return nil, errInvalidCredentials
 	}
-	u, jailRoot, ok := s.authenticateUser(c.User(), keyCheck)
+	u, jailRoot, revision, ok := s.authenticateUser(c.User(), keyCheck)
 	if !ok {
 		s.authFailed(c.User(), clientIP, CompletedUploadProtocolSFTP, authEvents, false)
 		return nil, errInvalidCredentials
 	}
-	return permissionsFor(u, c.User(), jailRoot), nil
+	permissions := permissionsFor(u, c.User(), jailRoot)
+	permissions.ExtraData = map[any]any{sshRevisionKey{}: revision}
+	return permissions, nil
 }
 
 // sshServerConfig builds the SSH server configuration with both password-based
@@ -159,7 +163,7 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 				return matchAuthorizedKey(u.AuthorizedKeys, key)
 			}, false, authEvents)
 			if err == nil {
-				permissions.ExtraData = map[any]any{keyAdmission{}: true}
+				permissions.ExtraData[keyAdmission{}] = true
 			}
 			return permissions, err
 		},
@@ -212,16 +216,30 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- C
 		}
 		return
 	}
-	defer func() { _ = sshConn.Close() }()
+	globalRequestsDone := make(chan struct{})
+	go func() {
+		defer close(globalRequestsDone)
+		ssh.DiscardRequests(reqs)
+	}()
+	defer func() {
+		_ = sshConn.Close()
+		<-globalRequestsDone
+	}()
+	if !s.commitSSHConnection(nc, sshConn, authEvents) {
+		// Closing the transport alone cannot release a mux blocked on its
+		// incoming-channel queue. Drain queued opens after revocation too.
+		_ = sshConn.Close()
+		for newCh := range chans {
+			_ = newCh.Reject(ssh.Prohibited, "authentication no longer valid")
+		}
+		return
+	}
 
 	jailRoot := sshConn.Permissions.Extensions["jailRoot"]
 	user := sshConn.Permissions.Extensions["user"]
 	canRead := sshConn.Permissions.Extensions["canRead"] == "true"
 	canWrite := sshConn.Permissions.Extensions["canWrite"] == "true"
 	clientIP := netconn.RemoteIP(sshConn.RemoteAddr())
-	// Record the authenticated user on this connection so RemoveUser can
-	// force-close it if the account is later revoked.
-	s.setConnUser(nc, user)
 	log.Printf("login protocol=sftp user=%s root=%s from=%s", user, jailRoot, sshConn.RemoteAddr())
 	authEvent := AuthEvent{
 		Type:     AuthEventLoginSuccess,
@@ -233,9 +251,23 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- C
 	authEvent.Type = AuthEventLogout
 	defer announceAuthEvent(authEvents, authEvent)
 
-	// Discard global requests
-	go ssh.DiscardRequests(reqs)
+	s.serveSSHChannels(chans, jailRoot, user, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown)
+}
 
+// commitSSHConnection binds only the exact authentication snapshot that
+// completed this handshake. Revocation before commit produces no session.
+func (s *Server) commitSSHConnection(nc net.Conn, conn *ssh.ServerConn, events chan<- AuthEvent) bool {
+	if conn.Permissions != nil {
+		revision, _ := conn.Permissions.ExtraData[sshRevisionKey{}].(uint64)
+		if s.commitConnUser(nc, conn.User(), revision) {
+			return true
+		}
+	}
+	s.authFailed(conn.User(), netconn.RemoteIP(conn.RemoteAddr()), CompletedUploadProtocolSFTP, events, false)
+	return false
+}
+
+func (s *Server) serveSSHChannels(chans <-chan ssh.NewChannel, jailRoot, user, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool) {
 	// Track the per-channel session goroutines so this function does not
 	// return until they have all finished. handleConn returning is what
 	// triggers untrackConn/connWG.Done in acceptLoop, which Shutdown waits

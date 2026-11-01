@@ -60,7 +60,11 @@ type Server struct {
 	ftpRequireTLS bool
 	// users maps usernames to their credentials and jail roots.
 	users map[string]UserInfo
-	// mu protects users, completedUploads, authEvents, and listeners for concurrent reads and writes.
+	// Revisions distinguish each authentication configuration, including a
+	// removed user subsequently recreated with the same credentials.
+	userRevisions    map[string]uint64
+	nextUserRevision uint64
+	// mu protects users, revisions, connection state, event streams, and listeners.
 	mu sync.RWMutex
 	// ln is the active SFTP listener; set by ListenAndServe and closed by Close.
 	ln net.Listener
@@ -142,13 +146,10 @@ type Server struct {
 	// shuttingDown reads/writes; this keeps the Add/Wait pair race-free
 	// per the sync.WaitGroup contract.
 	connWG sync.WaitGroup
-	// activeConns holds every accepted connection that has not yet returned
-	// from its handler, mapped to the username currently authenticated on
-	// that connection (empty string before authentication, or after FTP REIN).
-	// It is consulted by Shutdown to force-close stragglers when the caller's
-	// context deadline fires, and by RemoveUser to evict active sessions of
-	// a user being deleted.
-	activeConns map[net.Conn]string
+	// activeConns holds every accepted connection until its handler returns.
+	// Authentication is separate from username because an empty username is
+	// valid and must not be confused with an unauthenticated connection.
+	activeConns map[net.Conn]activeConnState
 	// connCancels retains cancellation state until the owning handler exits.
 	// It lets FTP interrupt data setup as well as the control connection.
 	// Both maps are protected by mu.
@@ -161,6 +162,11 @@ type Server struct {
 	// drain. It is guarded by mu so it serialises with connWG.Add inside
 	// trackConn.
 	shuttingDown bool
+}
+
+type activeConnState struct {
+	username      string
+	authenticated bool
 }
 
 type connCancelState struct {
@@ -225,7 +231,10 @@ func NewServer(config *Config) *Server {
 		idleTimeout:               config.IdleTimeout,
 		tcpKeepAlivePeriod:        config.TCPKeepAlivePeriod,
 		sftpAllowChown:            config.SftpAllowChown,
-		activeConns:               make(map[net.Conn]string),
+		activeConns:               make(map[net.Conn]activeConnState),
+	}
+	for username := range s.users {
+		s.bumpUserRevisionLocked(username)
 	}
 	if config.FtpTLSConfig != nil {
 		s.ftpTLSConfig = config.FtpTLSConfig.Clone()
@@ -310,9 +319,9 @@ func (s *Server) trackConn(nc net.Conn) bool {
 		return false
 	}
 	if s.activeConns == nil {
-		s.activeConns = make(map[net.Conn]string)
+		s.activeConns = make(map[net.Conn]activeConnState)
 	}
-	s.activeConns[nc] = ""
+	s.activeConns[nc] = activeConnState{}
 	s.connWG.Add(1)
 	return true
 }
@@ -354,15 +363,50 @@ func (s *Server) cancelConnLocked(nc net.Conn) func() {
 	}
 }
 
-// setConnUser records username as the authenticated identity on nc. It is a
-// no-op when nc is not currently tracked (e.g., in tests that bypass the
-// accept loop). Pass an empty username to clear the association (used after
-// FTP REIN so the now-anonymous session is no longer tied to the prior user).
-func (s *Server) setConnUser(nc net.Conn, username string) {
+// clearConnUser marks a tracked connection as unauthenticated. It preserves
+// cancellation state, so a concurrent revocation cannot be undone by FTP reset.
+func (s *Server) clearConnUser(nc net.Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.activeConns[nc]; ok {
-		s.activeConns[nc] = username
+	if _, tracked := s.activeConns[nc]; tracked {
+		s.activeConns[nc] = activeConnState{}
+	}
+}
+
+// commitConnUser verifies the snapshot and registers its authenticated
+// connection under the same lock as user mutations. A concurrent revocation
+// either invalidates this revision first or sees the connection and closes it.
+func (s *Server) commitConnUser(nc net.Conn, username string, revision uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if revision == 0 || s.userRevisions[username] != revision {
+		return false
+	}
+	if _, exists := s.users[username]; !exists {
+		return false
+	}
+	if _, tracked := s.activeConns[nc]; !tracked || s.connCancels[nc].canceled {
+		return false
+	}
+	s.activeConns[nc] = activeConnState{username: username, authenticated: true}
+	return true
+}
+
+// cancelUserConnsLocked marks every authenticated connection belonging to a
+// user before returning its cleanup callbacks. Callers run I/O outside mu.
+func (s *Server) cancelUserConnsLocked(username string) []func() {
+	var toClose []func()
+	for nc, state := range s.activeConns {
+		if state.authenticated && state.username == username {
+			toClose = append(toClose, s.cancelConnLocked(nc))
+		}
+	}
+	return toClose
+}
+
+func closeConns(closers []func()) {
+	for _, closeConn := range closers {
+		closeConn()
 	}
 }
 

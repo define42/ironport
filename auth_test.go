@@ -9,7 +9,6 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -114,8 +113,6 @@ func TestNewSignerFromFile(t *testing.T) {
 
 // TestSFTPServer_WithFileHostKey verifies that the server works end-to-end when
 // started with a host key loaded from a file via NewSignerFromFile.
-//
-//nolint:funlen // end-to-end host-key file load + handshake assertion is one logical scenario
 func TestSFTPServer_WithFileHostKey(t *testing.T) {
 	dir := t.TempDir()
 	root := t.TempDir()
@@ -141,25 +138,9 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-
-	srv := newTestServer(addr, "", "", users, signer, defaultCompletedUploadsSize)
-	cfg := srv.sshServerConfig()
-
-	go func() {
-		for {
-			nc, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go srv.handleConn(nc, cfg, srv.completedUploadsChan(), srv.authEventsChan(), srv.configuredTempExtensions(), srv.effectiveIdleTimeout(), srv.sftpChownAllowed())
-		}
-	}()
-	t.Cleanup(func() { _ = ln.Close() })
+	config := newTestConfig("", "", "", users, signer, defaultCompletedUploadsSize)
+	_, addr, stop := startTestServerWithConfig(t, config)
+	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
 	content := []byte("key from file")
@@ -466,14 +447,19 @@ func TestFTPSessionAuthenticate_ValidatesJailRoot(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			fs := &ftpSession{
-				server: &Server{
-					users: map[string]UserInfo{
-						"alice": {Password: "alicepw", Root: tc.root, CanRead: true, CanWrite: true},
-					},
-				},
-				username: "alice",
+			srv := NewServer(&Config{Users: map[string]UserInfo{
+				"alice": {Password: "alicepw", Root: tc.root, CanRead: true, CanWrite: true},
+			}})
+			conn := &stubConn{}
+			if !srv.trackConn(conn) {
+				t.Fatal("control connection was not admitted")
 			}
+			t.Cleanup(func() {
+				srv.untrackConn(conn)
+				srv.connWG.Done()
+			})
+			fs := &ftpSession{server: srv, rawConn: conn, username: "alice"}
+			t.Cleanup(fs.closeJail)
 
 			got := fs.authenticate("alicepw")
 			if got != tc.want {

@@ -493,6 +493,10 @@ srv.AddUserKey("alice", newKey)
 srv.RemoveUserKey("alice", oldKey)
 ```
 
+`AddUserKey` preserves established sessions. Removing an existing key with
+`RemoveUserKey` closes that user's SFTP/FTP sessions, including FTP data
+operations. Removing a missing key leaves sessions connected.
+
 ## Dynamic user management
 
 ```go
@@ -504,12 +508,25 @@ srv.AddUser("carol", ironport.UserInfo{
     CanWrite: true,
 })
 
-// Remove a user (active sessions for that user are not terminated).
+// Remove a user and terminate their active SFTP/FTP sessions.
 srv.RemoveUser("carol")
 
 // Remove all users without deleting any on-disk user data.
 srv.RemoveAllUsers()
 ```
+
+User changes are checked against pending logins: removing a user, replacing
+credentials, or changing the root or permissions prevents an old authentication
+snapshot from starting a new session, even if the same user is removed and
+added again. An effective `AddUser` replacement also closes the user's existing
+SFTP/FTP sessions. Equivalent replacements preserve them; authorized-key order,
+duplicates, and nil entries do not count as credential changes.
+
+Use `AddUserKey` to add a key without disconnecting established sessions. The
+addition still invalidates pending authentication snapshots so login commits
+use the current configuration. HTTP authentication is per request: updates
+reject stale authentication, while uploads already authorized continue. HTTP
+request cancellation and server shutdown remain owned by the caller.
 
 ## Graceful shutdown
 

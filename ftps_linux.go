@@ -256,7 +256,7 @@ func (f *ftpSession) resetSessionStateForAuthTLS() {
 	f.rnfrPath = ""
 	f.restartOffset = 0
 	f.expectedUploadSize = 0
-	f.server.setConnUser(f.rawConn, "")
+	f.server.clearConnUser(f.rawConn)
 }
 
 func (f *ftpSession) performTLSHandshake() bool {

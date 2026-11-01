@@ -589,7 +589,7 @@ func TestServer_RemoveUser_DisconnectsActiveFTPS(t *testing.T) {
 	srv.mu.RLock()
 	associated := false
 	for _, u := range srv.activeConns {
-		if u == "victim" {
+		if u.authenticated && u.username == "victim" {
 			associated = true
 			break
 		}

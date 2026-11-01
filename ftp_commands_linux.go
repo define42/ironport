@@ -115,7 +115,7 @@ func (f *ftpSession) cmdUser(arg string) {
 	// user association so a RemoveUser for that name no longer evicts a
 	// session that is mid-login as someone else. A successful PASS will
 	// re-establish the association for the new user.
-	f.server.setConnUser(f.rawConn, "")
+	f.server.clearConnUser(f.rawConn)
 	f.username = arg
 	f.authenticated = false
 	f.user = UserInfo{}
@@ -465,7 +465,7 @@ func (f *ftpSession) cmdRein() {
 	// The session is no longer tied to the previous user; clear the
 	// connection's user association so a RemoveUser for that name does not
 	// kick this now-anonymous session.
-	f.server.setConnUser(f.rawConn, "")
+	f.server.clearConnUser(f.rawConn)
 	_ = f.reply(220, "ready for new user")
 }
 

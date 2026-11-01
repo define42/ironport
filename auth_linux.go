@@ -84,11 +84,13 @@ func checkPassword(storedPw, suppliedPw string) bool {
 	return match && len(storedPw) > 0 && len(suppliedPw) > 0
 }
 
-// authenticateUser performs the credential check shared by SFTP and FTP
-// logins. It returns a cloned UserInfo snapshot and the canonical jail-root
-// path on success. ok is false when either the credentials do not match or
-// the jail-root cannot be canonicalised; callers should not distinguish those
-// cases when replying to clients, to avoid leaking which step failed.
+// authenticateUser performs the credential check shared by SFTP, FTP, and
+// HTTP. It returns a cloned user, canonical jail-root path, and revision.
+// The final revision check linearizes HTTP authentication with user updates;
+// connection protocols must also commit that revision before starting a session.
+// ok is false when credentials, root validation, or the revision check fail;
+// callers should not distinguish those cases when replying to clients, to avoid
+// leaking which step failed.
 //
 // keyCheck supplies the matching logic so the SSH PasswordCallback can pass a
 // password comparator and the PublicKeyCallback can pass a constant-time-padded
@@ -96,16 +98,19 @@ func checkPassword(storedPw, suppliedPw string) bool {
 // unknown, so it MUST be constant-time (independent of stored password length
 // and AuthorizedKeys count) to avoid leaking username existence; checkPassword
 // and the public-key timing pad already satisfy this.
-func (s *Server) authenticateUser(username string, keyCheck func(stored UserInfo) bool) (UserInfo, string, bool) {
-	u, ok := s.userSnapshot(username)
+func (s *Server) authenticateUser(username string, keyCheck func(stored UserInfo) bool) (UserInfo, string, uint64, bool) {
+	u, revision, ok := s.userSnapshot(username)
 	if !keyCheck(u) || !ok {
-		return UserInfo{}, "", false
+		return UserInfo{}, "", 0, false
 	}
 	jailRoot, err := jailfs.CanonicalRoot(u.Root)
 	if err != nil {
-		return UserInfo{}, "", false
+		return UserInfo{}, "", 0, false
 	}
-	return u, jailRoot, true
+	if !s.userRevisionMatches(username, revision) {
+		return UserInfo{}, "", 0, false
+	}
+	return u, jailRoot, revision, true
 }
 
 // matchAuthorizedKey reports whether the presented SSH public key matches any

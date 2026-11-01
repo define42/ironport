@@ -8,6 +8,15 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
+- User changes now invalidate pending authentication snapshots. SSH and FTP
+  atomically check the user revision when registering an authenticated
+  connection, closing the race with removal, replacement, and remove/re-add.
+  Effective `AddUser` replacements and `RemoveUserKey` removals also close
+  existing SFTP/FTP sessions and FTP data operations. Equivalent replacements,
+  missing-key removals, and additive `AddUserKey` calls preserve established
+  sessions. Already-authorized HTTP uploads continue. Public API signatures
+  are unchanged.
+
 - Added configurable resource limits for combined SFTP/FTP control connections
   (128 total, 32 per IP), SSH channels (16 per connection), SFTP file/directory
   handles (256 total, 64 per user, 32 per connection), passive FTP reservations

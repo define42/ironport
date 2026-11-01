@@ -214,7 +214,7 @@ func (s *Server) httpAuthenticate(w http.ResponseWriter, r *http.Request) (usern
 		s.rejectHTTPUpload(w, r, http.StatusTooManyRequests)
 		return "", UserInfo{}, "", false
 	}
-	u, root, authOK := s.authenticateUser(reqUser, func(stored UserInfo) bool {
+	u, root, _, authOK := s.authenticateUser(reqUser, func(stored UserInfo) bool {
 		return checkPassword(stored.Password, reqPass)
 	})
 	if !authOK {

@@ -108,7 +108,11 @@ func testConnectionCancellation(t *testing.T, cancelFirst, removeAll bool) {
 	}
 	defer s.connWG.Done()
 	defer s.untrackConn(c)
-	s.setConnUser(c, "alice")
+	s.AddUser("alice", UserInfo{})
+	_, revision, _ := s.userSnapshot("alice")
+	if !s.commitConnUser(c, "alice", revision) {
+		t.Fatal("authentication commit rejected")
+	}
 	canceled := false
 	cancel := func() { canceled = true }
 	if !cancelFirst && !s.setConnCancel(c, cancel) {
@@ -120,7 +124,7 @@ func testConnectionCancellation(t *testing.T, cancelFirst, removeAll bool) {
 		s.RemoveUser("alice")
 	}
 	// FTP authentication reset must not erase connection cancellation state.
-	s.setConnUser(c, "")
+	s.clearConnUser(c)
 	if cancelFirst && s.setConnCancel(c, cancel) {
 		t.Fatal("revoked connection accepted cleanup registration")
 	}

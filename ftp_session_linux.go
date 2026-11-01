@@ -87,7 +87,7 @@ type ftpSession struct {
 	// rawConn is the connection exactly as it was accepted and recorded
 	// in Server.activeConns. AUTH TLS replaces conn with the *tls.Conn
 	// wrapper, but activeConns stays keyed by the accepted conn, so user
-	// association updates (setConnUser) must always go through rawConn;
+	// association updates (commitConnUser/clearConnUser) use rawConn;
 	// keying on conn after the upgrade misses the map and the session
 	// escapes RemoveUser / RemoveAllUsers eviction.
 	rawConn        net.Conn
@@ -414,7 +414,7 @@ func parseFTPCommand(line string) (string, string) {
 }
 
 func (f *ftpSession) authenticate(pass string) bool {
-	u, jailRoot, ok := f.server.authenticateUser(f.username, func(stored UserInfo) bool {
+	u, jailRoot, revision, ok := f.server.authenticateUser(f.username, func(stored UserInfo) bool {
 		return checkPassword(stored.Password, pass)
 	})
 	if !ok {
@@ -429,12 +429,26 @@ func (f *ftpSession) authenticate(pass string) bool {
 		log.Printf("ftp open jail root %q for user %q: %v", jailRoot, f.username, err)
 		return false
 	}
+	u.Root = jailRoot
+	return f.commitAuthentication(u, revision, jfs)
+}
+
+// commitAuthentication takes ownership of jfs, closing it unless the accepted
+// control connection can still authenticate against this exact user revision.
+func (f *ftpSession) commitAuthentication(u UserInfo, revision uint64, jfs *jailfs.FS) bool {
+	// Key on rawConn: after AUTH TLS, conn is a wrapper around the connection
+	// registered by the accept loop. Revocation and this commit share the
+	// server lock, so an old credential snapshot cannot install a new session.
+	if !f.server.commitConnUser(f.rawConn, f.username, revision) {
+		_ = jfs.Close()
+		return false
+	}
 	// Release any previous jail from a stale session that re-used USER/PASS.
 	f.closeJail()
 	f.fs = jfs
 	f.user = UserInfo{
 		Password:       u.Password,
-		Root:           jailRoot,
+		Root:           u.Root,
 		CanRead:        u.CanRead,
 		CanWrite:       u.CanWrite,
 		AuthorizedKeys: slices.Clone(u.AuthorizedKeys),
@@ -443,11 +457,6 @@ func (f *ftpSession) authenticate(pass string) bool {
 	f.cwd = "/"
 	f.rnfrPath = ""
 	f.restartOffset = 0
-	// Tie the connection to the authenticated user so RemoveUser can
-	// force-close active FTP sessions if the account is revoked. Key on
-	// rawConn: after AUTH TLS, f.conn is the *tls.Conn wrapper, which is
-	// not the conn the accept loop registered in activeConns.
-	f.server.setConnUser(f.rawConn, f.username)
 	return true
 }
 

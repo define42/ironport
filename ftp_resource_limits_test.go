@@ -23,7 +23,15 @@ func TestFTPAuthenticationFailureLimitSurvivesReset(t *testing.T) {
 				"alice": {Password: "pw", Root: t.TempDir()},
 			}})
 			var response bytes.Buffer
-			f := &ftpSession{server: s, clientIP: "192.0.2.1", w: bufio.NewWriter(&response), conn: &stubConn{}}
+			conn := &stubConn{}
+			if !s.trackConn(conn) {
+				t.Fatal("control connection was not admitted")
+			}
+			t.Cleanup(func() {
+				s.untrackConn(conn)
+				s.connWG.Done()
+			})
+			f := &ftpSession{server: s, clientIP: "192.0.2.1", w: bufio.NewWriter(&response), conn: conn, rawConn: conn}
 			f.handleFTPCommand("USER", "alice")
 			if f.handleFTPCommand("PASS", "bad") {
 				t.Fatal("first failed attempt closed session")
