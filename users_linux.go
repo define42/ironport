@@ -4,7 +4,6 @@ package ironport
 
 import (
 	"crypto/subtle"
-	"net"
 	"slices"
 
 	"golang.org/x/crypto/ssh"
@@ -63,15 +62,15 @@ func (s *Server) AddUser(username string, info UserInfo) {
 func (s *Server) RemoveUser(username string) {
 	s.mu.Lock()
 	delete(s.users, username)
-	var toClose []net.Conn
+	var toClose []func()
 	for nc, u := range s.activeConns {
 		if u == username {
-			toClose = append(toClose, nc)
+			toClose = append(toClose, s.cancelConnLocked(nc))
 		}
 	}
 	s.mu.Unlock()
-	for _, c := range toClose {
-		_ = c.Close()
+	for _, closeConn := range toClose {
+		closeConn()
 	}
 }
 
@@ -84,15 +83,15 @@ func (s *Server) RemoveUser(username string) {
 func (s *Server) RemoveAllUsers() {
 	s.mu.Lock()
 	s.users = make(map[string]UserInfo)
-	var toClose []net.Conn
+	var toClose []func()
 	for nc, u := range s.activeConns {
 		if u != "" {
-			toClose = append(toClose, nc)
+			toClose = append(toClose, s.cancelConnLocked(nc))
 		}
 	}
 	s.mu.Unlock()
-	for _, c := range toClose {
-		_ = c.Close()
+	for _, closeConn := range toClose {
+		closeConn()
 	}
 }
 

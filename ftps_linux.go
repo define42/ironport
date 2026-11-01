@@ -248,6 +248,7 @@ func (f *ftpSession) resetSessionStateForAuthTLS() {
 	// is released (both were previously skipped), and clear the
 	// connection's user association so a RemoveUser for the pre-TLS user
 	// cannot evict the now-anonymous session.
+	f.closeDataEndpoint()
 	f.logoutIfAuthenticated()
 	f.username = ""
 	f.authenticated = false

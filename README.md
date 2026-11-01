@@ -20,6 +20,7 @@ A production-ready, embeddable SFTP server and FTP server library for Go with a 
 - **Temp-file aware completion** — optionally set `TempExtensions` on the config (for example, `.tmp`, `.writing`) to suppress completion notifications for temporary upload names and emit the notification when the file is renamed to a non-temp name. Dotfiles (names beginning with `.`) are always treated as temporary in the same way
 - **Graceful shutdown** — `Close()` stops the listener immediately and lets in-flight sessions finish on their own. `Shutdown(ctx)` stops the listener AND waits for in-flight sessions to finish, force-closing any that remain when `ctx` expires
 - **Thread-safe runtime APIs** — user-management helpers and listener lifecycle methods are safe to call while the server is running
+- **Resource limits** — finite caps on connections, SSH channels, SFTP handles, passive FTP listeners, and concurrent HTTP requests, with absolute login deadlines and shared authentication throttling
 - **Handshake timeout** — connections that do not complete the SSH handshake within 30 seconds are dropped
 - **SSH algorithm pinning** — optionally constrain SSH key exchange, ciphers, MACs, and public-key auth signature algorithms
 - **Idle-session timeout** — configurable via `IdleTimeout` on the config (default 15 minutes); inactive authenticated SFTP sessions are reaped
@@ -181,6 +182,104 @@ srv := ironport.NewServer(config)
 For RSA host-key signature pinning, pass a signer already restricted with
 `ssh.NewSignerWithAlgorithms`.
 
+## Resource and authentication limits
+
+Limits belong to one `Server` and are shared by its protocol handlers. Configure
+`Config.ResourceLimits` (`ResourceLimitConfig`) and `Config.AuthLimits`
+(`AuthLimitConfig`) before calling `NewServer`; zero or negative fields select
+finite defaults, including when constructing `Config` directly. For example:
+
+```go
+config := ironport.DefaultConfig()
+config.ResourceLimits.MaxConnections = 256
+config.ResourceLimits.SFTPMaxHandlesPerConnection = 16
+config.ResourceLimits.HTTPMaxConcurrentRequests = 8
+config.AuthLimits.MaxEntries = 4096
+if err := config.Validate(); err != nil {
+    return err
+}
+srv := ironport.NewServer(config)
+```
+
+The following fields belong to `Config.ResourceLimits`:
+
+| Configuration | Default | Scope |
+| --- | --- | --- |
+| `MaxConnections` / `MaxConnectionsPerIP` | 128 / 32 | SFTP and FTP control connections combined, including unauthenticated clients |
+| `SSHMaxChannels` | 16 | Simultaneous session channels per SSH connection |
+| `SFTPMaxHandles` / `SFTPMaxHandlesPerUser` / `SFTPMaxHandlesPerConnection` | 256 / 64 / 32 | Open files and directories; the connection budget spans every channel on one SSH connection |
+| `FTPMaxPassiveListeners` / `FTPMaxPassiveListenersPerUser` / `FTPMaxPassiveListenersPerIP` | 64 / 2 / 8 | Outstanding passive-port reservations, including data-connection setup |
+| `HTTPMaxConcurrentRequests` | 32 | Requests executing across every `HttpIngest` handler created from this server |
+| `HTTPMaxAuthorizationBytes` | 4,096 | Raw `Authorization` headers, before Basic-auth decoding |
+| `HTTPMaxUsernameBytes` / `HTTPMaxPasswordBytes` | 256 / 1,024 | Decoded HTTP Basic-auth credentials |
+| `FTPAuthTimeout` | 30 seconds | Absolute login window; anonymous `NOOP`, `USER`, and `REIN` cannot extend it |
+| `FTPMaxAuthFailures` | 5 | Failed credential checks over the lifetime of one FTP control connection |
+
+Connection overload closes new sockets before starting a handler. SSH channel
+overload rejects only the new channel. SFTP handle admission happens before
+opening, creating, or truncating a file; closing a handle or tearing down its
+channel returns its permit. Passive FTP exhaustion returns `425`. Each passive
+reservation expires from the time of `PASV`/`EPSV`, normally after 30 seconds,
+and releases on replacement, logout, disconnect, cancellation, or completed
+data setup. Established FTP transfers no longer occupy passive-listener slots.
+
+SSH has an absolute 30-second handshake deadline in addition to its read idle
+timeout. FTP successful login stops its login timer; logging out starts a new
+window. `FTPMaxAuthFailures` is not reset by `USER`, `REIN`, or a successful login.
+
+`AuthLimits` configures token buckets shared by SSH, FTP, and HTTP. Defaults
+allow bursts of 200 attempts server-wide, 30 per source IP, and 20 per username,
+refilling one token every 10 ms, one second, and one second respectively.
+Successful credential checks consume tokens too. SSH public-key authentication
+consumes one admission token per bucket for the key query and signature proof
+together, then rechecks current credentials and cooldown at verified completion.
+A repeated proof after a failed completion requires fresh admission. Every bucket
+and the identity-table capacity must permit the attempt before tokens are
+consumed or new identities retained.
+
+Three failed credential checks start a 250 ms cooldown, doubling after each
+further failure up to 30 seconds. Attempts during cooldown are rejected
+immediately. HTTP returns `429` with `Retry-After`, FTP returns `421` and closes
+the control connection, and SSH returns an authentication error. Success clears
+only that username's failure state, preserving shared-IP backoff. Failure logs
+and throttled failure events are sampled. `AuthEvent.Reason` distinguishes
+`AuthFailureCredentials` from `AuthFailureThrottled` on `LoginFailed` events;
+success and logout events leave it empty. Throttling events may be sampled even
+when the event queue has room, so this stream is not a complete attempt count.
+The combined IP/username table holds at most 8,192 entries by default. Idle
+entries become eligible for expiry after 15 minutes, once their tokens have
+fully refilled and active cooldowns have ended. Longer refill intervals therefore
+retain their limits across idle periods. New identities are denied while the
+table is full. IPs come from the transport peer,
+never forwarded headers, so clients behind one proxy share its IP budget.
+
+`Config.Validate()` rejects a positive `AuthLimits.MaxEntries` below two and
+contradictory positive `BackoffInitial`/`BackoffMax` settings. If only the maximum
+is set below 250 ms, the default initial delay is reduced to honor it. If only
+the initial delay exceeds 30 seconds, the default maximum is raised to match.
+`DefaultConfig()` fills in positive defaults: when lowering its maximum below
+250 ms, also lower or zero its initial delay. For example, set
+`config.AuthLimits = ironport.AuthLimitConfig{BackoffMax: 100 * time.Millisecond}`
+to use a 100 ms maximum with other authentication defaults.
+`NewServer` keeps its existing signature; invalid settings make `ListenAndServe`
+return an error and HTTP ingest return `503` before authentication or body reads.
+Validation is captured at construction, so later changes to the config do not
+change a running server. Listener/TLS/kernel checks still run at startup.
+
+Finite defaults introduce admission rejection for applications that previously
+accepted unlimited work. Negative `FtpDataAcceptTimeout` now disables only active
+FTP dial deadlines; passive reservations still expire after 30 seconds.
+
+These are application admission limits, not OS file-descriptor or storage
+quotas. `MaxConnections` excludes HTTP connections and FTP data sockets. HTTP
+callers own the listener and must configure read-header, read, write, and idle
+timeouts plus `MaxHeaderBytes`; the demo provides an example. HTTP request slots
+remain occupied until the entire request body, including any multipart epilogue,
+has been consumed or rejected. A stalled body therefore holds a slot until the
+caller's read timeout or the client disconnects. Middleware must preserve HTTP
+transport controls as described below. Multiple `Server` instances and processes
+have separate budgets.
+
 ## FTP support (opt-in)
 
 This package also exposes an FTP listener that shares the SFTP user database,
@@ -207,8 +306,8 @@ Active mode (`PORT` / `EPRT`) is refused unless `FtpAllowActiveMode` is true.
 Even then, the server only dials back to the same IP as the control connection
 to prevent FTP bounce behavior. Passive data connections are checked against the
 control connection IP to prevent passive-port stealing. Passive listeners and
-active dials wait up to `FtpDataAcceptTimeout`; set it negative to disable that
-deadline. Behind NAT or a port-forward, set `FtpPassiveAdvertisedIP` to the
+active dials wait up to `FtpDataAcceptTimeout`. A negative value disables only
+the active dial deadline; passive reservations still expire after 30 seconds. Behind NAT or a port-forward, set `FtpPassiveAdvertisedIP` to the
 external IPv4 address so the `PASV` reply advertises an address clients can
 reach instead of the server's internal address.
 
@@ -279,8 +378,35 @@ mux := http.NewServeMux()
 mux.HandleFunc("/upload", srv.HttpIngest())
 
 // Terminate TLS yourself — HTTP Basic credentials are otherwise in the clear.
-log.Fatal(http.ListenAndServeTLS(":8443", "server.crt", "server.key", mux))
+server := &http.Server{
+    Addr: ":8443", Handler: ironport.WithHTTPControl(mux),
+    ReadHeaderTimeout: 10 * time.Second,
+    ReadTimeout: 30 * time.Minute, WriteTimeout: 30 * time.Minute,
+    IdleTimeout: time.Minute, MaxHeaderBytes: 16 << 10,
+}
+log.Fatal(server.ListenAndServeTLS("server.crt", "server.key"))
 ```
+
+When adding middleware, keep `WithHTTPControl` outermost:
+
+```go
+server.Handler = ironport.WithHTTPControl(middleware(mux))
+```
+
+It captures the original response controller in the request context so rejected
+slow bodies can be interrupted even when middleware hides optional writer
+interfaces. Middleware must preserve that context. The wrapper is optional if
+all response-writer wrappers implement `Unwrap() http.ResponseWriter` and
+middleware preserves the complete request body. Middleware that replaces or
+limits the body needs the outer wrapper so any unread original body is consumed
+before an upload releases its concurrency slot.
+
+Without either mechanism, middleware that forwards `http.Hijacker` can still
+have rejected HTTP/1 connections closed, but the error response is lost. If
+middleware hides both deadline and hijacking support, the library logs a sampled
+integration error; cleanup then depends on the server's read timeout. Install
+`WithHTTPControl` outside that middleware to retain bounded cleanup and normal
+HTTP error responses. HTTP/2 rejection affects only the request stream.
 
 The endpoint accepts one or more files per request:
 
@@ -289,7 +415,9 @@ The endpoint accepts one or more files per request:
 - **Authentication** — HTTP Basic auth. The username and password are the
   **same** credentials used for SFTP/FTP/FTPS, validated with the same
   constant-time password comparison. A missing or wrong credential returns
-  `401` with a `WWW-Authenticate` challenge. Because Basic auth sends the
+  `401` with a `WWW-Authenticate` challenge. Throttled authentication returns
+  `429` with `Retry-After`. Oversized raw credentials return `431`; oversized
+  decoded credentials return `401`. Because Basic auth sends the
   credential on every request, run this endpoint over TLS (your own
   `http.Server` or a TLS-terminating reverse proxy).
 - **Permission** — the authenticated user must have `CanWrite`, or the request
@@ -335,6 +463,13 @@ curl -u alice:alicepw -F 'file=@./q2.csv;filename=reports/2026/q2.csv' https://h
 # Several files in one request — each part is stored and announced separately.
 curl -u alice:alicepw -F file=@./a.csv -F file=@./b.csv https://host:8443/upload
 ```
+
+The handler admits at most `ResourceLimits.HTTPMaxConcurrentRequests` requests at once across
+all handlers created from the same server. Saturation returns `503` with
+`Retry-After: 1` before authentication or body reads. Early rejection stops
+request reads and disables HTTP/1 connection reuse through the preserved
+transport controls described above, so slow bodies cannot keep occupying
+resources after admission capacity has been returned.
 
 The handler imposes no upload-size limit of its own (matching SFTP/FTP); wrap it
 with `http.MaxBytesReader`, or bound the request body at your reverse proxy, if

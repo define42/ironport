@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/define42/ironport/internal/authlimit"
 	"github.com/define42/ironport/internal/jailfs"
 	"github.com/define42/ironport/internal/netconn"
 	"golang.org/x/crypto/ssh"
@@ -23,6 +24,8 @@ import (
 
 // Server is a self-contained SFTP server with optional FTP support.
 type Server struct {
+	// configErr retains invalid admission settings so every protocol fails closed.
+	configErr error
 	// addr is the TCP address to listen on for SFTP, e.g. ":2022".
 	addr string
 	// ftpAddr is the TCP address to listen on for FTP, e.g. ":2121".
@@ -34,7 +37,8 @@ type Server struct {
 	ftpPassivePortRange string
 	// ftpDataAcceptTimeout bounds how long passive-mode FTP data listeners wait
 	// after PASV/EPSV and how long active-mode FTP dials may take after
-	// PORT/EPRT. Zero selects the package default; negative disables the deadline.
+	// PORT/EPRT. Zero selects the package default; negative disables active
+	// dial deadlines only. Passive reservations remain finite.
 	ftpDataAcceptTimeout time.Duration
 	// ftpPassiveAdvertisedIP optionally overrides the IPv4 address sent to
 	// clients in the PASV (227) reply, for deployments behind NAT or a
@@ -77,6 +81,24 @@ type Server struct {
 	sshCiphers                 []string
 	sshMACs                    []string
 	sshPublicKeyAuthAlgorithms []string
+	// Admission budgets are shared by all protocol handlers from this server.
+	sshMaxChannels            int
+	maxConnections            int
+	maxConnectionsPerIP       int
+	ftpAuthTimeout            time.Duration
+	ftpMaxAuthFailures        int
+	ftpPassiveLimits          ftpPassiveLimits
+	sftpHandles               handleBudget
+	authOnce                  sync.Once
+	authLimiter               *authlimit.Limiter
+	authLogs                  authLogSampler
+	httpMaxConcurrentRequests int
+	httpMaxAuthorizationBytes int
+	httpMaxUsernameBytes      int
+	httpMaxPasswordBytes      int
+	httpControlLogs           authLogSampler
+	httpRequestOnce           sync.Once
+	httpRequestSlots          chan struct{}
 	// completedUploads receives upload notifications. Use CompletedUploads to
 	// access it as a receive-only stream.
 	completedUploads chan CompletedUpload
@@ -127,6 +149,10 @@ type Server struct {
 	// context deadline fires, and by RemoveUser to evict active sessions of
 	// a user being deleted.
 	activeConns map[net.Conn]string
+	// connCancels retains cancellation state until the owning handler exits.
+	// It lets FTP interrupt data setup as well as the control connection.
+	// Both maps are protected by mu.
+	connCancels map[net.Conn]connCancelState
 	// shutdownWaiters counts concurrent Shutdown callers so shuttingDown stays
 	// true until the final caller has finished waiting on connWG.
 	shutdownWaiters int
@@ -137,7 +163,15 @@ type Server struct {
 	shuttingDown bool
 }
 
-// NewServer creates a new Server from config. Pass FtpAddr as "" to disable
+type connCancelState struct {
+	cancel   func()
+	canceled bool
+}
+
+// NewServer creates a new Server from config. Call Config.Validate to check
+// admission settings first. Invalid settings make ListenAndServe return an
+// error and HttpIngest reject requests with HTTP 503.
+// Pass FtpAddr as "" to disable
 // FTP. Leave FtpPassivePortRange empty to use OS-assigned passive data ports.
 //
 // CompletedUploadSize sets the buffer capacity of the CompletedUploads channel.
@@ -155,6 +189,7 @@ func NewServer(config *Config) *Server {
 		config = DefaultConfig()
 	}
 	s := &Server{
+		configErr:                  config.Validate(),
 		addr:                       config.SftpAddr,
 		ftpAddr:                    config.FtpAddr,
 		ftpPassivePortRange:        config.FtpPassivePortRange,
@@ -170,11 +205,27 @@ func NewServer(config *Config) *Server {
 		sshCiphers:                 slices.Clone(config.SSHCiphers),
 		sshMACs:                    slices.Clone(config.SSHMACs),
 		sshPublicKeyAuthAlgorithms: slices.Clone(config.SSHPublicKeyAuthAlgorithms),
-		tempExtensions:             normalizeTempExtensions(config.TempExtensions),
-		idleTimeout:                config.IdleTimeout,
-		tcpKeepAlivePeriod:         config.TCPKeepAlivePeriod,
-		sftpAllowChown:             config.SftpAllowChown,
-		activeConns:                make(map[net.Conn]string),
+		sshMaxChannels:             positiveLimit(config.ResourceLimits.SSHMaxChannels, defaultSSHMaxChannels),
+		maxConnections:             positiveLimit(config.ResourceLimits.MaxConnections, defaultMaxConnections),
+		maxConnectionsPerIP:        positiveLimit(config.ResourceLimits.MaxConnectionsPerIP, defaultMaxConnectionsPerIP),
+		ftpAuthTimeout:             positiveDuration(config.ResourceLimits.FTPAuthTimeout, defaultFTPAuthTimeout),
+		sftpHandles: handleBudget{
+			max:        positiveLimit(config.ResourceLimits.SFTPMaxHandles, defaultSFTPMaxHandles),
+			maxUser:    positiveLimit(config.ResourceLimits.SFTPMaxHandlesPerUser, defaultSFTPMaxHandlesPerUser),
+			maxSession: positiveLimit(config.ResourceLimits.SFTPMaxHandlesPerConnection, defaultSFTPMaxHandlesPerConnection),
+		},
+		ftpMaxAuthFailures:        positiveLimit(config.ResourceLimits.FTPMaxAuthFailures, 5),
+		ftpPassiveLimits:          newFTPPassiveLimits(config),
+		authLimiter:               newAuthLimiter(config.AuthLimits),
+		httpMaxConcurrentRequests: positiveLimit(config.ResourceLimits.HTTPMaxConcurrentRequests, defaultHTTPMaxConcurrentRequests),
+		httpMaxAuthorizationBytes: positiveLimit(config.ResourceLimits.HTTPMaxAuthorizationBytes, defaultHTTPMaxAuthorizationBytes),
+		httpMaxUsernameBytes:      positiveLimit(config.ResourceLimits.HTTPMaxUsernameBytes, defaultHTTPMaxUsernameBytes),
+		httpMaxPasswordBytes:      positiveLimit(config.ResourceLimits.HTTPMaxPasswordBytes, defaultHTTPMaxPasswordBytes),
+		tempExtensions:            normalizeTempExtensions(config.TempExtensions),
+		idleTimeout:               config.IdleTimeout,
+		tcpKeepAlivePeriod:        config.TCPKeepAlivePeriod,
+		sftpAllowChown:            config.SftpAllowChown,
+		activeConns:               make(map[net.Conn]string),
 	}
 	if config.FtpTLSConfig != nil {
 		s.ftpTLSConfig = config.FtpTLSConfig.Clone()
@@ -234,15 +285,28 @@ func (s *Server) endShutdown() {
 	s.mu.Unlock()
 }
 
-// trackConn records nc as an in-flight handler-owned connection. It returns
-// false when the server has already begun shutting down, in which case the
-// caller must not spawn a handler for nc and is responsible for closing it.
+// trackConn admits and tracks SFTP/FTP control connections within the shared
+// total and per-IP budgets. On overload or shutdown it returns false; the
+// caller must close nc without starting a handler.
 // On success the caller must call untrackConn(nc) and connWG.Done() exactly
 // once before its handler goroutine returns.
 func (s *Server) trackConn(nc net.Conn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.shuttingDown {
+	if s.shuttingDown || len(s.activeConns) >= positiveLimit(s.maxConnections, defaultMaxConnections) {
+		return false
+	}
+	if _, tracked := s.activeConns[nc]; tracked {
+		return false
+	}
+	ip := canonicalClientIP(netconn.RemoteIP(nc.RemoteAddr()))
+	count := 0
+	for conn := range s.activeConns {
+		if canonicalClientIP(netconn.RemoteIP(conn.RemoteAddr())) == ip {
+			count++
+		}
+	}
+	if count >= positiveLimit(s.maxConnectionsPerIP, defaultMaxConnectionsPerIP) {
 		return false
 	}
 	if s.activeConns == nil {
@@ -251,6 +315,43 @@ func (s *Server) trackConn(nc net.Conn) bool {
 	s.activeConns[nc] = ""
 	s.connWG.Add(1)
 	return true
+}
+
+// setConnCancel attaches idempotent protocol cleanup to a tracked connection.
+// A concurrent revocation or shutdown cannot be missed by late registration.
+func (s *Server) setConnCancel(nc net.Conn, cancel func()) bool {
+	s.mu.Lock()
+	_, tracked := s.activeConns[nc]
+	state := s.connCancels[nc]
+	if !tracked || state.canceled || s.shuttingDown {
+		s.mu.Unlock()
+		cancel()
+		return false
+	}
+	if s.connCancels == nil {
+		s.connCancels = make(map[net.Conn]connCancelState)
+	}
+	state.cancel = cancel
+	s.connCancels[nc] = state
+	s.mu.Unlock()
+	return true
+}
+
+// cancelConnLocked marks a connection before returning cleanup to run outside
+// mu. Keeping the marker until untrackConn prevents late registration races.
+func (s *Server) cancelConnLocked(nc net.Conn) func() {
+	if s.connCancels == nil {
+		s.connCancels = make(map[net.Conn]connCancelState)
+	}
+	state := s.connCancels[nc]
+	state.canceled = true
+	s.connCancels[nc] = state
+	return func() {
+		_ = nc.Close()
+		if state.cancel != nil {
+			state.cancel()
+		}
+	}
 }
 
 // setConnUser records username as the authenticated identity on nc. It is a
@@ -271,6 +372,7 @@ func (s *Server) setConnUser(nc net.Conn, username string) {
 func (s *Server) untrackConn(nc net.Conn) {
 	s.mu.Lock()
 	delete(s.activeConns, nc)
+	delete(s.connCancels, nc)
 	s.mu.Unlock()
 }
 
@@ -280,15 +382,15 @@ func (s *Server) untrackConn(nc net.Conn) {
 // finished on their own.
 func (s *Server) forceCloseActiveConns() int {
 	s.mu.Lock()
-	conns := make([]net.Conn, 0, len(s.activeConns))
+	closers := make([]func(), 0, len(s.activeConns))
 	for c := range s.activeConns {
-		conns = append(conns, c)
+		closers = append(closers, s.cancelConnLocked(c))
 	}
 	s.mu.Unlock()
-	for _, c := range conns {
-		_ = c.Close()
+	for _, closeConn := range closers {
+		closeConn()
 	}
-	return len(conns)
+	return len(closers)
 }
 
 // ListenAndServe starts the SFTP server and, when configured, the FTP server
@@ -298,6 +400,9 @@ func (s *Server) forceCloseActiveConns() int {
 // A stopped server can be started again by calling ListenAndServe after Close
 // or Shutdown returns. Concurrent ListenAndServe calls are rejected.
 func (s *Server) ListenAndServe() error {
+	if s.configErr != nil {
+		return s.configErr
+	}
 	if strings.TrimSpace(s.addr) == "" {
 		return errors.New("ironport: SftpAddr is required")
 	}
@@ -414,8 +519,8 @@ func (s *Server) acceptLoop(ln net.Listener, name string, handler func(net.Conn)
 		permanentErrors = 0
 		netconn.ApplyTCPKeepAlive(nc, s.effectiveTCPKeepAlivePeriod())
 		if !s.trackConn(nc) {
-			// Shutdown began between Accept returning and tracking; refuse
-			// the connection rather than spawning an untrackable handler.
+			// Reject overload or shutdown before allocating protocol state
+			// or starting a handler goroutine.
 			_ = nc.Close()
 			continue
 		}

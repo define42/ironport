@@ -173,7 +173,9 @@ func TestFTPServer_PASVExhaustsPortRange(t *testing.T) {
 	users := map[string]UserInfo{
 		"u": {Password: "p", Root: root, CanRead: true, CanWrite: true},
 	}
-	_, addr, stop := startTestFTPServer(t, users, "5500-5502")
+	config := newTestFTPConfig(t, users, "5500-5502", false)
+	config.ResourceLimits.FTPMaxPassiveListenersPerUser = 4 // Exercise port exhaustion rather than per-user admission.
+	_, addr, stop := startTestFTPServerWithConfig(t, config)
 	t.Cleanup(stop)
 
 	holders := make([]*ftpTestClient, 0, 3)

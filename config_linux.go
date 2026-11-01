@@ -4,6 +4,7 @@ package ironport
 
 import (
 	"crypto/tls"
+	"errors"
 	"slices"
 	"strings"
 	"time"
@@ -112,7 +113,8 @@ type Config struct {
 	// FtpDataAcceptTimeout bounds how long passive-mode FTP data listeners wait
 	// for the client data connection after PASV/EPSV, and how long active-mode
 	// FTP dials may take after PORT/EPRT. Zero selects the package default
-	// (30 seconds); negative disables the deadline.
+	// (30 seconds); negative disables active-mode dial deadlines, but passive
+	// reservations still expire after 30 seconds.
 	FtpDataAcceptTimeout time.Duration
 	// FtpAllowActiveMode enables FTP active mode (PORT/EPRT). It defaults to
 	// false because active mode requires outbound connections from the server.
@@ -155,6 +157,12 @@ type Config struct {
 	SSHCiphers                 []string
 	SSHMACs                    []string
 	SSHPublicKeyAuthAlgorithms []string
+	// ResourceLimits bounds connections, channels, handles, listeners, and HTTP
+	// requests. Non-positive fields select finite defaults.
+	ResourceLimits ResourceLimitConfig
+	// AuthLimits bounds authentication attempts and retry backoff jointly
+	// across SSH, FTP, and HTTP. Zero fields select secure defaults.
+	AuthLimits AuthLimitConfig
 	// TempExtensions marks file extensions that should defer completion
 	// notifications until a later rename to a non-temp name. Matching is
 	// case-insensitive.
@@ -174,6 +182,76 @@ type Config struct {
 	SftpAllowChown bool
 }
 
+// ResourceLimitConfig bounds resources shared by one Server.
+// Non-positive values select finite defaults; these limits cannot be disabled.
+// Configure limits before NewServer, which copies the settings.
+type ResourceLimitConfig struct {
+	// SSHMaxChannels limits simultaneous session channels per SSH connection.
+	// Non-positive values select the default of 16.
+	SSHMaxChannels int
+	// MaxConnections and MaxConnectionsPerIP bound accepted SFTP and FTP
+	// control connections together, including unauthenticated connections.
+	// Non-positive values select 128 and 32 respectively.
+	MaxConnections      int
+	MaxConnectionsPerIP int
+	// FTPAuthTimeout is the absolute time allowed to authenticate an FTP
+	// control session. Commands such as NOOP do not extend it. Non-positive
+	// values select 30 seconds. Logging out starts a new authentication window.
+	FTPAuthTimeout time.Duration
+	// SFTPMaxHandles, SFTPMaxHandlesPerUser, and SFTPMaxHandlesPerConnection
+	// bound open files and directories globally, per username (across SSH
+	// connections), and per SSH connection (across channels). Non-positive
+	// values select 256, 64, and 32. CLOSE and channel teardown release slots.
+	SFTPMaxHandles              int
+	SFTPMaxHandlesPerUser       int
+	SFTPMaxHandlesPerConnection int
+	// HTTPMaxConcurrentRequests caps requests executing in HttpIngest across
+	// every handler created from this Server. Non-positive values select 32.
+	// Requests over the limit are rejected immediately with 503 before their
+	// Authorization header or body is processed.
+	HTTPMaxConcurrentRequests int
+	// HTTPMaxAuthorizationBytes limits the raw Authorization header before
+	// Basic authentication decoding. Non-positive values select 4096 bytes.
+	HTTPMaxAuthorizationBytes int
+	// HTTPMaxUsernameBytes and HTTPMaxPasswordBytes limit decoded Basic-auth
+	// credentials. Non-positive values select 256 and 1024 bytes respectively.
+	HTTPMaxUsernameBytes int
+	HTTPMaxPasswordBytes int
+	// FTPMaxPassiveListeners caps outstanding PASV/EPSV listeners server-wide.
+	// Zero or negative selects the default of 64.
+	FTPMaxPassiveListeners int
+	// FTPMaxPassiveListenersPerUser caps outstanding PASV/EPSV listeners for
+	// one authenticated username. Zero or negative selects the default of 2.
+	FTPMaxPassiveListenersPerUser int
+	// FTPMaxPassiveListenersPerIP caps outstanding PASV/EPSV listeners for one
+	// control-connection source IP. Zero or negative selects the default of 8.
+	FTPMaxPassiveListenersPerIP int
+	// FTPMaxAuthFailures closes a control session after this many failed
+	// password attempts. Non-positive values select five; USER/REIN and
+	// successful login do not reset it.
+	FTPMaxAuthFailures int
+}
+
+func defaultResourceLimits() ResourceLimitConfig {
+	return ResourceLimitConfig{
+		SSHMaxChannels:                defaultSSHMaxChannels,
+		MaxConnections:                defaultMaxConnections,
+		MaxConnectionsPerIP:           defaultMaxConnectionsPerIP,
+		FTPAuthTimeout:                defaultFTPAuthTimeout,
+		FTPMaxAuthFailures:            5,
+		SFTPMaxHandles:                defaultSFTPMaxHandles,
+		SFTPMaxHandlesPerUser:         defaultSFTPMaxHandlesPerUser,
+		SFTPMaxHandlesPerConnection:   defaultSFTPMaxHandlesPerConnection,
+		FTPMaxPassiveListeners:        defaultFTPMaxPassiveListeners,
+		FTPMaxPassiveListenersPerUser: defaultFTPMaxPassiveListenersPerUser,
+		FTPMaxPassiveListenersPerIP:   defaultFTPMaxPassiveListenersPerIP,
+		HTTPMaxConcurrentRequests:     defaultHTTPMaxConcurrentRequests,
+		HTTPMaxAuthorizationBytes:     defaultHTTPMaxAuthorizationBytes,
+		HTTPMaxUsernameBytes:          defaultHTTPMaxUsernameBytes,
+		HTTPMaxPasswordBytes:          defaultHTTPMaxPasswordBytes,
+	}
+}
+
 // DefaultConfig returns a fresh server configuration with package
 // defaults applied. Callers should set Users before starting the server. Set
 // SftpSigner to use a stable host key; when SftpSigner is nil, ListenAndServe
@@ -185,7 +263,30 @@ func DefaultConfig() *Config {
 		FtpPassivePortRange: "5000-5010",
 		CompletedUploadSize: defaultCompletedUploadsSize,
 		AuthEventSize:       defaultAuthEventsSize,
+		ResourceLimits:      defaultResourceLimits(),
+		AuthLimits:          normalizeAuthLimits(AuthLimitConfig{}),
 	}
+}
+
+// Validate checks authentication-limit bounds before constructing a server.
+// Nil and zero-valued configurations use defaults and are valid. Non-positive
+// limit settings select defaults; MaxEntries must be at least two when set,
+// and an explicit BackoffInitial must not exceed an explicit BackoffMax.
+// Listener addresses, TLS settings, and kernel support are checked separately
+// when starting listeners. NewServer retains validation failures: ListenAndServe
+// returns the error and HttpIngest rejects requests with HTTP 503.
+func (c *Config) Validate() error {
+	if c == nil {
+		return nil
+	}
+	if c.AuthLimits.MaxEntries == 1 {
+		return errors.New("ironport: AuthLimits.MaxEntries must be at least 2 (one IP and one username)")
+	}
+	if c.AuthLimits.BackoffInitial > 0 && c.AuthLimits.BackoffMax > 0 &&
+		c.AuthLimits.BackoffInitial > c.AuthLimits.BackoffMax {
+		return errors.New("ironport: AuthLimits.BackoffInitial must not exceed AuthLimits.BackoffMax")
+	}
+	return nil
 }
 
 // configuredTempExtensions returns a copy of the normalised temp extensions
@@ -203,7 +304,8 @@ func (s *Server) effectiveIdleTimeout() time.Duration {
 
 // effectiveFTPDataAcceptTimeout returns the effective FTP data-connection
 // setup timeout. A zero configured timeout selects the package default; a
-// negative timeout disables the passive accept or active dial deadline.
+// negative timeout disables active dial deadlines. Passive listeners apply
+// their own finite reservation lifetime even when this returns zero.
 func (s *Server) effectiveFTPDataAcceptTimeout() time.Duration {
 	return resolveDur(s.ftpDataAcceptTimeout, defaultFTPDataAcceptTimeout)
 }

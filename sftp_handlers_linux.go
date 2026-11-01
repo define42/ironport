@@ -46,6 +46,7 @@ func sanitizeSFTPErr(err error) error {
 }
 
 type jail struct {
+	handles *sessionHandleBudget
 	// fs is the fd-relative filesystem implementation backing this jail. It
 	// is constructed once per session and shared by all handler invocations.
 	// Its lifetime is bound to the session: jailedHandlers (SFTP) or
@@ -77,11 +78,20 @@ func (j jail) Fileread(r *sftp.Request) (reader io.ReaderAt, err error) {
 	if !j.canRead {
 		return nil, os.ErrPermission
 	}
+	release, err := j.handles.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if reader == nil {
+			release()
+		}
+	}()
 	f, err := j.fs.OpenRead(r.Filepath)
 	if err != nil {
 		return nil, sanitizeSFTPErr(err)
 	}
-	return f, nil
+	return &budgetReader{File: f, release: release}, nil
 }
 
 // writeLogger wraps an *os.File and logs the filename when the file is closed,
@@ -198,11 +208,20 @@ func (j jail) Filewrite(r *sftp.Request) (writer io.WriterAt, err error) {
 	if err != nil {
 		return nil, err
 	}
+	release, err := j.handles.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if writer == nil {
+			release()
+		}
+	}()
 	f, err := j.fs.OpenWrite(r.Filepath, openFlags, 0o600)
 	if err != nil {
 		return nil, sanitizeSFTPErr(err)
 	}
-	return &writeLogger{
+	return &budgetWriter{writeLogger: &writeLogger{
 		File:         f,
 		filepath:     clientPath,
 		fullFilepath: j.fs.FullPath(r.Filepath),
@@ -211,7 +230,7 @@ func (j jail) Filewrite(r *sftp.Request) (writer io.WriterAt, err error) {
 		uploads:      j.uploads,
 		tempExts:     j.tempExts,
 		appendMode:   appendMode,
-	}, nil
+	}, release: release}, nil
 }
 
 func sftpWriteOpenFlags(r *sftp.Request) (int, bool, error) {
@@ -299,11 +318,20 @@ func (j jail) Filelist(r *sftp.Request) (lister sftp.ListerAt, err error) {
 	}
 	switch r.Method {
 	case "List":
+		release, err := j.handles.acquire()
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			if lister == nil {
+				release()
+			}
+		}()
 		infos, err := j.fs.List(r.Filepath)
 		if err != nil {
 			return nil, sanitizeSFTPErr(err)
 		}
-		return listerFromFileInfo(infos), nil
+		return &budgetLister{ListerAt: listerFromFileInfo(infos), release: release}, nil
 	case "Stat", "Lstat":
 		// Under the no-symlink policy Stat and Lstat are equivalent: the
 		// kernel rejects any symlink in the path lookup, so the entry being
@@ -382,7 +410,7 @@ func (j jail) applyTimes(r *sftp.Request, flags sftp.FileAttrFlags, attrs *sftp.
 	return nil
 }
 
-func jailedHandlers(root, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool) (sftp.Handlers, *jailfs.FS, error) {
+func jailedHandlers(root, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool, handles ...*sessionHandleBudget) (sftp.Handlers, *jailfs.FS, error) {
 	fs, err := jailfs.Open(filepath.Clean(root))
 	if err != nil {
 		return sftp.Handlers{}, nil, err
@@ -396,6 +424,9 @@ func jailedHandlers(root, username, clientIP string, canRead, canWrite bool, upl
 		uploads:        uploads,
 		tempExts:       tempExts,
 		sftpAllowChown: sftpAllowChown,
+	}
+	if len(handles) > 0 {
+		j.handles = handles[0]
 	}
 	return sftp.Handlers{
 		FileGet:  j,

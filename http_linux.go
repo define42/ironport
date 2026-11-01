@@ -27,13 +27,20 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/define42/ironport/internal/jailfs"
 	"github.com/define42/ironport/internal/netconn"
 )
 
 const (
+	defaultHTTPMaxConcurrentRequests = 32
+	defaultHTTPMaxAuthorizationBytes = 4096
+	defaultHTTPMaxUsernameBytes      = 256
+	defaultHTTPMaxPasswordBytes      = 1024
+
 	// CompletedUploadProtocolHTTP identifies an upload completed through the
 	// HTTP ingest endpoint (HttpIngest).
 	CompletedUploadProtocolHTTP = "HTTP"
@@ -68,7 +75,11 @@ const (
 //     constant-time password comparison. A missing or invalid credential gets
 //     401 with a WWW-Authenticate challenge; only an attempt that supplied a
 //     wrong credential (not a bare unauthenticated probe) emits a LoginFailed
-//     AuthEvent.
+//     AuthEvent. Oversized raw Authorization headers get 431 before decoding;
+//     oversized decoded credentials get 401 without logging or events.
+//     Throttled attempts get 429 with Retry-After.
+//   - HTTPMaxConcurrentRequests bounds in-flight work across every handler
+//     created from this Server; saturation gets 503 with Retry-After.
 //   - The authenticated user must have CanWrite; otherwise the request gets 403.
 //   - The body must be multipart/form-data carrying one or more parts under the
 //     form field "file" (key=file). Each part's filename becomes the
@@ -97,14 +108,60 @@ const (
 // in a temp directory. It imposes no size limit of its own (matching SFTP/FTP);
 // callers that want one can wrap the handler with http.MaxBytesReader or bound
 // the body at a reverse proxy.
+//
+// Middleware must preserve ResponseController access via Unwrap, or callers
+// must install WithHTTPControl outside the complete middleware chain. This
+// allows early rejections to stop body reads before returning request capacity.
+// Middleware that replaces or limits the request body also needs WithHTTPControl
+// so the original body is consumed before successful uploads return capacity.
+// Without transport control, HTTP/1 cleanup depends on the caller's read timeout.
 func (s *Server) HttpIngest() http.HandlerFunc { //nolint:revive // exported name HttpIngest is the documented API (mirrors this package's Ftp/Sftp naming and the caller example)
-	return s.handleHTTPIngest
+	return s.limitHTTPRequests(s.handleHTTPIngest)
+}
+
+// limitHTTPRequests rejects excess work before inspecting credentials or bodies.
+func (s *Server) limitHTTPRequests(next http.HandlerFunc) http.HandlerFunc {
+	slots := s.httpRequestSemaphore()
+	return func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case slots <- struct{}{}:
+			defer func() { <-slots }()
+		default:
+			w.Header().Set("Retry-After", "1")
+			s.rejectHTTPUpload(w, r, http.StatusServiceUnavailable)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) httpRequestSemaphore() chan struct{} {
+	s.httpRequestOnce.Do(func() {
+		s.httpRequestSlots = make(chan struct{}, positiveLimit(s.httpMaxConcurrentRequests, defaultHTTPMaxConcurrentRequests))
+	})
+	return s.httpRequestSlots
+}
+
+func (s *Server) httpAuthorizationByteLimit() int {
+	return positiveLimit(s.httpMaxAuthorizationBytes, defaultHTTPMaxAuthorizationBytes)
+}
+
+func (s *Server) httpUsernameByteLimit() int {
+	return positiveLimit(s.httpMaxUsernameBytes, defaultHTTPMaxUsernameBytes)
+}
+
+func (s *Server) httpPasswordByteLimit() int {
+	return positiveLimit(s.httpMaxPasswordBytes, defaultHTTPMaxPasswordBytes)
 }
 
 func (s *Server) handleHTTPIngest(w http.ResponseWriter, r *http.Request) {
+	if s.configErr != nil {
+		s.rejectHTTPUpload(w, r, http.StatusServiceUnavailable)
+		return
+	}
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
-		writeHTTPStatus(w, http.StatusMethodNotAllowed)
+		s.rejectHTTPUpload(w, r, http.StatusMethodNotAllowed)
 		return
 	}
 	username, user, jailRoot, ok := s.httpAuthenticate(w, r)
@@ -112,7 +169,7 @@ func (s *Server) handleHTTPIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !user.CanWrite {
-		writeHTTPStatus(w, http.StatusForbidden)
+		s.rejectHTTPUpload(w, r, http.StatusForbidden)
 		return
 	}
 	s.httpStoreUpload(w, r, username, jailRoot)
@@ -120,28 +177,52 @@ func (s *Server) handleHTTPIngest(w http.ResponseWriter, r *http.Request) {
 
 // httpAuthenticate validates HTTP Basic credentials against the shared user
 // database. On success it returns the username, the user's snapshot, and the
-// canonical jail root. On failure it has already written the 401 response and
+// canonical jail root. On failure it has rejected the upload with 401, 429, or
+// 431 (or closed the connection when only Hijacker is available), and
 // returns ok=false. A bare request with no Authorization header is answered
 // with a challenge but does not emit a LoginFailed event, so unauthenticated
 // probes (and the first leg of a browser's challenge/response) do not flood the
 // AuthEvents stream.
 func (s *Server) httpAuthenticate(w http.ResponseWriter, r *http.Request) (username string, user UserInfo, jailRoot string, ok bool) {
-	clientIP := netconn.HostFromAddr(r.RemoteAddr)
+	authorizationValues := r.Header.Values("Authorization")
+	if len(authorizationValues) == 0 {
+		s.rejectHTTPUpload(w, r, http.StatusUnauthorized)
+		return "", UserInfo{}, "", false
+	}
+	rawLimit := s.httpAuthorizationByteLimit()
+	rawBytes := 0
+	for _, value := range authorizationValues {
+		if len(value) > rawLimit-rawBytes {
+			s.rejectHTTPUpload(w, r, http.StatusRequestHeaderFieldsTooLarge)
+			return "", UserInfo{}, "", false
+		}
+		rawBytes += len(value)
+	}
+	if len(authorizationValues) != 1 {
+		s.rejectHTTPUpload(w, r, http.StatusUnauthorized)
+		return "", UserInfo{}, "", false
+	}
 	reqUser, reqPass, hasAuth := r.BasicAuth()
-	if !hasAuth {
-		writeHTTPAuthChallenge(w)
+	if !hasAuth || len(reqUser) > s.httpUsernameByteLimit() || len(reqPass) > s.httpPasswordByteLimit() {
+		s.rejectHTTPUpload(w, r, http.StatusUnauthorized)
+		return "", UserInfo{}, "", false
+	}
+	clientIP := netconn.HostFromAddr(r.RemoteAddr)
+	if retry := s.allowAuth(reqUser, clientIP); retry > 0 {
+		s.authFailed(reqUser, clientIP, CompletedUploadProtocolHTTP, s.authEventsChan(), true)
+		w.Header().Set("Retry-After", strconv.FormatInt(int64((retry-1)/time.Second+1), 10))
+		s.rejectHTTPUpload(w, r, http.StatusTooManyRequests)
 		return "", UserInfo{}, "", false
 	}
 	u, root, authOK := s.authenticateUser(reqUser, func(stored UserInfo) bool {
 		return checkPassword(stored.Password, reqPass)
 	})
 	if !authOK {
-		//nolint:gosec // G706: username/IP are logged with %q, which escapes CR/LF and so neutralises log-line injection from the client-supplied Authorization header
-		log.Printf("login failed protocol=http user=%q from=%q", reqUser, clientIP)
-		s.announceHTTPAuthEvent(AuthEventLoginFailed, reqUser, clientIP)
-		writeHTTPAuthChallenge(w)
+		s.authFailed(reqUser, clientIP, CompletedUploadProtocolHTTP, s.authEventsChan(), false)
+		s.rejectHTTPUpload(w, r, http.StatusUnauthorized)
 		return "", UserInfo{}, "", false
 	}
+	s.authSucceeded(reqUser, clientIP)
 	//nolint:gosec // G706: username/IP are logged with %q, which escapes CR/LF and so neutralises log-line injection from the client-supplied Authorization header
 	log.Printf("login protocol=http user=%q root=%q from=%q", reqUser, root, clientIP)
 	s.announceHTTPAuthEvent(AuthEventLoginSuccess, reqUser, clientIP)
@@ -159,18 +240,27 @@ func (s *Server) httpAuthenticate(w http.ResponseWriter, r *http.Request) (usern
 func (s *Server) httpStoreUpload(w http.ResponseWriter, r *http.Request, username, jailRoot string) {
 	mr, err := r.MultipartReader()
 	if err != nil {
-		writeHTTPStatus(w, http.StatusBadRequest)
+		s.rejectHTTPUpload(w, r, http.StatusBadRequest)
 		return
 	}
 	jfs, err := jailfs.Open(jailRoot)
 	if err != nil {
 		log.Printf("http open jail root %q for user %q: %v", jailRoot, username, err)
-		writeHTTPStatus(w, http.StatusInternalServerError)
+		s.rejectHTTPUpload(w, r, http.StatusInternalServerError)
 		return
 	}
 	defer func() { _ = jfs.Close() }()
 
 	results, bodyOK := s.storeUploadParts(mr, jfs, username, netconn.HostFromAddr(r.RemoteAddr))
+	if bodyOK {
+		// The closing multipart boundary can precede the HTTP body's EOF.
+		// Consume its epilogue under this request's admission permit, rather
+		// than leaving net/http to drain a possibly stalled body after return.
+		bodyOK = drainHTTPUploadBody(r) == nil
+	}
+	if !bodyOK && !s.stopHTTPUpload(w, r) {
+		return
+	}
 	writeUploadResponse(w, results, bodyOK)
 }
 

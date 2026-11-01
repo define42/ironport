@@ -99,8 +99,8 @@ func startEventLoggers(srv *ironport.Server) {
 	}()
 	go func() {
 		for ev := range srv.AuthEvents() {
-			log.Printf("auth event: type=%q protocol=%q user=%q ip=%q",
-				ev.Type, ev.Protocol, ev.Username, ev.ClientIP)
+			log.Printf("auth event: type=%q reason=%q protocol=%q user=%q ip=%q",
+				ev.Type, ev.Reason, ev.Protocol, ev.Username, ev.ClientIP)
 		}
 	}()
 }
@@ -120,6 +120,9 @@ func main() {
 
 	signer := loadSigner(*f.hostKeyPath)
 	config := buildConfig(f, signer, users)
+	if err := config.Validate(); err != nil {
+		log.Fatal(err)
+	}
 	srv := ironport.NewServer(config)
 	startEventLoggers(srv)
 	startHTTPIngest(srv, *f.httpAddr)
@@ -136,15 +139,25 @@ func startHTTPIngest(srv *ironport.Server, addr string) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/upload", srv.HttpIngest())
-	server := &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	server := newHTTPIngestServer(addr, mux)
 	go func() {
 		log.Printf("HTTP upload endpoint listening on %s (POST multipart key=file to /upload)", addr)
 		log.Fatal(server.ListenAndServe())
 	}()
+}
+
+// newHTTPIngestServer bounds work outside the library's request admission gate.
+// Long transfers may need deployment-specific read and write timeouts.
+func newHTTPIngestServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           ironport.WithHTTPControl(handler),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Minute,
+		WriteTimeout:      30 * time.Minute,
+		IdleTimeout:       time.Minute,
+		MaxHeaderBytes:    16 << 10,
+	}
 }
 
 // loadFTPSTLSConfig builds a *tls.Config from the operator-supplied cert/key

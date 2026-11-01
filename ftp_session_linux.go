@@ -4,6 +4,7 @@ package ironport
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -88,18 +90,27 @@ type ftpSession struct {
 	// association updates (setConnUser) must always go through rawConn;
 	// keying on conn after the upgrade misses the map and the session
 	// escapes RemoveUser / RemoveAllUsers eviction.
-	rawConn       net.Conn
-	r             *bufio.Reader
-	w             *bufio.Writer
-	username      string
-	user          UserInfo
-	authenticated bool
-	cwd           string
-	dataLn        net.Listener
-	dataAddr      *net.TCPAddr
-	epsvAll       bool
-	rnfrPath      string
-	restartOffset int64
+	rawConn        net.Conn
+	r              *bufio.Reader
+	w              *bufio.Writer
+	username       string
+	user           UserInfo
+	authenticated  bool
+	authFailures   int
+	authTerminated bool
+	authTimer      *time.Timer
+	cwd            string
+	dataLn         net.Listener
+	dataAddr       *net.TCPAddr
+	// dataMu protects setup resources shared with revocation and the reader.
+	dataMu            sync.Mutex
+	dataConn          net.Conn
+	dataCancel        context.CancelFunc
+	cancelled         bool
+	controlReadClosed bool
+	epsvAll           bool
+	rnfrPath          string
+	restartOffset     int64
 	// expectedUploadSize is the byte count declared by the client via the
 	// most recent ALLO command; it is consumed by the next STOR/APPE so
 	// an aborted transfer cannot let the hint leak into a later command.
@@ -150,6 +161,11 @@ type ftpSession struct {
 }
 
 func (s *Server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent) {
+	// Bound the entire unauthenticated window, including stalled AUTH TLS
+	// handshakes and reply writes. Pre-login commands never restart it.
+	authTimeout := positiveDuration(s.ftpAuthTimeout, defaultFTPAuthTimeout)
+	authTimer := time.AfterFunc(authTimeout, func() { _ = nc.Close() })
+	defer authTimer.Stop()
 	sess := &ftpSession{
 		server:     s,
 		conn:       nc,
@@ -162,19 +178,14 @@ func (s *Server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- Co
 		tempExts:   tempExts,
 		uploads:    uploads,
 		authEvents: authEvents,
+		authTimer:  authTimer,
 	}
-	// Close nc first, then drain the current reader's ctlMsg so its goroutine
-	// can exit. The reader may have been restarted by AUTH TLS; sess.ctlMsg
-	// is re-read at defer-execution time so the drain targets whichever
-	// channel is current.
-	defer func() {
+	if !s.setConnCancel(nc, sess.cancelDataOperations) {
 		_ = nc.Close()
-		ctl := sess.ctlMsg
-		if ctl != nil {
-			for range ctl {
-			}
-		}
-	}()
+		return
+	}
+	defer sess.cancelDataOperations()
+	defer sess.closeControlConn()
 	defer sess.closeDataEndpoint()
 	defer sess.closeJail()
 	defer sess.logoutIfAuthenticated()
@@ -211,6 +222,19 @@ func (s *Server) handleFTPConn(nc net.Conn, tempExts []string, uploads chan<- Co
 		cmd, arg := parseFTPCommand(line)
 		if sess.handleFTPCommand(cmd, arg) {
 			return
+		}
+		if sess.authenticated {
+			authTimer.Stop()
+		}
+	}
+}
+
+// closeControlConn closes the accepted connection and drains the current
+// reader, including a reader replaced by AUTH TLS, so its goroutine exits.
+func (f *ftpSession) closeControlConn() {
+	_ = f.rawConn.Close()
+	if f.ctlMsg != nil {
+		for range f.ctlMsg {
 		}
 	}
 }
@@ -325,6 +349,7 @@ func (f *ftpSession) readControlLines() {
 				return
 			default:
 			}
+			f.controlReaderClosed()
 			select {
 			case f.ctlMsg <- ftpCtlMsg{err: err}:
 			case <-f.readerStop:
@@ -438,6 +463,9 @@ func (f *ftpSession) announceAuthEvent(eventType AuthEventType) {
 func (f *ftpSession) logoutIfAuthenticated() {
 	if !f.authenticated {
 		return
+	}
+	if f.authTimer != nil {
+		f.authTimer.Reset(positiveDuration(f.server.ftpAuthTimeout, defaultFTPAuthTimeout))
 	}
 	f.announceAuthEvent(AuthEventLogout)
 	f.authenticated = false

@@ -45,6 +45,12 @@ func sanitizeFTPText(s string) string {
 }
 
 func (f *ftpSession) handleFTPCommand(cmd, arg string) bool {
+	f.dataMu.Lock()
+	cancelled := f.cancelled
+	f.dataMu.Unlock()
+	if cancelled {
+		return true
+	}
 	handled, quit := f.handlePreAuthCommand(cmd, arg)
 	if handled {
 		return quit
@@ -68,7 +74,7 @@ func (f *ftpSession) handlePreAuthCommand(cmd, arg string) (handled, quit bool) 
 	}
 	if handler, ok := preAuthFTPHandlers[cmd]; ok {
 		handler(f, arg)
-		return true, false
+		return true, f.authTerminated
 	}
 	return false, false
 }
@@ -103,6 +109,7 @@ func (f *ftpSession) cmdUser(arg string) {
 		_ = f.reply(534, "AUTH TLS required before login")
 		return
 	}
+	f.closeDataEndpoint()
 	f.logoutIfAuthenticated()
 	// The previous user (if any) is now logged out; drop the connection's
 	// user association so a RemoveUser for that name no longer evicts a
@@ -116,6 +123,10 @@ func (f *ftpSession) cmdUser(arg string) {
 }
 
 func (f *ftpSession) cmdPass(arg string) {
+	if f.authenticated {
+		_ = f.reply(503, "already logged in; send USER or REIN first")
+		return
+	}
 	if f.server.ftpRequireTLS && f.tlsConn == nil {
 		_ = f.reply(534, "AUTH TLS required before login")
 		return
@@ -124,11 +135,24 @@ func (f *ftpSession) cmdPass(arg string) {
 		_ = f.reply(503, "send USER first")
 		return
 	}
+	if f.server.allowAuth(f.username, f.clientIP) > 0 {
+		f.server.authFailed(f.username, f.clientIP, CompletedUploadProtocolFTP, f.authEvents, true)
+		f.authTerminated = true
+		_ = f.reply(421, "authentication temporarily unavailable, closing control connection")
+		return
+	}
 	if !f.authenticate(arg) {
-		f.announceAuthEvent(AuthEventLoginFailed)
+		f.authFailures++
+		f.server.authFailed(f.username, f.clientIP, CompletedUploadProtocolFTP, f.authEvents, false)
+		if f.authFailures >= positiveLimit(f.server.ftpMaxAuthFailures, 5) {
+			f.authTerminated = true
+			_ = f.reply(421, "too many authentication failures, closing control connection")
+			return
+		}
 		_ = f.reply(530, errInvalidCredentials.Error())
 		return
 	}
+	f.server.authSucceeded(f.username, f.clientIP)
 	log.Printf("login protocol=ftp user=%s root=%s from=%s", f.username, f.user.Root, f.conn.RemoteAddr())
 	f.announceAuthEvent(AuthEventLoginSuccess)
 	_ = f.reply(230, "login successful")

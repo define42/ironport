@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"time"
 )
 
 const (
@@ -27,6 +28,17 @@ const (
 	AuthEventLoginFailed AuthEventType = "LoginFailed"
 	// AuthEventLogout identifies the end of an authenticated session.
 	AuthEventLogout AuthEventType = "Logout"
+)
+
+// AuthFailureReason identifies why a login attempt was rejected. It is empty
+// for successful login and logout events.
+type AuthFailureReason string
+
+const (
+	// AuthFailureCredentials identifies a login rejected during credential validation.
+	AuthFailureCredentials AuthFailureReason = "Credentials"
+	// AuthFailureThrottled identifies a login rejected by authentication limits.
+	AuthFailureThrottled AuthFailureReason = "Throttled"
 )
 
 // publishUpload sends evt to uploads without blocking the caller. When the
@@ -67,7 +79,7 @@ func maybeAnnounceTempRename(uploads chan<- CompletedUpload, tempExts []string, 
 // CompletedUpload describes a file upload that has finished successfully.
 // It is the payload delivered on the server's CompletedUploads stream.
 type CompletedUpload struct {
-	// Username is the authenticated SFTP/FTP user that performed the upload.
+	// Username is the authenticated SFTP, FTP, or HTTP user that performed the upload.
 	Username string
 	// FullFilePath is the absolute path of the uploaded file on the server's
 	// local filesystem (i.e. resolved through the user's jail root).
@@ -80,7 +92,7 @@ type CompletedUpload struct {
 	// be parsed.
 	ClientIP string
 	// Protocol is the file-transfer protocol used for the upload.
-	// It is either CompletedUploadProtocolSFTP or CompletedUploadProtocolFTP.
+	// It is CompletedUploadProtocolSFTP, CompletedUploadProtocolFTP, or CompletedUploadProtocolHTTP.
 	Protocol string
 }
 
@@ -89,13 +101,16 @@ type CompletedUpload struct {
 type AuthEvent struct {
 	// Type is the authentication event kind.
 	Type AuthEventType
+	// Reason distinguishes credential rejection from authentication throttling
+	// for AuthEventLoginFailed. It is empty for successful login and logout.
+	Reason AuthFailureReason
 	// Username is the username supplied by the client for this event.
 	Username string
 	// ClientIP is the remote IP address of the client, without the port. It is
 	// empty if the address could not be parsed.
 	ClientIP string
 	// Protocol is the file-transfer protocol used for the event.
-	// It is either CompletedUploadProtocolSFTP or CompletedUploadProtocolFTP.
+	// It is CompletedUploadProtocolSFTP, CompletedUploadProtocolFTP, or CompletedUploadProtocolHTTP.
 	Protocol string
 }
 
@@ -140,7 +155,10 @@ func (s *Server) CompletedUploads() <-chan CompletedUpload {
 // notifications. Each AuthEvent includes the protocol that produced it.
 // The channel is buffered; sends are non-blocking so a slow consumer never
 // stalls authentication or logout handling. Callers should drain the stream
-// continuously.
+// continuously. A full channel drops events. Throttled login failures are
+// sampled even when the channel has capacity, so this stream is not a complete
+// audit trail or an exact count of rejected attempts. Credential failures,
+// successful logins, and logouts are not sampled.
 //
 // The buffer capacity is set by Config.AuthEventSize. A non-positive
 // value falls back to the package default (64).
@@ -155,7 +173,9 @@ func announceAuthEvent(events chan<- AuthEvent, evt AuthEvent) {
 	select {
 	case events <- evt:
 	default:
-		log.Printf("auth event: AuthEvents queue full, notification type=%q protocol=%q user=%q dropped", evt.Type, evt.Protocol, evt.Username)
+		if sample, suppressed := authEventDropLogs.allow(time.Now()); sample {
+			log.Printf("auth event: AuthEvents queue full, notification type=%q protocol=%q user=%q dropped (suppressed=%d)", evt.Type, evt.Protocol, evt.Username, suppressed)
+		}
 	}
 }
 

@@ -99,6 +99,28 @@ func deferRecoverSFTPPanicf(errp *error, onPanic func(), format string, args ...
 	}
 }
 
+// authenticateSSH checks admission and credentials for a query, password,
+// or verified key. A query's first proof reuses its already-consumed token.
+func (s *Server) authenticateSSH(c ssh.ConnMetadata, keyCheck func(UserInfo) bool, useQueryAdmission bool, authEvents chan<- AuthEvent) (*ssh.Permissions, error) {
+	clientIP := netconn.RemoteIP(c.RemoteAddr())
+	var retry time.Duration
+	if useQueryAdmission {
+		retry = s.authControl().RetryBackoff(c.User(), clientIP, time.Now())
+	} else {
+		retry = s.allowAuth(c.User(), clientIP)
+	}
+	if retry > 0 {
+		s.authFailed(c.User(), clientIP, CompletedUploadProtocolSFTP, authEvents, true)
+		return nil, errInvalidCredentials
+	}
+	u, jailRoot, ok := s.authenticateUser(c.User(), keyCheck)
+	if !ok {
+		s.authFailed(c.User(), clientIP, CompletedUploadProtocolSFTP, authEvents, false)
+		return nil, errInvalidCredentials
+	}
+	return permissionsFor(u, c.User(), jailRoot), nil
+}
+
 // sshServerConfig builds the SSH server configuration with both password-based
 // and public-key-based authentication enabled.
 //
@@ -110,22 +132,7 @@ func deferRecoverSFTPPanicf(errp *error, onPanic func(), format string, args ...
 // bytes).
 func (s *Server) sshServerConfig() *ssh.ServerConfig {
 	authEvents := s.authEventsChan()
-	// completeLogin centralises the failure announcement and the success
-	// permissions construction so PasswordCallback and PublicKeyCallback only
-	// have to express their own credential-matching logic.
-	completeLogin := func(c ssh.ConnMetadata, keyCheck func(UserInfo) bool) (*ssh.Permissions, error) {
-		u, jailRoot, ok := s.authenticateUser(c.User(), keyCheck)
-		if !ok {
-			announceAuthEvent(authEvents, AuthEvent{
-				Type:     AuthEventLoginFailed,
-				Username: c.User(),
-				ClientIP: netconn.RemoteIP(c.RemoteAddr()),
-				Protocol: CompletedUploadProtocolSFTP,
-			})
-			return nil, errInvalidCredentials
-		}
-		return permissionsFor(u, c.User(), jailRoot), nil
-	}
+	type keyAdmission struct{}
 
 	cfg := &ssh.ServerConfig{
 		KeyExchanges:            slices.Clone(s.sshKeyExchanges),
@@ -133,7 +140,7 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 		MACs:                    slices.Clone(s.sshMACs),
 		PublicKeyAuthAlgorithms: slices.Clone(s.sshPublicKeyAuthAlgorithms),
 		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
-			return completeLogin(c, func(u UserInfo) bool {
+			perms, err := s.authenticateSSH(c, func(u UserInfo) bool {
 				// checkPassword treats an empty stored password as
 				// "no password set" and rejects it. Passing u.Password
 				// directly works for both the existing-user and
@@ -141,37 +148,70 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 				// length-normalisation inside checkPassword keeps the
 				// comparison constant-time regardless.
 				return checkPassword(u.Password, string(pass))
-			})
+			}, false, authEvents)
+			if err == nil {
+				s.authSucceeded(c.User(), netconn.RemoteIP(c.RemoteAddr()))
+			}
+			return perms, err
 		},
 		PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			return completeLogin(c, func(u UserInfo) bool {
+			permissions, err := s.authenticateSSH(c, func(u UserInfo) bool {
 				return matchAuthorizedKey(u.AuthorizedKeys, key)
-			})
+			}, false, authEvents)
+			if err == nil {
+				permissions.ExtraData = map[any]any{keyAdmission{}: true}
+			}
+			return permissions, err
+		},
+		VerifiedPublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey, queryPermissions *ssh.Permissions, _ string) (*ssh.Permissions, error) {
+			// x/crypto transfers ownership of the cached query permissions here.
+			// Spend its admission once: another proof after a failed callback
+			// must obtain a fresh token even when x/crypto reuses that query.
+			admitted := false
+			if queryPermissions != nil {
+				_, admitted = queryPermissions.ExtraData[keyAdmission{}]
+				delete(queryPermissions.ExtraData, keyAdmission{})
+			}
+			permissions, err := s.authenticateSSH(c, func(u UserInfo) bool {
+				return matchAuthorizedKey(u.AuthorizedKeys, key)
+			}, admitted, authEvents)
+			if err == nil {
+				s.authSucceeded(c.User(), netconn.RemoteIP(c.RemoteAddr()))
+			}
+			return permissions, err
 		},
 	}
 	cfg.AddHostKey(s.sftpSigner)
 	return cfg
 }
 
+// acceptSSHConnection bounds both inactivity and total handshake time, then
+// switches successful connections to the authenticated-session idle timeout.
+func acceptSSHConnection(nc net.Conn, cfg *ssh.ServerConfig, idleTimeout time.Duration) (*ssh.ServerConn, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
+	ic := &netconn.IdleConn{Conn: nc}
+	ic.SetReadTimeout(sshHandshakeTimeout)
+	// Reads refresh the idle deadline, but cannot extend this absolute login
+	// window. Closing the transport also interrupts a blocked handshake write.
+	handshakeTimer := time.AfterFunc(sshHandshakeTimeout, func() { _ = nc.Close() })
+	defer handshakeTimer.Stop()
+	sshConn, chans, reqs, err := ssh.NewServerConn(ic, cfg)
+	handshakeTimer.Stop()
+	if err == nil {
+		ic.SetReadTimeout(idleTimeout)
+	}
+	return sshConn, chans, reqs, err
+}
+
 func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- CompletedUpload, authEvents chan<- AuthEvent, tempExts []string, idleTimeout time.Duration, sftpAllowChown bool) {
 	defer func() { _ = nc.Close() }()
 
-	// Wrap the raw connection so that every Read resets the read deadline.
-	// During the handshake we use sshHandshakeTimeout to prevent malicious
-	// clients from holding goroutines open indefinitely without completing
-	// the handshake (denial-of-service via resource exhaustion). After the
-	// handshake succeeds we switch to the per-session idle timeout so that
-	// authenticated but inactive sessions are eventually reaped.
-	ic := &netconn.IdleConn{Conn: nc}
-	ic.SetReadTimeout(sshHandshakeTimeout)
-	sshConn, chans, reqs, err := ssh.NewServerConn(ic, cfg)
+	sshConn, chans, reqs, err := acceptSSHConnection(nc, cfg, idleTimeout)
 	if err != nil {
-		log.Println("ssh handshake:", err)
+		if allowed, suppressed := s.authLogs.allow(time.Now()); allowed {
+			log.Printf("ssh handshake: %v (suppressed=%d)", err, suppressed)
+		}
 		return
 	}
-	// Handshake complete – switch to the idle-session deadline. A zero value
-	// disables the deadline.
-	ic.SetReadTimeout(idleTimeout)
 	defer func() { _ = sshConn.Close() }()
 
 	jailRoot := sshConn.Permissions.Extensions["jailRoot"]
@@ -183,18 +223,15 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- C
 	// force-close it if the account is later revoked.
 	s.setConnUser(nc, user)
 	log.Printf("login protocol=sftp user=%s root=%s from=%s", user, jailRoot, sshConn.RemoteAddr())
-	announceAuthEvent(authEvents, AuthEvent{
+	authEvent := AuthEvent{
 		Type:     AuthEventLoginSuccess,
 		Username: user,
 		ClientIP: clientIP,
 		Protocol: CompletedUploadProtocolSFTP,
-	})
-	defer announceAuthEvent(authEvents, AuthEvent{
-		Type:     AuthEventLogout,
-		Username: user,
-		ClientIP: clientIP,
-		Protocol: CompletedUploadProtocolSFTP,
-	})
+	}
+	announceAuthEvent(authEvents, authEvent)
+	authEvent.Type = AuthEventLogout
+	defer announceAuthEvent(authEvents, authEvent)
 
 	// Discard global requests
 	go ssh.DiscardRequests(reqs)
@@ -206,6 +243,8 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- C
 	// operation is still in flight and jailfs.FS.Close could race with it.
 	var sessionWG sync.WaitGroup
 	defer sessionWG.Wait()
+	sessionSlots := make(chan struct{}, positiveLimit(s.sshMaxChannels, defaultSSHMaxChannels))
+	handles := &sessionHandleBudget{owner: &s.sftpHandles, username: user}
 
 	for newCh := range chans {
 		if newCh.ChannelType() != "session" {
@@ -213,19 +252,28 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- C
 			continue
 		}
 
+		select {
+		case sessionSlots <- struct{}{}:
+		default:
+			_ = newCh.Reject(ssh.ResourceShortage, "session channel limit reached")
+			continue
+		}
+
 		ch, inReqs, err := newCh.Accept()
 		if err != nil {
+			<-sessionSlots
 			log.Println("accept channel:", err)
 			continue
 		}
 
 		sessionWG.Go(func() {
-			handleSession(ch, inReqs, jailRoot, user, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown)
+			defer func() { <-sessionSlots }()
+			handleSession(ch, inReqs, jailRoot, user, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown, handles)
 		})
 	}
 }
 
-func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool) {
+func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool, handles ...*sessionHandleBudget) {
 	defer func() {
 		recoverSFTPSessionPanic(username, clientIP, recover())
 		_ = ch.Close()
@@ -254,7 +302,7 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, usernam
 			// return rather than accumulating inside this for/switch — a
 			// defer placed directly in this case would survive across loop
 			// iterations if the trailing `return` were ever removed.
-			serveSFTPSubsystem(ch, jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown)
+			serveSFTPSubsystem(ch, jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown, handles...)
 			return
 
 		default:
@@ -267,8 +315,8 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot, usernam
 // to completion, and tears both down via defer so the cleanup is local to this
 // function and not to handleSession's loop body. Callers must already have
 // replied to the "subsystem" request before invoking it.
-func serveSFTPSubsystem(ch ssh.Channel, jailRoot, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool) {
-	handlers, fs, err := jailedHandlers(jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown)
+func serveSFTPSubsystem(ch ssh.Channel, jailRoot, username, clientIP string, canRead, canWrite bool, uploads chan<- CompletedUpload, tempExts []string, sftpAllowChown bool, handles ...*sessionHandleBudget) {
+	handlers, fs, err := jailedHandlers(jailRoot, username, clientIP, canRead, canWrite, uploads, tempExts, sftpAllowChown, handles...)
 	if err != nil {
 		log.Printf("open jail root %q: %v", jailRoot, err)
 		return

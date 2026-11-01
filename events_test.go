@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/pkg/sftp"
@@ -28,7 +29,7 @@ func TestSFTPServer_AuthEventsLoginSuccessAndLogout(t *testing.T) {
 		t.Fatalf("ssh.Dial: %v", err)
 	}
 
-	login := requireAuthEvent(t, srv.AuthEvents(), AuthEventLoginSuccess, "testuser", CompletedUploadProtocolSFTP)
+	login := requireAuthEventReason(t, srv.AuthEvents(), AuthEventLoginSuccess, "testuser", CompletedUploadProtocolSFTP, "")
 	if login.ClientIP == "" {
 		t.Fatal("LoginSuccess ClientIP is empty; want non-empty")
 	}
@@ -36,7 +37,7 @@ func TestSFTPServer_AuthEventsLoginSuccessAndLogout(t *testing.T) {
 	if err := conn.Close(); err != nil {
 		t.Fatalf("ssh client Close: %v", err)
 	}
-	logout := requireAuthEvent(t, srv.AuthEvents(), AuthEventLogout, "testuser", CompletedUploadProtocolSFTP)
+	logout := requireAuthEventReason(t, srv.AuthEvents(), AuthEventLogout, "testuser", CompletedUploadProtocolSFTP, "")
 	if logout.ClientIP == "" {
 		t.Fatal("Logout ClientIP is empty; want non-empty")
 	}
@@ -60,7 +61,7 @@ func TestSFTPServer_AuthEventsPasswordLoginFailed(t *testing.T) {
 		t.Fatal("expected authentication error, got nil")
 	}
 
-	failed := requireAuthEvent(t, srv.AuthEvents(), AuthEventLoginFailed, "testuser", CompletedUploadProtocolSFTP)
+	failed := requireAuthEventReason(t, srv.AuthEvents(), AuthEventLoginFailed, "testuser", CompletedUploadProtocolSFTP, AuthFailureCredentials)
 	if failed.ClientIP == "" {
 		t.Fatal("LoginFailed ClientIP is empty; want non-empty")
 	}
@@ -86,7 +87,7 @@ func TestSFTPServer_AuthEventsPublicKeyLoginFailed(t *testing.T) {
 		t.Fatal("expected public-key authentication error, got nil")
 	}
 
-	failed := requireAuthEvent(t, srv.AuthEvents(), AuthEventLoginFailed, "keyuser", CompletedUploadProtocolSFTP)
+	failed := requireAuthEventReason(t, srv.AuthEvents(), AuthEventLoginFailed, "keyuser", CompletedUploadProtocolSFTP, AuthFailureCredentials)
 	if failed.ClientIP == "" {
 		t.Fatal("LoginFailed ClientIP is empty; want non-empty")
 	}
@@ -299,7 +300,7 @@ func TestFTPServer_AuthEventsLoginSuccess(t *testing.T) {
 	client := dialFTP(t, addr)
 	client.login("ftpuser", "ftppw")
 
-	login := requireAuthEvent(t, srv.AuthEvents(), AuthEventLoginSuccess, "ftpuser", CompletedUploadProtocolFTP)
+	login := requireAuthEventReason(t, srv.AuthEvents(), AuthEventLoginSuccess, "ftpuser", CompletedUploadProtocolFTP, "")
 	if login.ClientIP == "" {
 		t.Fatal("LoginSuccess ClientIP is empty; want non-empty")
 	}
@@ -318,7 +319,7 @@ func TestFTPServer_AuthEventsLoginFailed(t *testing.T) {
 	client.command(331, "USER ftpuser")
 	client.command(530, "PASS wrongpw")
 
-	failed := requireAuthEvent(t, srv.AuthEvents(), AuthEventLoginFailed, "ftpuser", CompletedUploadProtocolFTP)
+	failed := requireAuthEventReason(t, srv.AuthEvents(), AuthEventLoginFailed, "ftpuser", CompletedUploadProtocolFTP, AuthFailureCredentials)
 	if failed.ClientIP == "" {
 		t.Fatal("LoginFailed ClientIP is empty; want non-empty")
 	}
@@ -336,10 +337,10 @@ func TestFTPServer_AuthEventsLogoutOnQuitAndDisconnect(t *testing.T) {
 
 		client := dialFTP(t, addr)
 		client.login("ftpuser", "ftppw")
-		requireAuthEvent(t, srv.AuthEvents(), AuthEventLoginSuccess, "ftpuser", CompletedUploadProtocolFTP)
+		requireAuthEventReason(t, srv.AuthEvents(), AuthEventLoginSuccess, "ftpuser", CompletedUploadProtocolFTP, "")
 
 		client.command(221, "QUIT")
-		logout := requireAuthEvent(t, srv.AuthEvents(), AuthEventLogout, "ftpuser", CompletedUploadProtocolFTP)
+		logout := requireAuthEventReason(t, srv.AuthEvents(), AuthEventLogout, "ftpuser", CompletedUploadProtocolFTP, "")
 		if logout.ClientIP == "" {
 			t.Fatal("Logout ClientIP is empty; want non-empty")
 		}
@@ -356,10 +357,10 @@ func TestFTPServer_AuthEventsLogoutOnQuitAndDisconnect(t *testing.T) {
 
 		client := dialFTP(t, addr)
 		client.login("ftpuser", "ftppw")
-		requireAuthEvent(t, srv.AuthEvents(), AuthEventLoginSuccess, "ftpuser", CompletedUploadProtocolFTP)
+		requireAuthEventReason(t, srv.AuthEvents(), AuthEventLoginSuccess, "ftpuser", CompletedUploadProtocolFTP, "")
 
 		_ = client.tp.Close()
-		logout := requireAuthEvent(t, srv.AuthEvents(), AuthEventLogout, "ftpuser", CompletedUploadProtocolFTP)
+		logout := requireAuthEventReason(t, srv.AuthEvents(), AuthEventLogout, "ftpuser", CompletedUploadProtocolFTP, "")
 		if logout.ClientIP == "" {
 			t.Fatal("Logout ClientIP is empty; want non-empty")
 		}
@@ -378,15 +379,15 @@ func TestFTPServer_AuthEventsUserLogsOutPreviousSession(t *testing.T) {
 
 	client := dialFTP(t, addr)
 	client.login("alice", "alicepw")
-	requireAuthEvent(t, srv.AuthEvents(), AuthEventLoginSuccess, "alice", CompletedUploadProtocolFTP)
+	requireAuthEventReason(t, srv.AuthEvents(), AuthEventLoginSuccess, "alice", CompletedUploadProtocolFTP, "")
 
 	client.command(331, "USER bob")
-	requireAuthEvent(t, srv.AuthEvents(), AuthEventLogout, "alice", CompletedUploadProtocolFTP)
+	requireAuthEventReason(t, srv.AuthEvents(), AuthEventLogout, "alice", CompletedUploadProtocolFTP, "")
 
 	client.command(230, "PASS bobpw")
-	requireAuthEvent(t, srv.AuthEvents(), AuthEventLoginSuccess, "bob", CompletedUploadProtocolFTP)
+	requireAuthEventReason(t, srv.AuthEvents(), AuthEventLoginSuccess, "bob", CompletedUploadProtocolFTP, "")
 	client.command(221, "QUIT")
-	requireAuthEvent(t, srv.AuthEvents(), AuthEventLogout, "bob", CompletedUploadProtocolFTP)
+	requireAuthEventReason(t, srv.AuthEvents(), AuthEventLogout, "bob", CompletedUploadProtocolFTP, "")
 }
 
 // TestSFTPServer_CompletedUploadsQueue verifies that after a file upload finishes
@@ -851,4 +852,62 @@ func TestSFTPServer_InterruptedUploadNotAnnounced(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		// expected: no notification for a truncated upload.
 	}
+}
+
+func requireAuthEventReason(t *testing.T, events <-chan AuthEvent, eventType AuthEventType, username, protocol string, reason AuthFailureReason) AuthEvent {
+	t.Helper()
+	event := requireAuthEvent(t, events, eventType, username, protocol)
+	if event.Reason != reason {
+		t.Fatalf("AuthEvent Reason = %q; want %q (event %+v)", event.Reason, reason, event)
+	}
+	return event
+}
+
+func TestAuthFailureReasons(t *testing.T) {
+	for _, protocol := range []string{CompletedUploadProtocolSFTP, CompletedUploadProtocolFTP, CompletedUploadProtocolHTTP} {
+		t.Run(protocol, func(t *testing.T) {
+			for _, tc := range []struct {
+				name      string
+				throttled bool
+				reason    AuthFailureReason
+			}{
+				{name: "credentials", reason: AuthFailureCredentials},
+				{name: "throttled", throttled: true, reason: AuthFailureThrottled},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					server := NewServer(&Config{})
+					server.authFailed("alice", "192.0.2.1", protocol, server.authEventsChan(), tc.throttled)
+					requireAuthEventReason(t, server.AuthEvents(), AuthEventLoginFailed, "alice", protocol, tc.reason)
+				})
+			}
+		})
+	}
+}
+
+func TestAuthFailureEventSampling(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		server := NewServer(&Config{AuthEventSize: 8})
+		events := server.authEventsChan()
+		server.authFailed("alice", "192.0.2.1", CompletedUploadProtocolHTTP, events, true)
+		requireAuthEventReason(t, events, AuthEventLoginFailed, "alice", CompletedUploadProtocolHTTP, AuthFailureThrottled)
+		// The queue is empty, but another throttled failure is still sampled out.
+		server.authFailed("alice", "192.0.2.1", CompletedUploadProtocolHTTP, events, true)
+		requireNoAuthEvent(t, events)
+		// Credential failures remain observable while diagnostic logs are sampled.
+		server.authFailed("alice", "192.0.2.1", CompletedUploadProtocolHTTP, events, false)
+		requireAuthEventReason(t, events, AuthEventLoginFailed, "alice", CompletedUploadProtocolHTTP, AuthFailureCredentials)
+		time.Sleep(time.Second)
+		server.authFailed("alice", "192.0.2.1", CompletedUploadProtocolHTTP, events, true)
+		requireAuthEventReason(t, events, AuthEventLoginFailed, "alice", CompletedUploadProtocolHTTP, AuthFailureThrottled)
+	})
+}
+
+func TestHTTPAuthEventsReasons(t *testing.T) {
+	server := newHTTPTestServer(t, map[string]UserInfo{
+		"alice": {Password: "rightpw", Root: t.TempDir(), CanWrite: true},
+	})
+	doHTTPUpload(t, server, "alice", "wrongpw", "file", "failed.txt", []byte("data"))
+	requireAuthEventReason(t, server.AuthEvents(), AuthEventLoginFailed, "alice", CompletedUploadProtocolHTTP, AuthFailureCredentials)
+	doHTTPUpload(t, server, "alice", "rightpw", "file", "success.txt", []byte("data"))
+	requireAuthEventReason(t, server.AuthEvents(), AuthEventLoginSuccess, "alice", CompletedUploadProtocolHTTP, "")
 }

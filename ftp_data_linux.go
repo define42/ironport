@@ -95,12 +95,19 @@ func (f *ftpSession) enterPassive(epsv bool) {
 		return
 	}
 
-	ln, err := f.server.listenFTPData(host)
+	ln, err := f.server.listenReservedFTPData(host, f.username, f.clientIP)
 	if err != nil {
 		_ = f.reply(425, ftpErrMsg(err))
 		return
 	}
+	f.dataMu.Lock()
+	if f.cancelled {
+		f.dataMu.Unlock()
+		_ = ln.Close()
+		return
+	}
 	f.dataLn = ln
+	f.dataMu.Unlock()
 
 	port := ln.Addr().(*net.TCPAddr).Port
 	if epsv {
@@ -170,7 +177,11 @@ func (f *ftpSession) enterActive(addr *net.TCPAddr) {
 		return
 	}
 	f.closeDataEndpoint()
-	f.dataAddr = addr
+	f.dataMu.Lock()
+	if !f.cancelled {
+		f.dataAddr = addr
+	}
+	f.dataMu.Unlock()
 	_ = f.reply(200, "active mode ready")
 }
 
@@ -244,25 +255,60 @@ func (f *ftpSession) acceptDataConn() (net.Conn, error) {
 		f.closeDataEndpoint()
 		return nil, errFTPDataProtectionRequired
 	}
-	dc, err := f.dialOrAcceptDataConn()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.dataMu.Lock()
+	if f.cancelled || f.controlReadClosed {
+		f.dataMu.Unlock()
+		return nil, net.ErrClosed
+	}
+	f.dataCancel = cancel
+	ln, addr := f.dataLn, f.dataAddr
+	f.dataMu.Unlock()
+	// Keep the passive permit through FTPS authentication, then release the
+	// listening port before starting the established transfer.
+	defer f.finishDataSetup()
+	var deadline time.Time
+	if timeout := f.server.effectiveFTPDataAcceptTimeout(); timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	if reserved, ok := ln.(*netconn.ExpiringListener); ok {
+		// PASV/EPSV starts the absolute lifetime; later commands cannot extend it.
+		deadline = reserved.Deadline()
+	}
+	dc, err := f.dialOrAcceptDataConn(ctx, ln, addr, deadline)
 	if err != nil {
 		return nil, err
 	}
+	return f.protectDataConn(ctx, dc, deadline)
+}
+
+func (f *ftpSession) protectDataConn(ctx context.Context, dc net.Conn, setupDeadline time.Time) (net.Conn, error) {
+	f.dataMu.Lock()
+	if f.cancelled || f.controlReadClosed {
+		f.dataMu.Unlock()
+		_ = dc.Close()
+		return nil, net.ErrClosed
+	}
+	f.dataConn = dc
+	f.dataMu.Unlock()
 	if f.dataProt != 'P' {
 		return dc, nil
 	}
-	// PROT P: wrap the raw data connection in TLS using this control session's
-	// private data config. Its ticket key accepts only tickets minted on this
-	// control connection, and it additionally requires DidResume. A failure
-	// tears the data connection down before any plaintext bytes can be exchanged.
+	// PROT P uses this control session's private data config, which requires
+	// resumption of its own ticket. The handshake is part of setup and cannot
+	// outlive the passive reservation.
 	if f.dataTLSConfig == nil {
 		_ = dc.Close()
 		return nil, errors.New("PROT P requested but FTPS is not configured")
 	}
 	deadline := time.Now().Add(ftpTLSHandshakeTimeout)
+	if !setupDeadline.IsZero() && setupDeadline.Before(deadline) {
+		deadline = setupDeadline
+	}
 	_ = dc.SetDeadline(deadline)
 	tc := tls.Server(dc, f.dataTLSConfig)
-	if err := tc.HandshakeContext(context.Background()); err != nil {
+	if err := tc.HandshakeContext(ctx); err != nil {
 		_ = dc.Close()
 		return nil, fmt.Errorf("data tls handshake: %w", err)
 	}
@@ -270,34 +316,25 @@ func (f *ftpSession) acceptDataConn() (net.Conn, error) {
 	return tc, nil
 }
 
-func (f *ftpSession) dialOrAcceptDataConn() (net.Conn, error) {
-	if f.dataLn != nil {
-		return f.acceptPassiveDataConn()
+func (f *ftpSession) dialOrAcceptDataConn(ctx context.Context, ln net.Listener, addr *net.TCPAddr, deadline time.Time) (net.Conn, error) {
+	if ln != nil {
+		return f.acceptPassiveDataConn(ln, deadline)
 	}
-	if f.dataAddr != nil {
-		return f.dialActiveDataConn()
+	if addr != nil {
+		return f.dialActiveDataConn(ctx, addr, deadline)
 	}
 	return nil, errors.New("data connection not prepared")
 }
 
-func (f *ftpSession) acceptPassiveDataConn() (net.Conn, error) {
-	ln := f.dataLn
-	f.dataLn = nil
-	defer func() { _ = ln.Close() }()
-
-	if tcpLn, ok := ln.(*net.TCPListener); ok {
-		if timeout := f.server.effectiveFTPDataAcceptTimeout(); timeout > 0 {
-			_ = tcpLn.SetDeadline(time.Now().Add(timeout))
-		}
+func (f *ftpSession) acceptPassiveDataConn(ln net.Listener, deadline time.Time) (net.Conn, error) {
+	if tcpLn, ok := ln.(interface{ SetDeadline(time.Time) error }); ok {
+		_ = tcpLn.SetDeadline(deadline)
 	}
-
 	dc, err := ln.Accept()
 	if err != nil {
 		return nil, err
 	}
-
-	// Prevent passive data-port stealing by requiring the data connection to
-	// originate from the same IP as the control connection.
+	// Prevent passive data-port stealing by requiring the control peer's IP.
 	if f.clientIP != "" && netconn.RemoteIP(dc.RemoteAddr()) != f.clientIP {
 		_ = dc.Close()
 		return nil, fmt.Errorf("data connection from unexpected IP %s", netconn.RemoteIP(dc.RemoteAddr()))
@@ -305,15 +342,10 @@ func (f *ftpSession) acceptPassiveDataConn() (net.Conn, error) {
 	return dc, nil
 }
 
-func (f *ftpSession) dialActiveDataConn() (net.Conn, error) {
-	addr := f.dataAddr
-	f.dataAddr = nil
-	dialer := net.Dialer{}
-	if timeout := f.server.effectiveFTPDataAcceptTimeout(); timeout > 0 {
-		dialer.Timeout = timeout
-	}
+func (f *ftpSession) dialActiveDataConn(ctx context.Context, addr *net.TCPAddr, deadline time.Time) (net.Conn, error) {
+	dialer := net.Dialer{Deadline: deadline}
 	log.Printf("ftp active data dial user=%s from=%s to=%s", f.username, f.conn.RemoteAddr(), addr)
-	return dialer.Dial("tcp", addr.String())
+	return dialer.DialContext(ctx, "tcp", addr.String())
 }
 
 // closeDataConn closes an FTP data connection. For TLS-wrapped data
@@ -337,13 +369,64 @@ func closeDataConn(dc net.Conn) {
 }
 
 func (f *ftpSession) closeDataListener() {
-	if f.dataLn != nil {
-		_ = f.dataLn.Close()
-		f.dataLn = nil
+	f.dataMu.Lock()
+	ln := f.dataLn
+	f.dataLn = nil
+	f.dataMu.Unlock()
+	if ln != nil {
+		_ = ln.Close()
 	}
 }
 
 func (f *ftpSession) closeDataEndpoint() {
 	f.closeDataListener()
+	f.dataMu.Lock()
 	f.dataAddr = nil
+	f.dataMu.Unlock()
+}
+
+func (f *ftpSession) finishDataSetup() {
+	f.closeDataEndpoint()
+	f.dataMu.Lock()
+	f.dataCancel = nil
+	f.dataMu.Unlock()
+}
+
+// A control-reader EOF interrupts pending setup while queued commands still
+// receive their replies. Established transfers consume EOF in runTransfer.
+func (f *ftpSession) controlReaderClosed() {
+	f.dataMu.Lock()
+	f.controlReadClosed = true
+	ln, dc, cancel := f.dataLn, f.dataConn, f.dataCancel
+	f.dataMu.Unlock()
+	if cancel == nil {
+		return
+	}
+	cancel()
+	if ln != nil {
+		_ = ln.Close()
+	}
+	if dc != nil {
+		_ = dc.Close()
+	}
+}
+
+// cancelDataOperations releases reservations and interrupts setup/transfer I/O
+// when this control connection is revoked, shut down, or finally torn down.
+func (f *ftpSession) cancelDataOperations() {
+	f.dataMu.Lock()
+	f.cancelled = true
+	ln, dc, cancel := f.dataLn, f.dataConn, f.dataCancel
+	f.dataLn, f.dataConn, f.dataCancel = nil, nil, nil
+	f.dataAddr = nil
+	f.dataMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if ln != nil {
+		_ = ln.Close()
+	}
+	if dc != nil {
+		_ = dc.Close()
+	}
 }

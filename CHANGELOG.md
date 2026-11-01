@@ -8,6 +8,40 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
+- Added configurable resource limits for combined SFTP/FTP control connections
+  (128 total, 32 per IP), SSH channels (16 per connection), SFTP file/directory
+  handles (256 total, 64 per user, 32 per connection), passive FTP reservations
+  (64 total, 2 per user, 8 per IP), and HTTP ingest requests (32 per server).
+  Settings are grouped under `Config.ResourceLimits` (`ResourceLimitConfig`),
+  including `SFTPMaxHandlesPerConnection` for the budget shared by SSH channels.
+  Zero or negative settings select finite defaults. Overload is rejected before
+  expensive work, and teardown returns admission capacity.
+- Added `Config.Validate()` for authentication-limit bounds. Invalid settings
+  prevent listener startup and make HTTP ingest fail with `503`; explicit
+  identity-table and backoff maximums are never silently enlarged. Added typed
+  `AuthEvent.Reason` values for credential failures and throttling. Throttled
+  events are sampled, including when the event queue has room.
+- Added `WithHTTPControl(http.Handler)` for use outside middleware that hides
+  optional response-writer interfaces. It preserves request-specific deadline
+  controls, so rejected slow HTTP bodies close before cleanup escapes admission
+  limits. Middleware forwarding only Hijacker falls back to closing HTTP/1
+  connections; missing controls produce a sampled integration diagnostic. The
+  demo installs the wrapper, and HTTP/2 rejections preserve other streams.
+- Authentication-table expiry now retains depleted buckets and active cooldowns;
+  a long configured refill interval can no longer be shortened by idle expiry.
+- HTTP admission now covers the complete request body, including multipart
+  epilogues, while preserving keepalive after full body consumption. SSH
+  public-key login consumes one token per bucket for query and proof together,
+  with credential/backoff rechecks at proof and fresh admission on retries.
+- Added absolute 30-second SSH/FTP login deadlines, passive reservation expiry
+  from PASV/EPSV, and shared server/IP/username authentication throttling across
+  protocols. Repeated failures trigger bounded exponential cooldown; FTP also
+  caps failures per connection. HTTP credentials are size-bounded, and early
+  rejections stop body reads. The HTTP demo now includes read/write/idle
+  timeouts and a header-size cap. Negative `FtpDataAcceptTimeout` disables only
+  active-mode dial deadlines; passive reservations remain finite. These finite
+  defaults can reject work that was previously admitted without a limit.
+
 - Added an HTTP upload endpoint: `Server.HttpIngest()` returns an
   `http.HandlerFunc` that callers mount on their own router. It accepts a
   `multipart/form-data` POST with the file under the `file` field (`key=file`),
