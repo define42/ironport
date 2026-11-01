@@ -100,12 +100,10 @@ func (j jail) Fileread(r *sftp.Request) (reader io.ReaderAt, err error) {
 // uploads; the completion notification will instead be emitted when the client
 // renames the file to its final name (see jail.Filecmd "Rename").
 //
-// When pkg/sftp's RequestServer aborts an in-flight transfer (typically
-// because the client dropped the connection mid-upload, or sent an explicit
-// error packet), it invokes TransferError(err) on the writer before calling
-// Close. writeLogger records that error in transferErr so Close knows the
-// upload is truncated and must NOT be announced on the CompletedUploads
-// channel; otherwise consumers would treat a partial file as complete.
+// Write errors and transfer aborts are recorded through TransferError so Close
+// does not announce a failed upload on CompletedUploads. pkg/sftp invokes
+// TransferError when aborting a transfer, but WriteAt must record its own
+// errors: a failed WRITE can be followed by a normal, successful CLOSE.
 type writeLogger struct {
 	*os.File
 
@@ -116,20 +114,16 @@ type writeLogger struct {
 	uploads      chan<- CompletedUpload
 	tempExts     []string
 	appendMode   bool
-	// mu guards transferErr against the race between TransferError (invoked
-	// asynchronously from the request-server's drain path when the client
-	// connection drops mid-transfer) and Close (invoked from the per-request
-	// worker goroutine that handled the SSH_FXP_WRITE packets).
+	// mu guards transferErr across writes, transfer-abort callbacks, and Close.
 	mu sync.Mutex
-	// transferErr records the first error reported via TransferError. Only
-	// the first error is retained ("first error wins"); subsequent calls
-	// from the drain path are no-ops because the upload is already known
-	// to be poisoned and further error detail would not change the
-	// "do not announce" decision in Close.
+	// transferErr retains the first write or transfer error. Later successful
+	// writes cannot restore completion notification for this handle.
 	transferErr error
 }
 
 func (w *writeLogger) WriteAt(p []byte, off int64) (n int, err error) {
+	// Run after panic recovery so every returned write error marks the upload.
+	defer func() { w.TransferError(err) }()
 	defer deferRecoverSFTPPanicf(&err, func() { n = 0 }, "sftp write panic user=%q ip=%q path=%q: %v\n%s", w.username, w.clientIP, w.filepath)()
 	if w.appendMode {
 		// O_APPEND semantics (open(2)): on every write the kernel
@@ -142,12 +136,9 @@ func (w *writeLogger) WriteAt(p []byte, off int64) (n int, err error) {
 	return w.File.WriteAt(p, off)
 }
 
-// TransferError implements pkg/sftp's optional TransferError interface. It is
-// invoked by the request server when the in-flight transfer is aborted (for
-// example, the client connection dropped or the client sent an SSH_FXP_CLOSE
-// after an error packet). Recording the error marks the upload as poisoned so
-// the subsequent Close does not announce a CompletedUpload event for what is
-// in fact a truncated file.
+// TransferError implements pkg/sftp's optional TransferError interface for
+// aborted transfers. WriteAt also calls it for write failures. Recording the
+// first error suppresses CompletedUpload notification when the handle closes.
 func (w *writeLogger) TransferError(err error) {
 	if err == nil {
 		return

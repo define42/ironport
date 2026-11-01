@@ -1193,6 +1193,123 @@ func TestSFTPServer_SymlinkRejected(t *testing.T) {
 	}
 }
 
+func TestWriteLogger_WriteFailureSuppressesNotification(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		appendMode bool
+	}{
+		{"ordinary", false},
+		{"append", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			flags := os.O_RDONLY
+			if tc.appendMode {
+				flags |= os.O_APPEND
+			}
+			wl, uploads, _ := newWriteLoggerFailureFixture(t, flags, tc.appendMode)
+			n, firstErr := wl.WriteAt([]byte("first"), 0)
+			if n != 0 || !errors.Is(firstErr, syscall.EBADF) {
+				t.Fatalf("read-only WriteAt = %d, %v; want 0, EBADF", n, firstErr)
+			}
+			if n, err := wl.WriteAt([]byte("second"), 9); n != 0 || !errors.Is(err, syscall.EBADF) {
+				t.Fatalf("second read-only WriteAt = %d, %v; want 0, EBADF", n, err)
+			}
+			assertWriteLoggerFirstError(t, wl, firstErr)
+			closeWriteLoggerWithoutNotification(t, wl, uploads)
+		})
+	}
+}
+
+func TestWriteLogger_LaterWriteSuccessPreservesFailure(t *testing.T) {
+	wl, uploads, disk := newWriteLoggerFailureFixture(t, os.O_RDWR, false)
+	n, firstErr := wl.WriteAt([]byte("bad"), -1)
+	if n != 0 || firstErr == nil {
+		t.Fatalf("negative-offset WriteAt = %d, %v; want 0 and an error", n, firstErr)
+	}
+	if n, err := wl.WriteAt([]byte("ok"), 0); n != 2 || err != nil {
+		t.Fatalf("subsequent WriteAt = %d, %v; want 2, nil", n, err)
+	}
+	assertWriteLoggerFirstError(t, wl, firstErr)
+	closeWriteLoggerWithoutNotification(t, wl, uploads)
+	contents, err := disk.ReadFile("upload.bin")
+	if err != nil || string(contents) != "okiginal" {
+		t.Fatalf("contents after successful later write = %q, %v; want okiginal", contents, err)
+	}
+}
+
+func TestWriteLogger_RecoveredWritePanicRecordsFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		appendMode bool
+	}{
+		{"ordinary", false},
+		{"append", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// A zero-value os.File has no internal descriptor state. Its write
+			// panics without owning any resource that needs Close or cleanup.
+			wl := &writeLogger{File: new(os.File), appendMode: tc.appendMode}
+			n, err := wl.WriteAt([]byte("x"), 0)
+			if n != 0 || !errors.Is(err, errSFTPRequestFailed) {
+				t.Fatalf("recovered WriteAt = %d, %v; want 0 and request failure", n, err)
+			}
+			assertWriteLoggerFirstError(t, wl, err)
+		})
+	}
+}
+
+func newWriteLoggerFailureFixture(t *testing.T, flags int, appendMode bool) (*writeLogger, <-chan CompletedUpload, *os.Root) {
+	t.Helper()
+	root := t.TempDir()
+	disk, err := os.OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = disk.Close() })
+	if err := disk.WriteFile("upload.bin", []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := disk.OpenFile("upload.bin", flags, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+	uploads := make(chan CompletedUpload, 1)
+	return &writeLogger{
+		File:         file,
+		filepath:     "/upload.bin",
+		fullFilepath: filepath.Join(root, "upload.bin"),
+		username:     "alice",
+		clientIP:     "127.0.0.1",
+		uploads:      uploads,
+		appendMode:   appendMode,
+	}, uploads, disk
+}
+
+func assertWriteLoggerFirstError(t *testing.T, wl *writeLogger, firstErr error) {
+	t.Helper()
+	wl.mu.Lock()
+	got := wl.transferErr
+	wl.mu.Unlock()
+	if !errors.Is(got, firstErr) {
+		t.Errorf("recorded write failure = %v; want original error %v", got, firstErr)
+	}
+}
+
+func closeWriteLoggerWithoutNotification(t *testing.T, wl *writeLogger, uploads <-chan CompletedUpload) {
+	t.Helper()
+	// Keep Close successful: a close-before-write fixture would suppress
+	// completion for the wrong reason and hide the missing write-error state.
+	if err := wl.Close(); err != nil {
+		t.Fatalf("Close after failed WriteAt = %v; want nil", err)
+	}
+	select {
+	case evt := <-uploads:
+		t.Errorf("failed write emitted CompletedUpload: %+v", evt)
+	default:
+	}
+}
+
 // TestWriteLogger_TransferErrorSuppressesNotification verifies that when
 // pkg/sftp invokes TransferError on the writer before Close (i.e. the
 // in-flight upload was aborted), the subsequent Close does NOT enqueue a

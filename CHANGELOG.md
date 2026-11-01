@@ -8,6 +8,10 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
+- SFTP handles now retain write errors, including append failures, so a later
+  successful `CLOSE` does not emit a false `CompletedUploads` event. Successful
+  writes after a failure do not clear that handle's failed-upload state.
+
 - File reads, writes, truncation, and chmod now validate a pinned inode before
   opening it for I/O, rejecting FIFOs, sockets, and devices without triggering
   their open behavior. Existing files are reopened through `/proc/self/fd`, and
