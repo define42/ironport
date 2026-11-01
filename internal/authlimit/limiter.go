@@ -3,86 +3,91 @@ package authlimit
 
 import (
 	"crypto/sha256"
-	"math"
+	"hash/maphash"
 	"net/netip"
 	"sync"
 	"time"
 )
 
-type bucket struct {
-	tokens       float64
-	updated      time.Time
-	seen         time.Time
-	blockedUntil time.Time
-	failures     int
-}
-
-// available reports the bucket's refilled token count and any required wait
-// without mutating the bucket. Callers can therefore inspect every bucket
-// before committing an authentication attempt to any of them.
-func (b *bucket) available(now time.Time, burst int, interval time.Duration) (float64, time.Duration) {
-	tokens := b.tokens
-	if b.updated.IsZero() {
-		tokens = float64(burst)
-	} else if now.After(b.updated) {
-		tokens = math.Min(float64(burst), tokens+float64(now.Sub(b.updated))/float64(interval))
-	}
-	if now.Before(b.blockedUntil) {
-		return tokens, b.blockedUntil.Sub(now)
-	}
-	if tokens < 1 {
-		retry := math.Ceil((1 - tokens) * float64(interval))
-		// float64 rounds MaxInt64 up to 2^63. Saturate before converting so
-		// a long refill interval cannot wrap negative and admit extra work.
-		if retry >= float64(math.MaxInt64) {
-			return tokens, time.Duration(math.MaxInt64)
-		}
-		return tokens, time.Duration(retry)
-	}
-	return tokens, 0
-}
-
-func (b *bucket) consume(now time.Time, tokens float64) {
-	b.tokens = tokens - 1
-	b.updated = now
-	b.seen = now
-}
-
-type identity struct {
-	kind byte
-	hash [32]byte
-}
-
-func identities(username, clientIP string) [2]identity {
-	if ip, err := netip.ParseAddr(clientIP); err == nil {
-		clientIP = ip.Unmap().String()
-	} else {
-		// Invalid/missing transport addresses share a single bucket, preventing
-		// callers from creating unbounded distinct non-IP identities.
-		clientIP = "unknown"
-	}
-	return [2]identity{{kind: 'i', hash: sha256.Sum256([]byte(clientIP))}, {kind: 'u', hash: sha256.Sum256([]byte(username))}}
+// Attempt identifies the buckets charged by a successful admission. Its zero
+// value is invalid. Retain it through verification so results and SSH proofs
+// use exactly the source and username slots charged at admission.
+type Attempt struct {
+	owner    *Limiter
+	ip       int
+	user     int
+	username [32]byte
 }
 
 // Limiter shares authentication budgets and backoff across concurrent callers.
+// Fixed, privately hashed partitions bound memory without a table-full lockout.
+// Collisions share limits conservatively; they never replace active state.
 // Construct it with New; its zero value is not ready for use.
 type Limiter struct {
 	mu        sync.Mutex
 	config    Config
+	seed      maphash.Seed
 	global    bucket
-	entries   map[identity]*bucket
-	nextSweep time.Time
+	ips       map[int]*bucket
+	users     map[int]*userBucket
+	ipCount   int
+	userCount int
 	lastTime  time.Time
 }
 
-// New creates an authentication limiter with bounded identity storage.
+// New creates a limiter with MaxEntries lazily allocated slots, split between
+// source addresses and supplied usernames. Account existence never changes
+// admission or result accounting.
 func New(config Config) *Limiter {
-	return &Limiter{config: config.WithDefaults(), entries: make(map[identity]*bucket)}
+	config = config.WithDefaults()
+	ipCount := config.MaxEntries / 2
+	return &Limiter{
+		config:    config,
+		seed:      maphash.MakeSeed(),
+		ips:       make(map[int]*bucket),
+		users:     make(map[int]*userBucket),
+		ipCount:   ipCount,
+		userCount: config.MaxEntries - ipCount,
+	}
 }
 
-// advanceTime serializes caller timestamps while l.mu is held. Callers may
-// capture time before waiting for the mutex, so arrival order can differ from
-// timestamp order. Never move refill, idle-expiry, or backoff accounting back.
+// sourceIdentity groups IPv6 hosts by /64, ignoring interface zones. IPv4 and
+// IPv4-mapped IPv6 addresses share their exact IPv4 identity.
+func sourceIdentity(clientIP string) string {
+	ip, err := netip.ParseAddr(clientIP)
+	if err != nil {
+		return "unknown"
+	}
+	ip = ip.Unmap().WithZone("")
+	if ip.Is6() {
+		return netip.PrefixFrom(ip, 64).Masked().String()
+	}
+	return ip.String()
+}
+
+func (l *Limiter) locate(username, clientIP string) Attempt {
+	attempt := Attempt{owner: l, username: sha256.Sum256([]byte(username))}
+	attempt.ip = slotIndex(maphash.String(l.seed, sourceIdentity(clientIP)), l.ipCount)
+	attempt.user = slotIndex(maphash.Bytes(l.seed, attempt.username[:]), l.userCount)
+	return attempt
+}
+
+func slotIndex(hash uint64, count int) int {
+	if count <= 0 {
+		return -1
+	}
+	//nolint:gosec // G115: modulo a positive int bounds the result below count and therefore MaxInt.
+	return int(hash % uint64(count))
+}
+
+func (l *Limiter) valid(attempt Attempt) bool {
+	return attempt.owner == l && attempt.owner != nil &&
+		attempt.ip >= 0 && attempt.ip < l.ipCount &&
+		attempt.user >= 0 && attempt.user < l.userCount
+}
+
+// advanceTime serializes caller timestamps while l.mu is held. Never move
+// refill, idle-expiry, or backoff accounting back for a queued caller.
 func (l *Limiter) advanceTime(now time.Time) time.Time {
 	if now.After(l.lastTime) {
 		l.lastTime = now
@@ -90,145 +95,110 @@ func (l *Limiter) advanceTime(now time.Time) time.Time {
 	return l.lastTime
 }
 
-// Allow consumes one attempt when every bucket and the identity table admit it.
-// It returns zero on admission or the required retry delay on rejection.
-func (l *Limiter) Allow(username, clientIP string, now time.Time) time.Duration {
+// Allow consumes one attempt when every applicable bucket admits it. A positive
+// retry returns an invalid Attempt and consumes no tokens. Every supplied
+// username receives the same controls, including nonexistent accounts.
+func (l *Limiter) Allow(username, clientIP string, now time.Time) (Attempt, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.ipCount == 0 || l.userCount == 0 {
+		return Attempt{}, time.Second
+	}
 	now = l.advanceTime(now)
 	globalTokens, retry := l.global.available(now, l.config.GlobalBurst, l.config.GlobalInterval)
 	if retry > 0 {
-		return retry
+		return Attempt{}, retry
 	}
-	// Inspect the global bucket first so an exhausted server-wide bucket
-	// rejects before identity hashing. Do not consume it until every identity
-	// bucket and the bounded identity table have also admitted the request.
-	keys := identities(username, clientIP)
-	l.expireEntries(now)
-	missing := 0
-	for _, key := range keys {
-		if l.entries[key] == nil {
-			missing++
-		}
+	// Check the global budget before hashing attacker-controlled identities.
+	attempt := l.locate(username, clientIP)
+	tokens, retry := l.available(attempt, now)
+	if retry > 0 {
+		return Attempt{}, retry
 	}
-	if len(l.entries)+missing > l.config.MaxEntries {
+	l.global.consume(now, globalTokens)
+	if l.ips[attempt.ip] == nil {
+		l.ips[attempt.ip] = &bucket{}
+	}
+	l.ips[attempt.ip].consume(now, tokens[0])
+	if l.users[attempt.user] == nil {
+		l.users[attempt.user] = &userBucket{}
+	}
+	l.users[attempt.user].consume(now, tokens[1])
+	return attempt, 0
+}
+
+func (l *Limiter) available(attempt Attempt, now time.Time) ([2]float64, time.Duration) {
+	var tokens [2]float64
+	var retry time.Duration
+	tokens[0], retry = l.ipAvailable(attempt.ip, now)
+	var userRetry time.Duration
+	tokens[1], userRetry = l.userAvailable(attempt.user, now)
+	return tokens, max(retry, userRetry)
+}
+
+func (l *Limiter) ipAvailable(slot int, now time.Time) (float64, time.Duration) {
+	ip := l.ips[slot]
+	if ip == nil {
+		return float64(l.config.IPBurst), 0
+	}
+	ip.expire(now, l.config.IPBurst, l.config.IPInterval, l.config)
+	return ip.available(now, l.config.IPBurst, l.config.IPInterval)
+}
+
+func (l *Limiter) userAvailable(slot int, now time.Time) (float64, time.Duration) {
+	user := l.users[slot]
+	if user == nil {
+		return float64(l.config.UserBurst), 0
+	}
+	user.prepare(now, l.config)
+	return user.available(now, l.config.UserBurst, l.config.UserInterval)
+}
+
+// RetryBackoff checks an admitted attempt without charging another token. SSH
+// uses it between a public-key query and proof. Invalid/foreign attempts fail
+// closed; callers must obtain a fresh admission instead of manufacturing one.
+func (l *Limiter) RetryBackoff(attempt Attempt, now time.Time) time.Duration {
+	if !l.valid(attempt) {
 		return time.Second
 	}
-	var buckets [2]*bucket
-	var tokens [2]float64
-	for i, key := range keys {
-		b := l.entries[key]
-		buckets[i] = b
-		burst, interval := l.config.IPBurst, l.config.IPInterval
-		if i == 1 {
-			burst, interval = l.config.UserBurst, l.config.UserInterval
-		}
-		if b == nil {
-			tokens[i] = float64(burst)
-			continue
-		}
-		var bucketRetry time.Duration
-		tokens[i], bucketRetry = b.available(now, burst, interval)
-		retry = max(retry, bucketRetry)
-	}
-	if retry > 0 {
-		return retry
-	}
-
-	// The mutex makes the checks and commits one transaction: no bucket state
-	// can change between inspection and consumption.
-	l.global.consume(now, globalTokens)
-	for i, key := range keys {
-		b := buckets[i]
-		if b == nil {
-			b = &bucket{}
-			l.entries[key] = b
-		}
-		b.consume(now, tokens[i])
-	}
-	return 0
-}
-
-// RetryBackoff checks an already-admitted attempt without consuming another
-// token. SSH uses it when a public-key query is followed by signature proof.
-func (l *Limiter) RetryBackoff(username, clientIP string, now time.Time) time.Duration {
-	keys := identities(username, clientIP)
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	now = l.advanceTime(now)
-	var retry time.Duration
-	for _, key := range keys {
-		if bucket := l.entries[key]; bucket != nil && now.Before(bucket.blockedUntil) {
-			retry = max(retry, bucket.blockedUntil.Sub(now))
-		}
+	if l.ips[attempt.ip] == nil || l.users[attempt.user] == nil {
+		return time.Second
 	}
-	return retry
+	now = l.advanceTime(now)
+	retry := max(time.Duration(0), l.ips[attempt.ip].blockedUntil.Sub(now))
+	return max(retry, l.users[attempt.user].blockedUntil.Sub(now))
 }
 
-// expireEntries reclaims inactive identities while l.mu is held.
-func (l *Limiter) expireEntries(now time.Time) {
-	if now.Before(l.nextSweep) {
+// Result records completed verification against the original admission slots.
+// Invalid/foreign attempts are ignored. Success never clears source penalties
+// or a username slot containing failures from distinct usernames; those decay
+// by one failure per BackoffMax without another failure.
+func (l *Limiter) Result(attempt Attempt, success bool, now time.Time) {
+	if !l.valid(attempt) {
 		return
 	}
-	for key, bucket := range l.entries {
-		if now.Sub(bucket.seen) < l.config.EntryTTL {
-			continue
-		}
-		// Recreating an identity grants a full burst, so retain any token
-		// deficit and any cooldown established after its last admission.
-		burst, interval := l.config.IPBurst, l.config.IPInterval
-		if key.kind == 'u' {
-			burst, interval = l.config.UserBurst, l.config.UserInterval
-		}
-		tokens, retry := bucket.available(now, burst, interval)
-		if tokens >= float64(burst) && retry == 0 {
-			delete(l.entries, key)
-		}
-	}
-	l.nextSweep = now.Add(min(time.Minute, l.config.EntryTTL))
-}
-
-// Result records a completed credential verification for an admitted attempt.
-func (l *Limiter) Result(username, clientIP string, success bool, now time.Time) {
-	keys := identities(username, clientIP)
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.ips[attempt.ip] == nil || l.users[attempt.user] == nil {
+		return
+	}
 	now = l.advanceTime(now)
-	if success {
-		// A successful username proves nothing about other authentication
-		// attempts from the same IP. Preserve shared-IP backoff so one valid
-		// low-privilege account cannot mask password spraying against others.
-		if b := l.entries[keys[1]]; b != nil {
-			b.failures = 0
-			b.blockedUntil = time.Time{}
-		}
-		return
+	ip := l.ips[attempt.ip]
+	ip.seen = now
+	ip.forget(now, l.config.BackoffMax)
+	if !success {
+		ip.recordFailure(now, l.config)
 	}
-	for _, key := range keys {
-		b := l.entries[key]
-		if b == nil {
-			continue
-		}
-		b.recordFailure(now, l.config)
+	user := l.users[attempt.user]
+	user.seen = now
+	user.forget(now, l.config.BackoffMax)
+	if !success {
+		// A delayed failure may arrive after idle expiry and a new owner.
+		user.observe(attempt.username)
+		user.recordFailure(now, l.config)
+	} else if user.owned && !user.mixed && user.owner == attempt.username {
+		user.clearFailures()
 	}
-}
-
-// recordFailure advances the bucket's backoff while its limiter mutex is held.
-func (b *bucket) recordFailure(now time.Time, config Config) {
-	// Saturating count avoids integer overflow under prolonged attacks.
-	if b.failures < 64 {
-		b.failures++
-	}
-	if b.failures < 3 {
-		return
-	}
-	delay := config.BackoffInitial
-	for n := 3; n < b.failures && delay < config.BackoffMax; n++ {
-		if delay > config.BackoffMax/2 {
-			delay = config.BackoffMax
-			break
-		}
-		delay *= 2
-	}
-	b.blockedUntil = now.Add(min(delay, config.BackoffMax))
 }

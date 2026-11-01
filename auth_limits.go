@@ -12,8 +12,10 @@ import (
 
 // AuthLimitConfig bounds authentication work across SSH, FTP, and HTTP.
 // All non-positive fields select secure defaults; limits cannot be disabled.
-// Limits apply to successful and failed authentication attempts. Client IPs
-// come only from the transport peer; forwarded headers are never trusted.
+// Limits apply to successful and failed authentication attempts. Source budgets
+// use individual IPv4 addresses and IPv6 /64 prefixes. Addresses come only from
+// the transport peer; forwarded headers are never trusted. Every supplied username
+// consumes the same budgets, whether or not the account currently exists.
 type AuthLimitConfig struct {
 	// GlobalBurst and GlobalInterval default to 200 attempts and one token per
 	// 10 ms. IPBurst/IPInterval default to 30 and one per second; UserBurst/
@@ -24,12 +26,15 @@ type AuthLimitConfig struct {
 	IPInterval     time.Duration
 	UserBurst      int
 	UserInterval   time.Duration
-	// MaxEntries bounds the combined IP and username table (default 8192).
-	// A positive value must be at least two (one IP and one username).
-	// New identities are denied when full until entries expire. EntryTTL is
-	// the minimum idle time before expiry, defaults to 15 minutes, and is never
-	// shorter than the maximum backoff. Entries remain until their tokens have
-	// fully refilled and any active backoff has elapsed.
+	// MaxEntries bounds source and username buckets (default 8192).
+	// A positive value must be at least two. Half the slots serve sources and
+	// the remainder serve usernames. Private hashing assigns stable slots;
+	// collisions share budgets and backoff rather than evicting active state
+	// or rejecting all new identities when storage fills. Smaller limits
+	// increase collateral throttling. EntryTTL is the minimum idle time before
+	// resetting a slot, defaults to 15 minutes, and is never shorter than the
+	// maximum backoff. Reset also requires full tokens, elapsed cooldown, and
+	// fully decayed failures, so a short EntryTTL cannot restart backoff early.
 	MaxEntries int
 	EntryTTL   time.Duration
 	// Backoff starts after three failed verifications and doubles after each
@@ -39,8 +44,13 @@ type AuthLimitConfig struct {
 	// values with BackoffInitial greater than BackoffMax fail Config.Validate.
 	// An unset maximum is raised to an explicit initial value above 30 seconds.
 	// Backoff rejects attempts immediately; it never sleeps in a handler.
-	// Successful authentication clears only that username's backoff; shared-IP
-	// failure state remains until the entry expires.
+	// Successful authentication clears a username slot's failure history only
+	// when all retained failures belong to that username. Unsigned key queries
+	// do not change failure ownership. Source and mixed-username failure state
+	// is not cleared by success; each slot forgets one failure per BackoffMax
+	// without another failure, so a finished attack's penalties fade while the
+	// slot stays active. Steady failures still hold maximum backoff for any
+	// EntryTTL.
 	BackoffInitial time.Duration
 	BackoffMax     time.Duration
 }
@@ -64,17 +74,19 @@ func (s *Server) authControl() *authlimit.Limiter {
 	return s.authLimiter
 }
 
-func (s *Server) allowAuth(username, clientIP string) time.Duration {
+func (s *Server) allowAuth(username, clientIP string) (authlimit.Attempt, time.Duration) {
+	// Admission depends only on the supplied identities, so account changes
+	// cannot bypass an existing username budget or cooldown.
 	return s.authControl().Allow(username, clientIP, time.Now())
 }
 
-func (s *Server) authSucceeded(username, clientIP string) {
-	s.authControl().Result(username, clientIP, true, time.Now())
+func (s *Server) authSucceeded(attempt authlimit.Attempt) {
+	s.authControl().Result(attempt, true, time.Now())
 }
 
-func (s *Server) authFailed(username, clientIP, protocol string, events chan<- AuthEvent, throttled bool) {
+func (s *Server) authFailed(attempt authlimit.Attempt, username, clientIP, protocol string, events chan<- AuthEvent, throttled bool) {
 	if !throttled {
-		s.authControl().Result(username, clientIP, false, time.Now())
+		s.authControl().Result(attempt, false, time.Now())
 	}
 	s.reportAuthFailure(username, clientIP, protocol, events, throttled)
 }

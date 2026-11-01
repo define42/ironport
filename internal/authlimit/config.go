@@ -2,7 +2,7 @@ package authlimit
 
 import "time"
 
-// Config sets token-bucket, identity-table, and backoff limits.
+// Config sets token-bucket, fixed-slot, and backoff limits.
 // Non-positive fields select defaults. Callers validate contradictory settings.
 type Config struct {
 	GlobalBurst    int

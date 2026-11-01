@@ -66,15 +66,16 @@ func TestAuthExplicitBackoffBounds(t *testing.T) {
 			limiter := newAuthLimiter(tt.config)
 			now := time.Now()
 			for range 3 {
-				if retry := limiter.Allow("u", "192.0.2.1", now); retry != 0 {
+				attempt, retry := limiter.Allow("u", "192.0.2.1", now)
+				if retry != 0 {
 					t.Fatalf("attempt before backoff: %v", retry)
 				}
-				limiter.Result("u", "192.0.2.1", false, now)
+				limiter.Result(attempt, false, now)
 			}
-			if retry := limiter.Allow("u", "192.0.2.1", now); retry != tt.want {
+			if _, retry := limiter.Allow("u", "192.0.2.1", now); retry != tt.want {
 				t.Fatalf("backoff = %v; want configured bound %v", retry, tt.want)
 			}
-			if retry := limiter.Allow("u", "192.0.2.1", now.Add(tt.want)); retry != 0 {
+			if _, retry := limiter.Allow("u", "192.0.2.1", now.Add(tt.want)); retry != 0 {
 				t.Fatalf("bound elapsed but authentication still blocked for %v", retry)
 			}
 		})

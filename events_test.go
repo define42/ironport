@@ -876,7 +876,7 @@ func TestAuthFailureReasons(t *testing.T) {
 			} {
 				t.Run(tc.name, func(t *testing.T) {
 					server := NewServer(&Config{})
-					server.authFailed("alice", "192.0.2.1", protocol, server.authEventsChan(), tc.throttled)
+					server.authFailed(requireAuthAdmission(t, server, "alice", "192.0.2.1"), "alice", "192.0.2.1", protocol, server.authEventsChan(), tc.throttled)
 					requireAuthEventReason(t, server.AuthEvents(), AuthEventLoginFailed, "alice", protocol, tc.reason)
 				})
 			}
@@ -888,16 +888,16 @@ func TestAuthFailureEventSampling(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		server := NewServer(&Config{AuthEventSize: 8})
 		events := server.authEventsChan()
-		server.authFailed("alice", "192.0.2.1", CompletedUploadProtocolHTTP, events, true)
+		server.authFailed(requireAuthAdmission(t, server, "alice", "192.0.2.1"), "alice", "192.0.2.1", CompletedUploadProtocolHTTP, events, true)
 		requireAuthEventReason(t, events, AuthEventLoginFailed, "alice", CompletedUploadProtocolHTTP, AuthFailureThrottled)
 		// The queue is empty, but another throttled failure is still sampled out.
-		server.authFailed("alice", "192.0.2.1", CompletedUploadProtocolHTTP, events, true)
+		server.authFailed(requireAuthAdmission(t, server, "alice", "192.0.2.1"), "alice", "192.0.2.1", CompletedUploadProtocolHTTP, events, true)
 		requireNoAuthEvent(t, events)
 		// Credential failures remain observable while diagnostic logs are sampled.
-		server.authFailed("alice", "192.0.2.1", CompletedUploadProtocolHTTP, events, false)
+		server.authFailed(requireAuthAdmission(t, server, "alice", "192.0.2.1"), "alice", "192.0.2.1", CompletedUploadProtocolHTTP, events, false)
 		requireAuthEventReason(t, events, AuthEventLoginFailed, "alice", CompletedUploadProtocolHTTP, AuthFailureCredentials)
 		time.Sleep(time.Second)
-		server.authFailed("alice", "192.0.2.1", CompletedUploadProtocolHTTP, events, true)
+		server.authFailed(requireAuthAdmission(t, server, "alice", "192.0.2.1"), "alice", "192.0.2.1", CompletedUploadProtocolHTTP, events, true)
 		requireAuthEventReason(t, events, AuthEventLoginFailed, "alice", CompletedUploadProtocolHTTP, AuthFailureThrottled)
 	})
 }

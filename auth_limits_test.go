@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/define42/ironport/internal/authlimit"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -60,36 +61,36 @@ func TestSSHKeyProofUsesSharedAuthenticationLimit(t *testing.T) {
 			server := NewServer(&Config{
 				SftpSigner: testSigner(t),
 				Users:      map[string]UserInfo{"alice": {Root: t.TempDir(), AuthorizedKeys: []ssh.PublicKey{key}}},
+				AuthLimits: AuthLimitConfig{BackoffInitial: time.Hour, BackoffMax: time.Hour},
 			})
 			limiter := server.authControl()
-			// Seed failures from another IP so only the username can carry
-			// backoff across the unsigned query and its later signature proof.
-			if retry := limiter.Allow("alice", "192.0.2.1", time.Now()); retry != 0 {
-				t.Fatal(retry)
-			}
-			for range 2 {
-				limiter.Result("alice", "192.0.2.1", false, time.Now())
+			failures, metadata := newSSHProofFailureAttempts(t, limiter)
+			for _, attempt := range failures[:2] {
+				limiter.Result(attempt, false, time.Now())
 			}
 			var authState sshAuthState
 			defer authState.close()
 			config := authState.config(server.sshServerConfig())
-			metadata := testConnMetadata{user: "alice"}
 			permissions, err := config.PublicKeyCallback(metadata, key)
 			if err != nil {
 				t.Fatalf("public-key query: %v", err)
 			}
 			if blockBeforeProof {
-				limiter.Result("alice", "", false, time.Now())
+				limiter.Result(failures[2], false, time.Now())
 			}
-			_, err = config.VerifiedPublicKeyCallback(metadata, key, permissions, "")
+			verified, err := config.VerifiedPublicKeyCallback(metadata, key, permissions, "")
 			if (err != nil) != blockBeforeProof {
 				t.Fatalf("verified-key error = %v, blocked = %t", err, blockBeforeProof)
 			}
 			if !blockBeforeProof {
-				// Use a fresh IP to observe only the username's state. One more
-				// failure would trigger backoff if proof had not cleared the first two.
-				limiter.Result("alice", "192.0.2.99", false, time.Now())
-				if retry := limiter.RetryBackoff("alice", "192.0.2.99", time.Now()); retry != 0 {
+				attempt, ok := verified.ExtraData[sshAdmissionKey{}].(authlimit.Attempt)
+				if !ok {
+					t.Fatal("verified key returned no admission ticket")
+				}
+				// The proof must have cleared the username failures. Its source
+				// was chosen outside the failed source slot.
+				limiter.Result(failures[2], false, time.Now())
+				if retry := limiter.RetryBackoff(attempt, time.Now()); retry != 0 {
 					t.Fatalf("verified key did not clear username failure state: %v", retry)
 				}
 			}
@@ -122,4 +123,41 @@ func TestSSHKeyProofCannotReuseQueryAdmission(t *testing.T) {
 	if _, err := config.VerifiedPublicKeyCallback(metadata, key, permissions, ""); err == nil {
 		t.Fatal("repeated proof reused the consumed query admission")
 	}
+}
+
+func newSSHProofFailureAttempts(t *testing.T, limiter *authlimit.Limiter) ([3]authlimit.Attempt, sshKeyOfferMetadata) {
+	t.Helper()
+	var admitted [7]authlimit.Attempt
+	for i := range admitted {
+		attempt, retry := limiter.Allow("alice", "192.0.2.1", time.Now())
+		if retry != 0 {
+			t.Fatal(retry)
+		}
+		admitted[i] = attempt
+	}
+	// Seed source backoff, then clear only the username through a separate
+	// admitted success. The three remaining attempts drive the actual scenario.
+	for _, attempt := range admitted[:3] {
+		limiter.Result(attempt, false, time.Now())
+	}
+	limiter.Result(admitted[3], true, time.Now())
+	failures := [3]authlimit.Attempt(admitted[4:])
+	for i := 2; i < 66; i++ {
+		ip := fmt.Sprintf("192.0.2.%d", i)
+		username := fmt.Sprintf("source-control-%d", i)
+		if _, retry := limiter.Allow(username, ip, time.Now()); retry == 0 {
+			return failures, sshKeyOfferMetadata{user: "alice", ip: ip}
+		}
+	}
+	t.Fatal("could not find an independent source slot for the key proof")
+	return failures, sshKeyOfferMetadata{}
+}
+
+func requireAuthAdmission(t *testing.T, server *Server, username, ip string) authlimit.Attempt {
+	t.Helper()
+	attempt, retry := server.allowAuth(username, ip)
+	if retry != 0 {
+		t.Fatalf("authentication admission rejected for %v", retry)
+	}
+	return attempt
 }

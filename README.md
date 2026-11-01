@@ -270,8 +270,12 @@ timeout. FTP successful login stops its login timer; logging out starts a new
 window. `FTPMaxAuthFailures` is not reset by `USER`, `REIN`, or a successful login.
 
 `AuthLimits` configures token buckets shared by SSH, FTP, and HTTP. Defaults
-allow bursts of 200 attempts server-wide, 30 per source IP, and 20 per username,
+allow bursts of 200 attempts server-wide, 30 per source, and 20 per username,
 refilling one token every 10 ms, one second, and one second respectively.
+A source is one IPv4 address or one IPv6 `/64` prefix. IPv4-mapped IPv6 addresses
+use the IPv4 budget. Every supplied username consumes the same budgets, whether
+or not the account currently exists. Adding or removing an account does not
+change its username budget or bypass an existing cooldown.
 Successful credential checks consume tokens too. Each admitted SSH key eligibility
 check consumes one token per bucket; an accepted check and its first signature
 proof share that admission. Verified completion rechecks current credentials and
@@ -281,25 +285,38 @@ still emit `LoginFailed` events with reason `AuthFailureCredentials`.
 Unsigned key queries check key eligibility without opening the jail or emitting
 root diagnostics. The jail is opened and retained only after signature
 verification, using the user's current root, keys, and permissions.
-A repeated proof after a failed completion requires fresh admission. Every bucket
-and the identity-table capacity must permit the attempt before tokens are
-consumed or new identities retained.
+A repeated proof after a failed completion requires fresh admission. Every
+applicable bucket must permit an attempt before any tokens are consumed.
+Admission retains its original budgets through verification, including when
+users are dynamically added, changed, or removed.
 
 Three failed credential checks start a 250 ms cooldown, doubling after each
 further failure up to 30 seconds. Attempts during cooldown are rejected
 immediately. HTTP returns `429` with `Retry-After`, FTP returns `421` and closes
 the control connection, and SSH returns an authentication error. Success clears
-only that username's failure state, preserving shared-IP backoff. Failure logs
-and throttled failure events are sampled. `AuthEvent.Reason` distinguishes
+username failure state only when all retained failures in the bucket belong to
+that username. Unsigned key queries and successful logins for colliding usernames
+do not change failure ownership. Source penalties and username penalties shared
+by failures for different usernames are not cleared by success. Instead, each
+bucket forgets one failure for every maximum-backoff period (30 seconds by
+default) without another failure, even while it stays in use. A finished attack's
+penalties therefore fade within about five minutes with the default backoff
+settings. A steady attacker still holds maximum backoff, and pausing to let
+failures decay or a slot expire cannot raise the attempt rate.
+Failure logs and throttled failure events are sampled. `AuthEvent.Reason` distinguishes
 `AuthFailureCredentials` from `AuthFailureThrottled` on `LoginFailed` events;
 success and logout events leave it empty. Throttling events may be sampled even
 when the event queue has room, so this stream is not a complete attempt count.
-The combined IP/username table holds at most 8,192 entries by default. Idle
-entries become eligible for expiry after 15 minutes, once their tokens have
-fully refilled and active cooldowns have ended. Longer refill intervals therefore
-retain their limits across idle periods. New identities are denied while the
-table is full. IPs come from the transport peer,
-never forwarded headers, so clients behind one proxy share its IP budget.
+`MaxEntries` bounds the number of buckets: the default 8,192 slots are split
+between 4,096 sources and 4,096 usernames. A private, randomized hash assigns
+each identity a stable slot. Collisions conservatively share tokens and
+backoff; smaller limits increase collateral throttling. Storage capacity itself
+never rejects new identities, and identity churn cannot evict active penalties.
+Idle slots become eligible for reset after 15 minutes, once their tokens have
+fully refilled, active cooldowns have ended, and every failure has decayed.
+Longer refill intervals and a short `EntryTTL` therefore cannot shorten limits
+or backoff across idle periods. Addresses come from the transport peer,
+never forwarded headers, so clients behind one proxy share its source budget.
 
 `Config.Validate()` rejects a positive `AuthLimits.MaxEntries` below two and
 contradictory positive `BackoffInitial`/`BackoffMax` settings. If only the maximum

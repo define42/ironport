@@ -136,15 +136,16 @@ func (f *ftpSession) cmdPass(arg string) {
 		_ = f.reply(503, "send USER first")
 		return
 	}
-	if f.server.allowAuth(f.username, f.clientIP) > 0 {
-		f.server.authFailed(f.username, f.clientIP, CompletedUploadProtocolFTP, f.authEvents, true)
+	attempt, retry := f.server.allowAuth(f.username, f.clientIP)
+	if retry > 0 {
+		f.server.authFailed(attempt, f.username, f.clientIP, CompletedUploadProtocolFTP, f.authEvents, true)
 		f.authTerminated = true
 		_ = f.reply(421, "authentication temporarily unavailable, closing control connection")
 		return
 	}
 	if !f.authenticate(arg) {
 		f.authFailures++
-		f.server.authFailed(f.username, f.clientIP, CompletedUploadProtocolFTP, f.authEvents, false)
+		f.server.authFailed(attempt, f.username, f.clientIP, CompletedUploadProtocolFTP, f.authEvents, false)
 		if f.authFailures >= positiveLimit(f.server.ftpMaxAuthFailures, 5) {
 			f.authTerminated = true
 			_ = f.reply(421, "too many authentication failures, closing control connection")
@@ -153,7 +154,7 @@ func (f *ftpSession) cmdPass(arg string) {
 		_ = f.reply(530, errInvalidCredentials.Error())
 		return
 	}
-	f.server.authSucceeded(f.username, f.clientIP)
+	f.server.authSucceeded(attempt)
 	log.Printf("login protocol=ftp user=%q root=%q from=%s", f.username, f.user.Root, f.conn.RemoteAddr())
 	f.announceAuthEvent(AuthEventLoginSuccess)
 	_ = f.reply(230, "login successful")

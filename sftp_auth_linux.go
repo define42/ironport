@@ -5,6 +5,7 @@ package ironport
 import (
 	"net"
 
+	"github.com/define42/ironport/internal/authlimit"
 	"github.com/define42/ironport/internal/jailfs"
 	"github.com/define42/ironport/internal/netconn"
 	"golang.org/x/crypto/ssh"
@@ -13,6 +14,8 @@ import (
 type sshRevisionKey struct{}
 
 type sshJailFSKey struct{}
+
+type sshAdmissionKey struct{}
 
 // sshAuthState owns a password or verified-key callback's provisional jail
 // until the completed handshake commits it. SSH invokes callbacks sequentially,
@@ -77,7 +80,9 @@ func (a *sshAuthState) config(base *ssh.ServerConfig) *ssh.ServerConfig {
 // commitSSHConnection transfers only the exact authentication snapshot and
 // opened jail that completed this handshake. Revocation produces no session.
 func (s *Server) commitSSHConnection(nc net.Conn, conn *ssh.ServerConn, state *sshAuthState, events chan<- AuthEvent) (*jailfs.FS, bool) {
+	var attempt authlimit.Attempt
 	if conn.Permissions != nil {
+		attempt, _ = conn.Permissions.ExtraData[sshAdmissionKey{}].(authlimit.Attempt)
 		fs, _ := conn.Permissions.ExtraData[sshJailFSKey{}].(*jailfs.FS)
 		revision, _ := conn.Permissions.ExtraData[sshRevisionKey{}].(uint64)
 		user := conn.Permissions.Extensions["user"]
@@ -86,6 +91,6 @@ func (s *Server) commitSSHConnection(nc net.Conn, conn *ssh.ServerConn, state *s
 			return fs, true
 		}
 	}
-	s.authFailed(conn.User(), netconn.RemoteIP(conn.RemoteAddr()), CompletedUploadProtocolSFTP, events, false)
+	s.authFailed(attempt, conn.User(), netconn.RemoteIP(conn.RemoteAddr()), CompletedUploadProtocolSFTP, events, false)
 	return nil, false
 }

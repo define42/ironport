@@ -229,8 +229,9 @@ func (s *Server) httpAuthenticate(w http.ResponseWriter, r *http.Request) (usern
 		return "", UserInfo{}, nil, false
 	}
 	clientIP := netconn.HostFromAddr(r.RemoteAddr)
-	if retry := s.allowAuth(reqUser, clientIP); retry > 0 {
-		s.authFailed(reqUser, clientIP, CompletedUploadProtocolHTTP, s.authEventsChan(), true)
+	attempt, retry := s.allowAuth(reqUser, clientIP)
+	if retry > 0 {
+		s.authFailed(attempt, reqUser, clientIP, CompletedUploadProtocolHTTP, s.authEventsChan(), true)
 		w.Header().Set("Retry-After", strconv.FormatInt(int64((retry-1)/time.Second+1), 10))
 		s.rejectHTTPUpload(w, r, http.StatusTooManyRequests)
 		return "", UserInfo{}, nil, false
@@ -239,7 +240,7 @@ func (s *Server) httpAuthenticate(w http.ResponseWriter, r *http.Request) (usern
 		return checkPassword(stored.Password, reqPass)
 	})
 	if !authOK {
-		s.authFailed(reqUser, clientIP, CompletedUploadProtocolHTTP, s.authEventsChan(), false)
+		s.authFailed(attempt, reqUser, clientIP, CompletedUploadProtocolHTTP, s.authEventsChan(), false)
 		s.rejectHTTPUpload(w, r, http.StatusUnauthorized)
 		return "", UserInfo{}, nil, false
 	}
@@ -250,7 +251,7 @@ func (s *Server) httpAuthenticate(w http.ResponseWriter, r *http.Request) (usern
 			_ = jail.Close()
 		}
 	}()
-	s.authSucceeded(reqUser, clientIP)
+	s.authSucceeded(attempt)
 	//nolint:gosec // G706: username/IP are logged with %q, which escapes CR/LF and so neutralises log-line injection from the client-supplied Authorization header
 	log.Printf("login protocol=http user=%q root=%q from=%q", reqUser, u.Root, clientIP)
 	s.announceHTTPAuthEvent(AuthEventLoginSuccess, reqUser, clientIP)

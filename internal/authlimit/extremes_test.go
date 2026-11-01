@@ -35,22 +35,22 @@ func TestLimiterExtremeRefillIntervals(t *testing.T) {
 func testLimiterExtremeRefill(t *testing.T, limiter *Limiter, interval, wantRetry time.Duration) {
 	t.Helper()
 	now := time.Now()
-	if retry := limiter.Allow("alice", "192.0.2.1", now); retry != 0 {
+	if _, retry := limiter.Allow("alice", "192.0.2.1", now); retry != 0 {
 		t.Fatalf("initial attempt rejected: %v", retry)
 	}
 	for range 2 {
-		if retry := limiter.Allow("alice", "192.0.2.1", now); retry != wantRetry {
+		if _, retry := limiter.Allow("alice", "192.0.2.1", now); retry != wantRetry {
 			t.Fatalf("exhausted bucket retry = %v; want %v", retry, wantRetry)
 		}
 	}
-	if retry := limiter.Allow("alice", "192.0.2.1", now.Add(interval/2)); retry <= 0 || retry >= wantRetry {
+	if _, retry := limiter.Allow("alice", "192.0.2.1", now.Add(interval/2)); retry <= 0 || retry >= wantRetry {
 		t.Fatalf("partially refilled bucket retry = %v; want a shorter positive wait", retry)
 	}
 	recovered := now.Add(interval)
-	if retry := limiter.Allow("alice", "192.0.2.1", recovered); retry != 0 {
+	if _, retry := limiter.Allow("alice", "192.0.2.1", recovered); retry != 0 {
 		t.Fatalf("refilled bucket rejected: %v", retry)
 	}
-	if retry := limiter.Allow("alice", "192.0.2.1", recovered); retry != wantRetry {
+	if _, retry := limiter.Allow("alice", "192.0.2.1", recovered); retry != wantRetry {
 		t.Fatalf("refilled token was not consumed: retry = %v; want %v", retry, wantRetry)
 	}
 }

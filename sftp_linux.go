@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/define42/ironport/internal/authlimit"
 	"github.com/define42/ironport/internal/jailfs"
 	"github.com/define42/ironport/internal/netconn"
 	"github.com/pkg/sftp"
@@ -103,11 +104,12 @@ func deferRecoverSFTPPanicf(errp *error, onPanic func(), format string, args ...
 // checkSSHKeyQuery checks admission and key eligibility without opening a jail.
 // An unsigned query does not prove key ownership, so it must not trigger root
 // I/O or root diagnostics. Proof will re-read the user and check the key again.
-func (s *Server) checkSSHKeyQuery(c ssh.ConnMetadata, key ssh.PublicKey, authEvents chan<- AuthEvent) error {
+func (s *Server) checkSSHKeyQuery(c ssh.ConnMetadata, key ssh.PublicKey, authEvents chan<- AuthEvent) (authlimit.Attempt, error) {
 	clientIP := netconn.RemoteIP(c.RemoteAddr())
-	if s.allowAuth(c.User(), clientIP) > 0 {
-		s.authFailed(c.User(), clientIP, CompletedUploadProtocolSFTP, authEvents, true)
-		return errInvalidCredentials
+	attempt, retry := s.allowAuth(c.User(), clientIP)
+	if retry > 0 {
+		s.authFailed(attempt, c.User(), clientIP, CompletedUploadProtocolSFTP, authEvents, true)
+		return attempt, errInvalidCredentials
 	}
 	u, revision, exists := s.userSnapshot(c.User())
 	// Match even for unknown users to preserve the public-key timing pad.
@@ -116,34 +118,37 @@ func (s *Server) checkSSHKeyQuery(c ssh.ConnMetadata, key ssh.PublicKey, authEve
 		// Eligibility is checked before signature verification, even for signed
 		// requests, so a rejection must not advance credential-failure backoff.
 		s.reportAuthFailure(c.User(), clientIP, CompletedUploadProtocolSFTP, authEvents, false)
-		return errInvalidCredentials
+		return attempt, errInvalidCredentials
 	}
-	return nil
+	return attempt, nil
 }
 
 // authenticateSSH checks admission and credentials for a password or verified
 // key. A query's first proof reuses its already-consumed token.
 // Successful permissions carry an owned jail descriptor. Every new auth callback
 // must transfer that ownership through sshAuthState.config or close it itself.
-func (s *Server) authenticateSSH(c ssh.ConnMetadata, keyCheck func(UserInfo) bool, useQueryAdmission bool, authEvents chan<- AuthEvent) (*ssh.Permissions, error) {
+func (s *Server) authenticateSSH(c ssh.ConnMetadata, keyCheck func(UserInfo) bool, queryAdmission *authlimit.Attempt, authEvents chan<- AuthEvent) (*ssh.Permissions, error) {
 	clientIP := netconn.RemoteIP(c.RemoteAddr())
+	var attempt authlimit.Attempt
 	var retry time.Duration
-	if useQueryAdmission {
-		retry = s.authControl().RetryBackoff(c.User(), clientIP, time.Now())
+	if queryAdmission != nil {
+		attempt = *queryAdmission
+		retry = s.authControl().RetryBackoff(attempt, time.Now())
 	} else {
-		retry = s.allowAuth(c.User(), clientIP)
+		attempt, retry = s.allowAuth(c.User(), clientIP)
 	}
 	if retry > 0 {
-		s.authFailed(c.User(), clientIP, CompletedUploadProtocolSFTP, authEvents, true)
+		s.authFailed(attempt, c.User(), clientIP, CompletedUploadProtocolSFTP, authEvents, true)
 		return nil, errInvalidCredentials
 	}
 	u, fs, revision, ok := s.authenticateUser(c.User(), keyCheck)
 	if !ok {
-		s.authFailed(c.User(), clientIP, CompletedUploadProtocolSFTP, authEvents, false)
+		s.authFailed(attempt, c.User(), clientIP, CompletedUploadProtocolSFTP, authEvents, false)
 		return nil, errInvalidCredentials
 	}
 	permissions := permissionsFor(u, c.User(), u.Root)
-	permissions.ExtraData = map[any]any{sshRevisionKey{}: revision, sshJailFSKey{}: fs}
+	permissions.ExtraData = map[any]any{sshRevisionKey{}: revision, sshJailFSKey{}: fs, sshAdmissionKey{}: attempt}
+	s.authSucceeded(attempt)
 	return permissions, nil
 }
 
@@ -166,7 +171,7 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 		MACs:                    slices.Clone(s.sshMACs),
 		PublicKeyAuthAlgorithms: slices.Clone(s.sshPublicKeyAuthAlgorithms),
 		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
-			perms, err := s.authenticateSSH(c, func(u UserInfo) bool {
+			return s.authenticateSSH(c, func(u UserInfo) bool {
 				// checkPassword treats an empty stored password as
 				// "no password set" and rejects it. Passing u.Password
 				// directly works for both the existing-user and
@@ -174,37 +179,32 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 				// length-normalisation inside checkPassword keeps the
 				// comparison constant-time regardless.
 				return checkPassword(u.Password, string(pass))
-			}, false, authEvents)
-			if err == nil {
-				s.authSucceeded(c.User(), netconn.RemoteIP(c.RemoteAddr()))
-			}
-			return perms, err
+			}, nil, authEvents)
 		},
 		PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			if err := s.checkSSHKeyQuery(c, key, authEvents); err != nil {
+			attempt, err := s.checkSSHKeyQuery(c, key, authEvents)
+			if err != nil {
 				return nil, err
 			}
 			// Retain only admission, never the query's user snapshot or a jail.
-			return &ssh.Permissions{ExtraData: map[any]any{keyAdmission{}: true}}, nil
+			return &ssh.Permissions{ExtraData: map[any]any{keyAdmission{}: attempt}}, nil
 		},
 		VerifiedPublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey, queryPermissions *ssh.Permissions, _ string) (*ssh.Permissions, error) {
 			// x/crypto transfers ownership of the cached query permissions here.
 			// Spend its admission once: another proof after a failed callback
 			// must obtain a fresh token even when x/crypto reuses that query.
-			admitted := false
+			var admission *authlimit.Attempt
 			if queryPermissions != nil {
-				_, admitted = queryPermissions.ExtraData[keyAdmission{}]
+				if attempt, ok := queryPermissions.ExtraData[keyAdmission{}].(authlimit.Attempt); ok {
+					admission = &attempt
+				}
 				delete(queryPermissions.ExtraData, keyAdmission{})
 			}
 			// Signature verification has proved key ownership. Re-read current
 			// credentials and permissions before opening and retaining the jail.
-			permissions, err := s.authenticateSSH(c, func(u UserInfo) bool {
+			return s.authenticateSSH(c, func(u UserInfo) bool {
 				return matchAuthorizedKey(u.AuthorizedKeys, key)
-			}, admitted, authEvents)
-			if err == nil {
-				s.authSucceeded(c.User(), netconn.RemoteIP(c.RemoteAddr()))
-			}
-			return permissions, err
+			}, admission, authEvents)
 		},
 	}
 	cfg.AddHostKey(s.sftpSigner)

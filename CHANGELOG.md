@@ -8,6 +8,23 @@ and patch releases; breaking API changes require a major version bump.
 
 ## Unreleased
 
+- Authentication limits now use bounded, privately hashed source and username
+  buckets, preventing identity-table saturation from rejecting every new
+  identity. Collisions share limits conservatively without evicting active
+  penalties. Configured and unknown usernames consume the same budgets, so
+  adding or removing an account cannot bypass its cooldown.
+  **Behavior change:** source limits now group IPv6 addresses by `/64`; IPv4
+  remains per address. Successful logins clear username backoff only when all
+  retained failures belong to that username; unsigned key queries cannot change
+  failure ownership. Each bucket forgets one failure per `BackoffMax` without
+  another failure, so penalties left by a finished attack fade even while
+  legitimate logins keep the bucket active; steady failures still hold maximum
+  backoff. Idle expiry also waits until every failure has decayed, so an
+  `EntryTTL` close to `BackoffMax` no longer lets an attacker restart backoff by
+  pausing. Authentication retains its original admission through dynamic user
+  changes and SSH key proof. Public API signatures and configuration fields are
+  unchanged.
+
 - SSH key eligibility rejections no longer advance username or shared-IP
   credential-failure backoff, allowing clients to offer multiple keys before the
   authorized one. Key offers still consume admission tokens, and existing

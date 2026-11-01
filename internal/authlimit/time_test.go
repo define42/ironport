@@ -23,16 +23,12 @@ func TestLimiterStaleAdmissionDoesNotRefillTwice(t *testing.T) {
 			// Model a queued call whose timestamp was captured before another
 			// caller acquired the mutex. Only one token has refilled at later.
 			for _, now := range []time.Time{earlier, later, earlier} {
-				if retry := limiter.Allow("alice", "192.0.2.1", now); retry != 0 {
-					t.Fatalf("available token rejected: %v", retry)
-				}
+				admit(t, limiter, "alice", "192.0.2.1", now)
 			}
-			if retry := limiter.Allow("alice", "192.0.2.1", later); retry != time.Second {
+			if _, retry := limiter.Allow("alice", "192.0.2.1", later); retry != time.Second {
 				t.Fatalf("stale timestamp credited the refill twice: retry = %v, want 1s", retry)
 			}
-			if retry := limiter.Allow("alice", "192.0.2.1", later.Add(time.Second)); retry != 0 {
-				t.Fatalf("next refill rejected: %v", retry)
-			}
+			admit(t, limiter, "alice", "192.0.2.1", later.Add(time.Second))
 		})
 	}
 }
@@ -52,31 +48,28 @@ func testLimiterStaleFailure(t *testing.T, identity string) {
 	limiter := New(Config{BackoffInitial: time.Second, BackoffMax: time.Second})
 	earlier := time.Now()
 	later := earlier.Add(2 * time.Second)
-	for range 4 {
-		if retry := limiter.Allow("alice", "192.0.2.1", earlier); retry != 0 {
-			t.Fatalf("initial attempt rejected: %v", retry)
-		}
+	var attempts [4]Attempt
+	for i := range attempts {
+		attempts[i] = admit(t, limiter, "alice", "192.0.2.1", earlier)
 	}
-	for range 3 {
-		limiter.Result("alice", "192.0.2.1", false, later)
-	}
-	// A delayed failure must not replace the active cooldown with one
-	// computed from an older timestamp, even once backoff is capped.
-	limiter.Result("alice", "192.0.2.1", false, earlier)
-	username, ip := "alice", "192.0.2.2"
+	username, ip := "alice", differentSource(t, limiter, "192.0.2.1")
 	if identity == "IP" {
-		username, ip = "bob", "192.0.2.1"
+		username, ip = differentUsername(t, limiter, "alice"), "192.0.2.1"
 	}
-	if retry := limiter.RetryBackoff(username, ip, later); retry != time.Second {
+	proof := admit(t, limiter, username, ip, earlier)
+	for _, attempt := range attempts[:3] {
+		limiter.Result(attempt, false, later)
+	}
+	// A queued failure cannot replace an active cooldown with an older one.
+	limiter.Result(attempts[3], false, earlier)
+	if retry := limiter.RetryBackoff(proof, later); retry != time.Second {
 		t.Fatalf("stale failure shortened cooldown: retry = %v, want 1s", retry)
 	}
-	if retry := limiter.Allow(username, ip, later); retry != time.Second {
+	if _, retry := limiter.Allow(username, ip, later); retry != time.Second {
 		t.Fatalf("active cooldown did not reject admission: retry = %v", retry)
 	}
-	if retry := limiter.Allow(username, ip, later.Add(time.Second)); retry != 0 {
-		t.Fatalf("elapsed cooldown did not recover: %v", retry)
-	}
-	if retry := limiter.RetryBackoff(username, ip, earlier); retry != 0 {
+	admit(t, limiter, username, ip, later.Add(time.Second))
+	if retry := limiter.RetryBackoff(proof, earlier); retry != 0 {
 		t.Fatalf("stale proof check revived an elapsed cooldown: %v", retry)
 	}
 }

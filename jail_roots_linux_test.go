@@ -129,7 +129,7 @@ func TestRootAuthenticationDiagnosticsSampleIndependently(t *testing.T) {
 	rootErr := errors.New("failed\r\n\x1b\"operation")
 	output := captureRootDiagnosticLog(t)
 
-	server.authFailed(username, "192.0.2.1", "http", nil, false)
+	server.authFailed(requireAuthAdmission(t, server, username, "192.0.2.1"), username, "192.0.2.1", "http", nil, false)
 	if !strings.Contains(output.String(), "login failed") {
 		t.Fatalf("missing ordinary authentication diagnostic: %q", output.String())
 	}
